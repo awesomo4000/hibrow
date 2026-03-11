@@ -156,16 +156,20 @@ pub fn launch(allocator: mem.Allocator, options: LaunchOptions) !Browser {
     try child.spawn();
     const pid = child.id;
 
-    // Wait for browser to become responsive (poll CDP endpoint)
+    // Wait for CDP to become responsive (poll with TCP connect, then verify HTTP)
     var attempts: u32 = 0;
-    while (attempts < 60) : (attempts += 1) {
-        if (verify(allocator, port) catch false) {
-            return .{
-                .profile = try allocator.dupe(u8, options.profile),
-                .port = port,
-                .pid = pid,
-                .managed = true,
-            };
+    while (attempts < 100) : (attempts += 1) {
+        // Quick TCP probe first (cheap)
+        if (tcpProbe(port)) {
+            // TCP is open — now verify CDP responds over HTTP
+            if (verify(allocator, port) catch false) {
+                return .{
+                    .profile = try allocator.dupe(u8, options.profile),
+                    .port = port,
+                    .pid = pid,
+                    .managed = true,
+                };
+            }
         }
         std.Thread.sleep(100 * std.time.ns_per_ms); // 100ms between attempts
     }
@@ -303,6 +307,15 @@ fn extractPsPid(line: []const u8) ?posix.pid_t {
 // ---------------------------------------------------------------------------
 
 /// Verify a browser is responsive by hitting its CDP endpoint.
+/// Quick TCP connect probe — returns true if the port is accepting connections.
+/// Much cheaper than a full HTTP request for polling.
+pub fn tcpProbe(port: u16) bool {
+    const addr = std.net.Address.resolveIp("127.0.0.1", port) catch return false;
+    const stream = std.net.tcpConnectToAddress(addr) catch return false;
+    stream.close();
+    return true;
+}
+
 pub fn verify(allocator: mem.Allocator, port: u16) !bool {
     var url_buf: [64]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/json/version", .{port});

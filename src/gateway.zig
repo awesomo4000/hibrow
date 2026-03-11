@@ -339,6 +339,19 @@ pub const Server = struct {
             return resp.encode(self.allocator);
         };
 
+        // Discovery-first: check if this profile is already running.
+        if (try findBrowserPort(self.allocator, profile)) |existing_port| {
+            // Already running — return existing browser info instead of launching again.
+            var result_obj = json.ObjectMap.init(self.allocator);
+            defer result_obj.deinit();
+            try result_obj.put("profile", .{ .string = profile });
+            try result_obj.put("port", .{ .integer = @intCast(existing_port) });
+            try result_obj.put("already_running", .{ .bool = true });
+
+            const resp = protocol.makeResponse(id, .{ .object = result_obj });
+            return resp.encode(self.allocator);
+        }
+
         const proxy = extractStringParam(params, "proxy");
         const proxy_dns = extractBoolParam(params, "proxy_dns") orelse false;
 
