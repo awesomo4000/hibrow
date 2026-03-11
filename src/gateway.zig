@@ -46,6 +46,16 @@ pub const Client = struct {
     /// Connect to the gateway daemon. Tries the socket directly, and if
     /// connection fails, attempts to auto-start the daemon and retry.
     pub fn connect(allocator: mem.Allocator) !Client {
+        return connectImpl(allocator, true);
+    }
+
+    /// Connect to the gateway daemon without auto-starting it.
+    /// Returns error.ConnectionRefused if the daemon is not running.
+    pub fn connectNoAutoStart(allocator: mem.Allocator) !Client {
+        return connectImpl(allocator, false);
+    }
+
+    fn connectImpl(allocator: mem.Allocator, auto_start: bool) !Client {
         const socket_path = try getSocketPath(allocator);
         defer allocator.free(socket_path);
 
@@ -53,6 +63,8 @@ pub const Client = struct {
         if (connectToSocket(socket_path)) |stream| {
             return .{ .allocator = allocator, .stream = stream };
         } else |_| {}
+
+        if (!auto_start) return error.ConnectionRefused;
 
         // Auto-start daemon and retry
         try autoStartDaemon(allocator);
@@ -271,15 +283,27 @@ pub const Server = struct {
     }
 
     fn handleGatewayShutdown(self: *Server, id: json.Value) ![]u8 {
-        // Signal shutdown (will take effect after this response is sent)
-        self.running = false;
-
         var result_obj = json.ObjectMap.init(self.allocator);
         defer result_obj.deinit();
         try result_obj.put("status", .{ .string = "shutting_down" });
 
         const resp = protocol.makeResponse(id, .{ .object = result_obj });
-        return resp.encode(self.allocator);
+        const encoded = try resp.encode(self.allocator);
+
+        // Schedule shutdown: close the listener so accept() unblocks.
+        // We do this after encoding the response so the caller gets the reply.
+        self.running = false;
+        if (self.listener) |*l| {
+            l.deinit();
+            self.listener = null;
+        }
+
+        // Clean up socket file
+        if (self.socket_path) |p| {
+            std.fs.deleteFileAbsolute(p) catch {};
+        }
+
+        return encoded;
     }
 
     fn handleBrowserList(self: *Server, id: json.Value) ![]u8 {

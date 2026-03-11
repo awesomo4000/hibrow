@@ -354,26 +354,26 @@ fn cmdGateway(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     }
 
     if (mem.eql(u8, action, "status")) {
-        var client = hibrow.Client.connect(allocator) catch |err| {
-            writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
-            std.process.exit(1);
+        var client = hibrow.gateway.Client.connectNoAutoStart(allocator) catch {
+            writeStdout("{s}\n", .{"{\"status\": \"not running\"}"});
+            return;
         };
         defer client.disconnect();
 
-        var resp = client.gatewayStatus() catch |err| {
+        var resp = client.call("gateway.status", null) catch |err| {
             writeStderr("Error: gateway.status failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
         defer resp.deinit();
         printJsonValue(allocator, resp.result);
     } else if (mem.eql(u8, action, "stop")) {
-        var client = hibrow.Client.connect(allocator) catch |err| {
-            writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
-            std.process.exit(1);
+        var client = hibrow.gateway.Client.connectNoAutoStart(allocator) catch {
+            writeStderr("Gateway is not running.\n", .{});
+            return;
         };
         defer client.disconnect();
 
-        var resp = client.gatewayShutdown() catch |err| {
+        var resp = client.call("gateway.shutdown", null) catch |err| {
             writeStderr("Error: gateway.shutdown failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
