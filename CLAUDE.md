@@ -103,6 +103,14 @@ zig build -Doptimize=.ReleaseSafe      # Build with optimizations
 
 **JSON**: Use `std.json.Stringify.valueAlloc(allocator, value, .{})` for serialization. Use `std.json.ArrayHashMap` for ordered JSON objects.
 
+**Sleeping**: Use `std.Thread.sleep(nanoseconds)` — there is no `std.time.sleep` in 0.15.2. Use `std.time.ns_per_ms` etc. for unit conversion.
+
+**Process APIs**: `std.posix.getuid()` exists but `std.posix.getpid()` does not — use `std.c.getpid()`. For stdin: `std.fs.File.stdin()` (not `std.io.getStdIn()`).
+
+**Sockets**: `std.net.Stream` is a thin fd wrapper; all methods take `self` by value (not pointer). `Stream.writeAll()` uses `sendmsg` internally — only works with socket fds, not pipes.
+
+**MANAGED containers**: `json.ObjectMap` and `json.Array` are managed (allocator stored at init, not passed per-call). Most other containers (ArrayList, HashMap) are unmanaged.
+
 **General**: Error unions (`!`), allocator-passing pattern, `std.heap.ArenaAllocator` for request-scoped work, strings are `[]const u8`.
 
 ## Reference Material

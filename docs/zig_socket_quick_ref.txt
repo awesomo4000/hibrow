@@ -1,0 +1,123 @@
+╔════════════════════════════════════════════════════════════════════════════════╗
+║                 ZIG 0.15.2 UNIX DOMAIN SOCKET API - QUICK REFERENCE            ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+
+┌─ SERVER SIDE ─────────────────────────────────────────────────────────────────┐
+│                                                                                 │
+│  1. Create Address:                                                            │
+│     const addr = try std.net.Address.initUnix("/tmp/socket.sock");            │
+│                                                                                │
+│  2. Listen for connections:                                                   │
+│     var server = try addr.listen(.{                                           │
+│         .kernel_backlog = 128,                                                │
+│         .reuse_address = true,                                                │
+│     });                                                                        │
+│     defer server.deinit();                                                    │
+│                                                                                │
+│  3. Accept client connection:                                                 │
+│     const conn = try server.accept();  // Blocks until client connects       │
+│     defer conn.stream.close();                                                │
+│                                                                                │
+│  4. Read/Write:                                                               │
+│     var buffer: [4096]u8 = undefined;                                        │
+│     const n = try conn.stream.read(&buffer);                                 │
+│     try conn.stream.writeAll(response);                                      │
+│                                                                                │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ CLIENT SIDE ─────────────────────────────────────────────────────────────────┐
+│                                                                                 │
+│  1. Connect to server:                                                         │
+│     const stream = try std.net.connectUnixSocket("/tmp/socket.sock");        │
+│     defer stream.close();                                                     │
+│                                                                                │
+│  2. Send request:                                                              │
+│     try stream.writeAll(json_request);                                        │
+│                                                                                │
+│  3. Receive response:                                                          │
+│     var buffer: [8192]u8 = undefined;                                        │
+│     const n = try stream.read(&buffer);                                      │
+│     const response = buffer[0..n];                                            │
+│                                                                                │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ FUNCTION SIGNATURES ─────────────────────────────────────────────────────────┐
+│                                                                                 │
+│  Address Creation:                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────┐ │
+│  │ pub fn initUnix(path: []const u8) !Address                             │ │
+│  │ Returns: Address with .un field (posix.sockaddr.un)                   │ │
+│  │ Error: NameTooLong (path too long, ~108 byte limit)                   │ │
+│  └─────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                 │
+│  Server Setup:                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────┐ │
+│  │ pub fn listen(                                                         │ │
+│  │     address: Address,                                                  │ │
+│  │     options: ListenOptions                                            │ │
+│  │ ) ListenError!Server                                                  │ │
+│  │                                                                         │ │
+│  │ ListenOptions:                                                        │ │
+│  │  • kernel_backlog: u31 = 128                                          │ │
+│  │  • reuse_address: bool = false                                        │ │
+│  │  • force_nonblocking: bool = false                                    │ │
+│  └─────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                 │
+│  Accept Connection:                                                            │
+│  ┌─────────────────────────────────────────────────────────────────────────┐ │
+│  │ pub fn accept(s: *Server) AcceptError!Server.Connection               │ │
+│  │ Returns: Server.Connection { stream: Stream, address: Address }       │ │
+│  │ Behavior: BLOCKS until client connects                                │ │
+│  └─────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                 │
+│  Client Connection:                                                            │
+│  ┌─────────────────────────────────────────────────────────────────────────┐ │
+│  │ pub fn connectUnixSocket(path: []const u8) !Stream                    │ │
+│  │ Returns: Connected Stream for read/write                              │ │
+│  │ Error: FileNotFound, ConnectionRefused, etc.                          │ │
+│  └─────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                 │
+│  Read/Write:                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────┐ │
+│  │ pub fn read(self: Stream, buffer: []u8) ReadError!usize               │ │
+│  │ pub fn writeAll(self: Stream, bytes: []const u8) WriteError!void     │ │
+│  │                                                                         │ │
+│  │ Stream.read()  → partial read, returns 0 on EOF                       │ │
+│  │ Stream.writeAll() → guarantees all data written                       │ │
+│  │ Stream.close()    → close socket (safe to call multiple times)        │ │
+│  └─────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                 │
+│  Cleanup:                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────────┐ │
+│  │ pub fn deinit(s: *Server) void                                         │ │
+│  │ pub fn close(s: Stream) void                                           │ │
+│  │ pub fn close() void { posix.close(s.handle) }                         │ │
+│  └─────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ KEY DIFFERENCES FROM OTHER PATTERNS ──────────────────────────────────────────┐
+│                                                                                 │
+│  ✓ Address.listen()      → Creates & binds server socket (not separate)       │
+│  ✓ Server.accept()       → Blocks until client connects                       │
+│  ✓ connectUnixSocket()   → One call for connect (no separate Address/bind)   │
+│  ✓ writeAll()            → Guarantees full write (loop internally)            │
+│  ✓ read()                → May return partial, check bytes_read               │
+│  ✓ Stream.close()        → Always use defer to prevent fd leaks              │
+│                                                                                 │
+│  ✗ write() is deprecated → Use writeAll() instead                             │
+│  ✗ No automatic retries  → Handle errors explicitly                           │
+│  ✗ No buffering by default → Use reader()/writer() for buffering             │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ MEMORY & CLEANUP CHECKLIST ──────────────────────────────────────────────────┐
+│                                                                                 │
+│  □ Server setup:          defer server.deinit();                              │
+│  □ Client connection:     defer stream.close();                               │
+│  □ Accept connection:     defer connection.stream.close();                    │
+│  □ Error paths:           Use errdefer where needed                           │
+│  □ Allocator:             Pass allocator to any structs if needed             │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+

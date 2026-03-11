@@ -8,6 +8,8 @@
 ///!   const result = try client.eval("work", "document.title");
 
 const std = @import("std");
+const json = std.json;
+const mem = std.mem;
 
 // Re-export public modules
 pub const protocol = @import("protocol.zig");
@@ -19,12 +21,15 @@ pub const websocket = @import("websocket.zig");
 
 /// High-level client for communicating with the hibrow gateway.
 /// This is the primary API for embedding hibrow in other Zig programs.
+///
+/// All methods that return `ParsedResponse` require the caller to call
+/// `.deinit()` when done to free parsed JSON memory.
 pub const Client = struct {
-    allocator: std.mem.Allocator,
+    allocator: mem.Allocator,
     gw: gateway.Client,
 
     /// Connect to the hibrow gateway (auto-starting it if needed).
-    pub fn connect(allocator: std.mem.Allocator) !Client {
+    pub fn connect(allocator: mem.Allocator) !Client {
         const gw = try gateway.Client.connect(allocator);
         return .{ .allocator = allocator, .gw = gw };
     }
@@ -34,34 +39,66 @@ pub const Client = struct {
         self.gw.disconnect();
     }
 
-    /// Evaluate JavaScript in the named profile's active tab.
-    pub fn eval(self: *Client, profile: []const u8, expression: []const u8) !std.json.Value {
-        _ = profile;
-        _ = expression;
-        // TODO: send browser.eval JSON-RPC request
-        return self.gw.call("browser.eval", null);
-    }
-
-    /// Navigate the named profile's active tab to a URL.
-    pub fn navigate(self: *Client, profile: []const u8, url: []const u8) !void {
-        _ = self;
-        _ = profile;
-        _ = url;
-        // TODO: send browser.navigate JSON-RPC request
-    }
-
     /// List all running browsers.
-    pub fn list(self: *Client) !std.json.Value {
+    pub fn list(self: *Client) !gateway.ParsedResponse {
         return self.gw.call("browser.list", null);
     }
 
-    /// Launch a new browser with the given profile name.
-    pub fn launch(self: *Client, profile: []const u8, options: browser.LaunchOptions) !std.json.Value {
-        _ = profile;
-        _ = options;
-        // TODO: send browser.launch JSON-RPC request
-        return self.gw.call("browser.launch", null);
+    /// Get info about a specific browser by profile name.
+    pub fn get(self: *Client, profile: []const u8) !gateway.ParsedResponse {
+        var params = json.ObjectMap.init(self.allocator);
+        defer params.deinit();
+        try params.put("profile", .{ .string = profile });
+        return self.gw.call("browser.get", .{ .object = params });
     }
+
+    /// Launch a new browser with the given profile name.
+    pub fn launch(self: *Client, profile: []const u8, opts: LaunchOpts) !gateway.ParsedResponse {
+        var params = json.ObjectMap.init(self.allocator);
+        defer params.deinit();
+        try params.put("profile", .{ .string = profile });
+        if (opts.proxy) |proxy| {
+            try params.put("proxy", .{ .string = proxy });
+        }
+        if (opts.proxy_dns) {
+            try params.put("proxy_dns", .{ .bool = true });
+        }
+        return self.gw.call("browser.launch", .{ .object = params });
+    }
+
+    /// Evaluate JavaScript in the named profile's active tab.
+    pub fn eval(self: *Client, profile: []const u8, expression: []const u8) !gateway.ParsedResponse {
+        var params = json.ObjectMap.init(self.allocator);
+        defer params.deinit();
+        try params.put("profile", .{ .string = profile });
+        try params.put("expression", .{ .string = expression });
+        return self.gw.call("browser.eval", .{ .object = params });
+    }
+
+    /// Navigate the named profile's active tab to a URL.
+    pub fn navigate(self: *Client, profile: []const u8, url: []const u8) !gateway.ParsedResponse {
+        var params = json.ObjectMap.init(self.allocator);
+        defer params.deinit();
+        try params.put("profile", .{ .string = profile });
+        try params.put("url", .{ .string = url });
+        return self.gw.call("browser.navigate", .{ .object = params });
+    }
+
+    /// Get gateway daemon status.
+    pub fn gatewayStatus(self: *Client) !gateway.ParsedResponse {
+        return self.gw.call("gateway.status", null);
+    }
+
+    /// Shut down the gateway daemon.
+    pub fn gatewayShutdown(self: *Client) !gateway.ParsedResponse {
+        return self.gw.call("gateway.shutdown", null);
+    }
+};
+
+/// Options for launching a browser (simplified from browser.LaunchOptions).
+pub const LaunchOpts = struct {
+    proxy: ?[]const u8 = null,
+    proxy_dns: bool = false,
 };
 
 // ---------------------------------------------------------------------------
@@ -81,6 +118,7 @@ test "public API re-exports are accessible" {
     _ = cdp.Connection;
     _ = websocket.WebSocket;
     _ = websocket.Opcode;
+    _ = websocket.ReadResult;
 }
 
 test "Client struct layout" {
@@ -88,6 +126,12 @@ test "Client struct layout" {
     _ = @typeInfo(Client);
     _ = @hasField(Client, "allocator");
     _ = @hasField(Client, "gw");
+}
+
+test "LaunchOpts defaults" {
+    const opts = LaunchOpts{};
+    try std.testing.expect(opts.proxy == null);
+    try std.testing.expect(!opts.proxy_dns);
 }
 
 test {

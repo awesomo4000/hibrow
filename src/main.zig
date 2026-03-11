@@ -5,6 +5,8 @@
 ///! 2. If connection fails → fork gateway into background, wait, retry
 ///! 3. Send JSON-RPC request, print result
 const std = @import("std");
+const json = std.json;
+const mem = std.mem;
 const hibrow = @import("hibrow");
 
 const usage =
@@ -38,6 +40,9 @@ const usage =
     \\  gateway stop
     \\      Stop the gateway daemon.
     \\
+    \\  gateway serve
+    \\      Run the gateway daemon (internal, used by auto-start).
+    \\
     \\Options:
     \\  --help, -h    Show this help message.
     \\  --version     Show version information.
@@ -62,39 +67,35 @@ pub fn main() !void {
         return;
     };
 
-    if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
+    if (mem.eql(u8, command, "--help") or mem.eql(u8, command, "-h")) {
         printUsage();
         return;
     }
 
-    if (std.mem.eql(u8, command, "--version")) {
+    if (mem.eql(u8, command, "--version")) {
         printVersion();
         return;
     }
 
     // Dispatch to command handlers
-    if (std.mem.eql(u8, command, "launch")) {
-        cmdLaunch(&args);
-    } else if (std.mem.eql(u8, command, "ls")) {
-        cmdList(&args);
-    } else if (std.mem.eql(u8, command, "nav")) {
-        cmdNavigate(&args);
-    } else if (std.mem.eql(u8, command, "eval")) {
-        cmdEval(&args);
-    } else if (std.mem.eql(u8, command, "url")) {
-        cmdUrl(&args);
-    } else if (std.mem.eql(u8, command, "console")) {
-        cmdConsole(&args);
-    } else if (std.mem.eql(u8, command, "tab")) {
-        cmdTab(&args);
-    } else if (std.mem.eql(u8, command, "gateway")) {
-        cmdGateway(&args);
+    if (mem.eql(u8, command, "launch")) {
+        cmdLaunch(allocator, &args);
+    } else if (mem.eql(u8, command, "ls")) {
+        cmdList(allocator, &args);
+    } else if (mem.eql(u8, command, "nav")) {
+        cmdNavigate(allocator, &args);
+    } else if (mem.eql(u8, command, "eval")) {
+        cmdEval(allocator, &args);
+    } else if (mem.eql(u8, command, "url")) {
+        cmdUrl(allocator, &args);
+    } else if (mem.eql(u8, command, "console")) {
+        cmdConsole(allocator, &args);
+    } else if (mem.eql(u8, command, "tab")) {
+        cmdTab(allocator, &args);
+    } else if (mem.eql(u8, command, "gateway")) {
+        cmdGateway(allocator, &args);
     } else {
-        var buf: [4096]u8 = undefined;
-        var stderr_writer = std.fs.File.stderr().writer(&buf);
-        const stderr = &stderr_writer.interface;
-        stderr.print("Unknown command: {s}\n\n", .{command}) catch {};
-        stderr.flush() catch {};
+        writeStderr("Unknown command: {s}\n\n", .{command});
         printUsage();
         std.process.exit(1);
     }
@@ -120,24 +121,105 @@ fn writeStderr(comptime fmt: []const u8, fmt_args: anytype) void {
     stderr.flush() catch {};
 }
 
+/// Print a json.Value to stdout using the JSON serializer.
+fn printJsonValue(allocator: mem.Allocator, value: json.Value) void {
+    const bytes = json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 }) catch {
+        writeStdout("null\n", .{});
+        return;
+    };
+    defer allocator.free(bytes);
+    writeStdout("{s}\n", .{bytes});
+}
+
 // ---------------------------------------------------------------------------
-// Command stubs
+// Command implementations
 // ---------------------------------------------------------------------------
 
-fn cmdLaunch(args: *std.process.ArgIterator) void {
+fn cmdLaunch(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     const profile = args.next() orelse {
         writeStderr("Error: launch requires a profile name\n", .{});
         std.process.exit(1);
     };
-    writeStdout("TODO: launch browser with profile \"{s}\"\n", .{profile});
+
+    // Parse optional flags
+    var proxy: ?[]const u8 = null;
+    var proxy_dns = false;
+    while (args.next()) |arg| {
+        if (mem.eql(u8, arg, "--proxy")) {
+            proxy = args.next() orelse {
+                writeStderr("Error: --proxy requires a URL argument\n", .{});
+                std.process.exit(1);
+            };
+        } else if (mem.eql(u8, arg, "--proxy-dns")) {
+            proxy_dns = true;
+        } else {
+            writeStderr("Unknown option: {s}\n", .{arg});
+            std.process.exit(1);
+        }
+    }
+
+    var client = hibrow.Client.connect(allocator) catch |err| {
+        writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer client.disconnect();
+
+    var resp = client.launch(profile, .{
+        .proxy = proxy,
+        .proxy_dns = proxy_dns,
+    }) catch |err| {
+        writeStderr("Error: launch failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer resp.deinit();
+
+    if (resp.is_error) {
+        printError(allocator, resp.result);
+        std.process.exit(1);
+    }
+
+    printJsonValue(allocator, resp.result);
 }
 
-fn cmdList(args: *std.process.ArgIterator) void {
-    _ = args;
-    writeStdout("TODO: list running browsers\n", .{});
+fn cmdList(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
+    const profile = args.next();
+
+    var client = hibrow.Client.connect(allocator) catch |err| {
+        writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer client.disconnect();
+
+    if (profile) |p| {
+        // Get specific browser
+        var resp = client.get(p) catch |err| {
+            writeStderr("Error: browser.get failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer resp.deinit();
+
+        if (resp.is_error) {
+            printError(allocator, resp.result);
+            std.process.exit(1);
+        }
+        printJsonValue(allocator, resp.result);
+    } else {
+        // List all browsers
+        var resp = client.list() catch |err| {
+            writeStderr("Error: browser.list failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer resp.deinit();
+
+        if (resp.is_error) {
+            printError(allocator, resp.result);
+            std.process.exit(1);
+        }
+        printJsonValue(allocator, resp.result);
+    }
 }
 
-fn cmdNavigate(args: *std.process.ArgIterator) void {
+fn cmdNavigate(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     const target = args.next() orelse {
         writeStderr("Error: nav requires a profile[:tab] and URL\n", .{});
         std.process.exit(1);
@@ -146,54 +228,157 @@ fn cmdNavigate(args: *std.process.ArgIterator) void {
         writeStderr("Error: nav requires a URL\n", .{});
         std.process.exit(1);
     };
-    writeStdout("TODO: navigate {s} to {s}\n", .{ target, url });
+
+    // Parse profile from target (ignore :tab for now)
+    const profile = parseProfile(target);
+
+    var client = hibrow.Client.connect(allocator) catch |err| {
+        writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer client.disconnect();
+
+    var resp = client.navigate(profile, url) catch |err| {
+        writeStderr("Error: navigate failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer resp.deinit();
+
+    if (resp.is_error) {
+        printError(allocator, resp.result);
+        std.process.exit(1);
+    }
+    printJsonValue(allocator, resp.result);
 }
 
-fn cmdEval(args: *std.process.ArgIterator) void {
+fn cmdEval(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     const target = args.next() orelse {
         writeStderr("Error: eval requires a profile[:tab] and expression\n", .{});
         std.process.exit(1);
     };
-    const expr = args.next() orelse {
+
+    const profile = parseProfile(target);
+
+    // Get expression: positional arg, -f <file>, or -f- (stdin)
+    const next_arg = args.next() orelse {
         writeStderr("Error: eval requires a JavaScript expression\n", .{});
         std.process.exit(1);
     };
-    writeStdout("TODO: eval \"{s}\" in {s}\n", .{ expr, target });
+
+    var expression: []const u8 = undefined;
+    var owned_expr: ?[]u8 = null;
+
+    if (mem.eql(u8, next_arg, "-f")) {
+        const filename = args.next() orelse {
+            writeStderr("Error: -f requires a filename\n", .{});
+            std.process.exit(1);
+        };
+        owned_expr = std.fs.cwd().readFileAlloc(allocator, filename, 1 << 20) catch |err| {
+            writeStderr("Error: could not read file: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        expression = owned_expr.?;
+    } else if (mem.eql(u8, next_arg, "-f-")) {
+        // Read from stdin
+        owned_expr = std.fs.File.stdin().readToEndAlloc(allocator, 1 << 20) catch |err| {
+            writeStderr("Error: could not read stdin: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        expression = owned_expr.?;
+    } else {
+        expression = next_arg;
+    }
+    defer if (owned_expr) |e| allocator.free(e);
+
+    var client = hibrow.Client.connect(allocator) catch |err| {
+        writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer client.disconnect();
+
+    var resp = client.eval(profile, expression) catch |err| {
+        writeStderr("Error: eval failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer resp.deinit();
+
+    if (resp.is_error) {
+        printError(allocator, resp.result);
+        std.process.exit(1);
+    }
+    printJsonValue(allocator, resp.result);
 }
 
-fn cmdUrl(args: *std.process.ArgIterator) void {
+fn cmdUrl(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     const target = args.next() orelse {
         writeStderr("Error: url requires a profile[:tab]\n", .{});
         std.process.exit(1);
     };
+    _ = allocator;
     writeStdout("TODO: print URL for {s}\n", .{target});
 }
 
-fn cmdConsole(args: *std.process.ArgIterator) void {
+fn cmdConsole(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     const target = args.next() orelse {
         writeStderr("Error: console requires a profile[:tab]\n", .{});
         std.process.exit(1);
     };
+    _ = allocator;
     writeStdout("TODO: stream console for {s}\n", .{target});
 }
 
-fn cmdTab(args: *std.process.ArgIterator) void {
+fn cmdTab(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     const action = args.next() orelse {
         writeStderr("Error: tab requires an action (list|new|close|switch)\n", .{});
         std.process.exit(1);
     };
+    _ = allocator;
     writeStdout("TODO: tab {s}\n", .{action});
 }
 
-fn cmdGateway(args: *std.process.ArgIterator) void {
+fn cmdGateway(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     const action = args.next() orelse {
-        writeStderr("Error: gateway requires an action (status|stop)\n", .{});
+        writeStderr("Error: gateway requires an action (status|stop|serve)\n", .{});
         std.process.exit(1);
     };
-    if (std.mem.eql(u8, action, "status")) {
-        writeStdout("TODO: show gateway status\n", .{});
-    } else if (std.mem.eql(u8, action, "stop")) {
-        writeStdout("TODO: stop gateway daemon\n", .{});
+
+    if (mem.eql(u8, action, "serve")) {
+        // Run the gateway daemon (this is the entry point for auto-start)
+        var server = hibrow.gateway.Server.init(allocator);
+        defer server.deinit();
+        server.serve() catch |err| {
+            writeStderr("Error: gateway serve failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        return;
+    }
+
+    if (mem.eql(u8, action, "status")) {
+        var client = hibrow.Client.connect(allocator) catch |err| {
+            writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer client.disconnect();
+
+        var resp = client.gatewayStatus() catch |err| {
+            writeStderr("Error: gateway.status failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer resp.deinit();
+        printJsonValue(allocator, resp.result);
+    } else if (mem.eql(u8, action, "stop")) {
+        var client = hibrow.Client.connect(allocator) catch |err| {
+            writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer client.disconnect();
+
+        var resp = client.gatewayShutdown() catch |err| {
+            writeStderr("Error: gateway.shutdown failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer resp.deinit();
+        printJsonValue(allocator, resp.result);
     } else {
         writeStderr("Unknown gateway action: {s}\n", .{action});
         std.process.exit(1);
@@ -210,6 +395,33 @@ fn printUsage() void {
 
 fn printVersion() void {
     writeStdout("hibrow {s}\n", .{version});
+}
+
+/// Parse profile from "profile" or "profile:tab" format.
+/// Returns just the profile part.
+fn parseProfile(target: []const u8) []const u8 {
+    if (mem.indexOfScalar(u8, target, ':')) |colon| {
+        return target[0..colon];
+    }
+    return target;
+}
+
+/// Print a JSON-RPC error response to stderr.
+fn printError(allocator: mem.Allocator, err_val: json.Value) void {
+    if (err_val == .object) {
+        const msg = err_val.object.get("message") orelse .null;
+        if (msg == .string) {
+            writeStderr("Error: {s}\n", .{msg.string});
+            return;
+        }
+    }
+    // Fall back to printing the raw error JSON
+    const bytes = json.Stringify.valueAlloc(allocator, err_val, .{}) catch {
+        writeStderr("Error: unknown error\n", .{});
+        return;
+    };
+    defer allocator.free(bytes);
+    writeStderr("Error: {s}\n", .{bytes});
 }
 
 // ---------------------------------------------------------------------------
@@ -233,4 +445,13 @@ test "hibrow module is importable" {
     _ = hibrow.tab;
     _ = hibrow.cdp;
     _ = hibrow.websocket;
+}
+
+test "parseProfile extracts profile from bare name" {
+    try std.testing.expectEqualStrings("work", parseProfile("work"));
+}
+
+test "parseProfile extracts profile from profile:tab" {
+    try std.testing.expectEqualStrings("work", parseProfile("work:1"));
+    try std.testing.expectEqualStrings("personal", parseProfile("personal:3"));
 }
