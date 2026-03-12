@@ -317,6 +317,51 @@ out=$($HIBROW eval $PROFILE "getComputedStyle(document.getElementById('pupilGrou
 assert_contains "$out" "look" "eyeball pupil animation is active"
 
 # --------------------------------------------------------------------------
+# Test: kill browser (graceful close, profile preserved)
+# --------------------------------------------------------------------------
+
+echo ""
+echo "$(bold '==> Kill browser')"
+
+out=$($HIBROW kill $PROFILE 2>&1)
+assert_contains "$out" "killed" "kill returns killed"
+
+sleep 1
+
+# Browser should be gone from listing
+out=$($HIBROW ls 2>&1)
+if echo "$out" | grep -q "$PROFILE"; then
+    fail "browser still listed after kill" "$out"
+else
+    pass "browser no longer listed after kill"
+fi
+
+# Profile directory should still exist
+if [ -d "$HOME/.hibrow/profiles/$PROFILE" ]; then
+    pass "profile directory preserved after kill"
+else
+    fail "profile directory was deleted by kill"
+fi
+
+# Relaunch should work (profile reuse)
+out=$($HIBROW launch $PROFILE 2>&1)
+assert_contains "$out" "\"profile\"" "relaunch after kill succeeds"
+
+# Kill again for clean state before gateway stop test
+$HIBROW kill $PROFILE > /dev/null 2>&1
+sleep 0.5
+
+# --------------------------------------------------------------------------
+# Test: kill nonexistent browser
+# --------------------------------------------------------------------------
+
+echo ""
+echo "$(bold '==> Kill error handling')"
+
+out=$($HIBROW kill nonexistent-profile 2>&1) || true
+assert_contains "$out" "not found" "kill nonexistent profile returns error"
+
+# --------------------------------------------------------------------------
 # Test: gateway stop
 # --------------------------------------------------------------------------
 
@@ -332,16 +377,17 @@ out=$($HIBROW gateway status 2>&1)
 assert_contains "$out" "not running" "gateway shows not running after stop"
 
 # --------------------------------------------------------------------------
-# Cleanup: kill the test browser (it survives gateway stop)
+# Cleanup
 # --------------------------------------------------------------------------
 
-# The browser process is still running since we detached it.
-# Find and kill it by looking for our test profile in the user-data-dir.
+# Kill test browser if still running (belt and suspenders)
 pkill -f "user-data-dir.*$PROFILE" 2>/dev/null || true
+
+# Clean up test profile directory
+rm -rf "$HOME/.hibrow/profiles/$PROFILE" 2>/dev/null || true
 
 # Clean up profile registry entry
 if [ -f ~/.hibrow/profiles.json ]; then
-    # Remove test profile entry (best effort)
     python3 -c "
 import json, sys
 try:

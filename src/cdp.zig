@@ -309,6 +309,14 @@ pub const Connection = struct {
         defer cdp_result.deinit();
     }
 
+    /// Send Browser.close to gracefully shut down the browser.
+    /// Must be connected to the browser-level WebSocket (from /json/version),
+    /// not a page-level WebSocket.
+    pub fn closeBrowser(self: *Connection) !void {
+        var cdp_result = try self.send("Browser.close", null);
+        defer cdp_result.deinit();
+    }
+
     /// Get the current URL of the connected target.
     pub fn getUrl(self: *Connection) ![]u8 {
         var cdp_result = try self.send("Runtime.evaluate", blk: {

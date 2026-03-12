@@ -84,6 +84,15 @@ pub const Client = struct {
         return self.gw.call("browser.navigate", .{ .object = params });
     }
 
+    /// Kill (gracefully close) the named profile's browser.
+    /// The profile directory is preserved for next launch.
+    pub fn kill(self: *Client, profile: []const u8) !gateway.ParsedResponse {
+        var params = json.ObjectMap.init(self.allocator);
+        defer params.deinit();
+        try params.put("profile", .{ .string = profile });
+        return self.gw.call("browser.kill", .{ .object = params });
+    }
+
     /// Get gateway daemon status.
     pub fn gatewayStatus(self: *Client) !gateway.ParsedResponse {
         return self.gw.call("gateway.status", null);

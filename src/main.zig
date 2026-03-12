@@ -25,6 +25,9 @@ const usage =
     \\  eval <profile[:tab]> "<js>" | -f <file> | -f-
     \\      Evaluate JavaScript in a browser tab.
     \\
+    \\  kill <profile>
+    \\      Gracefully close a browser (profile is preserved).
+    \\
     \\  url <profile[:tab]>
     \\      Print the current URL of a browser tab.
     \\
@@ -84,6 +87,7 @@ pub fn main() !void {
         .{ "ls", cmdList },
         .{ "nav", cmdNavigate },
         .{ "eval", cmdEval },
+        .{ "kill", cmdKill },
         .{ "url", cmdUrl },
         .{ "console", cmdConsole },
         .{ "tab", cmdTab },
@@ -296,6 +300,31 @@ fn cmdEval(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
 
     var resp = client.eval(profile, expression) catch |err| {
         writeStderr("Error: eval failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer resp.deinit();
+
+    if (resp.is_error) {
+        printError(allocator, resp.result);
+        std.process.exit(1);
+    }
+    printJsonValue(allocator, resp.result);
+}
+
+fn cmdKill(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
+    const profile = args.next() orelse {
+        writeStderr("Error: kill requires a profile name\n", .{});
+        std.process.exit(1);
+    };
+
+    var client = hibrow.Client.connect(allocator) catch |err| {
+        writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer client.disconnect();
+
+    var resp = client.kill(profile) catch |err| {
+        writeStderr("Error: kill failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
     defer resp.deinit();

@@ -258,6 +258,7 @@ pub const Server = struct {
             .{ "browser.eval", wrapWithParams(handleBrowserEval) },
             .{ "browser.navigate", wrapWithParams(handleBrowserNavigate) },
             .{ "browser.get", wrapWithParams(handleBrowserGet) },
+            .{ "browser.kill", wrapWithParams(handleBrowserKill) },
         });
 
         if (methods.get(req.method)) |handler| {
@@ -467,6 +468,33 @@ pub const Server = struct {
         }
 
         return self.fail(id, .browser_not_found, "Browser not found");
+    }
+
+    fn handleBrowserKill(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {
+        const profile = extractStringParam(params, "profile") orelse
+            return self.fail(id, .invalid_params, "Missing 'profile' parameter");
+
+        const port = try findBrowserPort(self.allocator, profile) orelse
+            return self.fail(id, .browser_not_found, "Browser not found");
+
+        // Get browser-level WebSocket URL from /json/version
+        const version = cdp.getVersion(self.allocator, port) catch
+            return self.fail(id, .cdp_error, "Could not reach browser");
+        defer cdp.freeVersionInfo(self.allocator, version);
+
+        const browser_ws = version.webSocketDebuggerUrl orelse
+            return self.fail(id, .cdp_error, "No browser WebSocket URL");
+
+        // Connect to browser-level WebSocket and send Browser.close
+        var conn = cdp.Connection.init(self.allocator);
+        defer conn.deinit();
+        conn.connect(browser_ws) catch
+            return self.fail(id, .cdp_error, "WebSocket connection failed");
+
+        conn.closeBrowser() catch
+            return self.fail(id, .cdp_error, "Browser.close failed");
+
+        return self.ok(id, .{ .string = "killed" });
     }
 };
 
