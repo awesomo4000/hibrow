@@ -78,22 +78,20 @@ pub fn main() !void {
     }
 
     // Dispatch to command handlers
-    if (mem.eql(u8, command, "launch")) {
-        cmdLaunch(allocator, &args);
-    } else if (mem.eql(u8, command, "ls")) {
-        cmdList(allocator, &args);
-    } else if (mem.eql(u8, command, "nav")) {
-        cmdNavigate(allocator, &args);
-    } else if (mem.eql(u8, command, "eval")) {
-        cmdEval(allocator, &args);
-    } else if (mem.eql(u8, command, "url")) {
-        cmdUrl(allocator, &args);
-    } else if (mem.eql(u8, command, "console")) {
-        cmdConsole(allocator, &args);
-    } else if (mem.eql(u8, command, "tab")) {
-        cmdTab(allocator, &args);
-    } else if (mem.eql(u8, command, "gateway")) {
-        cmdGateway(allocator, &args);
+    const Handler = *const fn (mem.Allocator, *std.process.ArgIterator) void;
+    const commands = std.StaticStringMap(Handler).initComptime(.{
+        .{ "launch", cmdLaunch },
+        .{ "ls", cmdList },
+        .{ "nav", cmdNavigate },
+        .{ "eval", cmdEval },
+        .{ "url", cmdUrl },
+        .{ "console", cmdConsole },
+        .{ "tab", cmdTab },
+        .{ "gateway", cmdGateway },
+    });
+
+    if (commands.get(command)) |handler| {
+        handler(allocator, &args);
     } else {
         writeStderr("Unknown command: {s}\n\n", .{command});
         printUsage();

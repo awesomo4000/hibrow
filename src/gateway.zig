@@ -249,24 +249,40 @@ pub const Server = struct {
     /// Dispatch a JSON-RPC request to the appropriate handler.
     /// Returns encoded response bytes (caller owns).
     fn dispatch(self: *Server, req: protocol.Request) ![]u8 {
-        if (mem.eql(u8, req.method, "gateway.status")) {
-            return self.handleGatewayStatus(req.id);
-        } else if (mem.eql(u8, req.method, "gateway.shutdown")) {
-            return self.handleGatewayShutdown(req.id);
-        } else if (mem.eql(u8, req.method, "browser.list")) {
-            return self.handleBrowserList(req.id);
-        } else if (mem.eql(u8, req.method, "browser.launch")) {
-            return self.handleBrowserLaunch(req.id, req.params);
-        } else if (mem.eql(u8, req.method, "browser.eval")) {
-            return self.handleBrowserEval(req.id, req.params);
-        } else if (mem.eql(u8, req.method, "browser.navigate")) {
-            return self.handleBrowserNavigate(req.id, req.params);
-        } else if (mem.eql(u8, req.method, "browser.get")) {
-            return self.handleBrowserGet(req.id, req.params);
-        } else {
-            const resp = protocol.makeErrorResponse(req.id, .method_not_found, "Method not found");
-            return resp.encode(self.allocator);
+        const MethodHandler = *const fn (*Server, json.Value, ?json.Value) anyerror![]u8;
+        const methods = std.StaticStringMap(MethodHandler).initComptime(.{
+            .{ "gateway.status", wrapNoParams(handleGatewayStatus) },
+            .{ "gateway.shutdown", wrapNoParams(handleGatewayShutdown) },
+            .{ "browser.list", wrapNoParams(handleBrowserList) },
+            .{ "browser.launch", wrapWithParams(handleBrowserLaunch) },
+            .{ "browser.eval", wrapWithParams(handleBrowserEval) },
+            .{ "browser.navigate", wrapWithParams(handleBrowserNavigate) },
+            .{ "browser.get", wrapWithParams(handleBrowserGet) },
+        });
+
+        if (methods.get(req.method)) |handler| {
+            return handler(self, req.id, req.params);
         }
+        const resp = protocol.makeErrorResponse(req.id, .method_not_found, "Method not found");
+        return resp.encode(self.allocator);
+    }
+
+    /// Adapter: wrap a handler that only takes (self, id) to accept (self, id, params).
+    fn wrapNoParams(comptime func: fn (*Server, json.Value) anyerror![]u8) *const fn (*Server, json.Value, ?json.Value) anyerror![]u8 {
+        return &struct {
+            fn call(self: *Server, id: json.Value, _: ?json.Value) anyerror![]u8 {
+                return func(self, id);
+            }
+        }.call;
+    }
+
+    /// Adapter: wrap a handler that takes (self, id, params) — identity, for type uniformity.
+    fn wrapWithParams(comptime func: fn (*Server, json.Value, ?json.Value) anyerror![]u8) *const fn (*Server, json.Value, ?json.Value) anyerror![]u8 {
+        return &struct {
+            fn call(self: *Server, id: json.Value, params: ?json.Value) anyerror![]u8 {
+                return func(self, id, params);
+            }
+        }.call;
     }
 
     // -----------------------------------------------------------------------
