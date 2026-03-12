@@ -286,246 +286,187 @@ pub const Server = struct {
     }
 
     // -----------------------------------------------------------------------
+    // Response helpers — eliminate the encode boilerplate
+    // -----------------------------------------------------------------------
+
+    fn ok(self: *Server, id: json.Value, result: json.Value) ![]u8 {
+        const resp = protocol.makeResponse(id, result);
+        return resp.encode(self.allocator);
+    }
+
+    fn fail(self: *Server, id: json.Value, code: protocol.ErrorCode, message: []const u8) []u8 {
+        const resp = protocol.makeErrorResponse(id, code, message);
+        return resp.encode(self.allocator) catch &.{};
+    }
+
+    /// Connect to a profile's active page via CDP. Returns a live connection
+    /// or an encoded error response ready to send back to the client.
+    const CdpResult = union(enum) {
+        connected: struct { conn: cdp.Connection, targets: []cdp.Target },
+        err: []u8,
+    };
+
+    fn connectToProfile(self: *Server, id: json.Value, profile: []const u8) !CdpResult {
+        const port = try findBrowserPort(self.allocator, profile) orelse
+            return .{ .err = self.fail(id, .browser_not_found, "Browser not found") };
+
+        const targets = cdp.discoverTargets(self.allocator, port) catch
+            return .{ .err = self.fail(id, .cdp_error, "CDP target discovery failed") };
+
+        const ws_url = findPageTarget(targets) orelse {
+            cdp.freeTargets(self.allocator, targets);
+            return .{ .err = self.fail(id, .cdp_error, "No page target found") };
+        };
+
+        var conn = cdp.Connection.init(self.allocator);
+        conn.connect(ws_url) catch {
+            conn.deinit();
+            cdp.freeTargets(self.allocator, targets);
+            return .{ .err = self.fail(id, .cdp_error, "WebSocket connection failed") };
+        };
+
+        return .{ .connected = .{ .conn = conn, .targets = targets } };
+    }
+
+    /// Serialize a Browser struct to a JSON object value.
+    fn browserToJson(self: *Server, b: browser_mod.Browser) !json.ObjectMap {
+        var obj = json.ObjectMap.init(self.allocator);
+        try obj.put("profile", .{ .string = b.profile });
+        try obj.put("port", .{ .integer = @intCast(b.port) });
+        if (b.pid) |pid| try obj.put("pid", .{ .integer = @intCast(pid) });
+        try obj.put("managed", .{ .bool = b.managed });
+        return obj;
+    }
+
+    // -----------------------------------------------------------------------
     // Method handlers
     // -----------------------------------------------------------------------
 
     fn handleGatewayStatus(self: *Server, id: json.Value) ![]u8 {
-        var result_obj = json.ObjectMap.init(self.allocator);
-        defer result_obj.deinit();
-        try result_obj.put("status", .{ .string = "running" });
-
-        const resp = protocol.makeResponse(id, .{ .object = result_obj });
-        return resp.encode(self.allocator);
+        return self.ok(id, .{ .string = "running" });
     }
 
     fn handleGatewayShutdown(self: *Server, id: json.Value) ![]u8 {
-        var result_obj = json.ObjectMap.init(self.allocator);
-        defer result_obj.deinit();
-        try result_obj.put("status", .{ .string = "shutting_down" });
+        const encoded = try self.ok(id, .{ .string = "shutting_down" });
 
-        const resp = protocol.makeResponse(id, .{ .object = result_obj });
-        const encoded = try resp.encode(self.allocator);
-
-        // Schedule shutdown: close the listener so accept() unblocks.
-        // We do this after encoding the response so the caller gets the reply.
+        // Shut down after encoding the response so the client gets the reply.
         self.running = false;
-        if (self.listener) |*l| {
-            l.deinit();
-            self.listener = null;
-        }
-
-        // Clean up socket file
-        if (self.socket_path) |p| {
-            std.fs.deleteFileAbsolute(p) catch {};
-        }
+        if (self.listener) |*l| { l.deinit(); self.listener = null; }
+        if (self.socket_path) |p| std.fs.deleteFileAbsolute(p) catch {};
 
         return encoded;
     }
 
     fn handleBrowserList(self: *Server, id: json.Value) ![]u8 {
-        // Discovery-first: scan for running browsers
-        const browsers = browser_mod.discover(self.allocator) catch {
-            const resp = protocol.makeErrorResponse(id, .internal_error, "Discovery failed");
-            return resp.encode(self.allocator);
-        };
+        const browsers = browser_mod.discover(self.allocator) catch
+            return self.fail(id, .internal_error, "Discovery failed");
         defer browser_mod.freeBrowsers(self.allocator, browsers);
 
-        // Build JSON array of browser info
         var arr = json.Array.init(self.allocator);
         defer arr.deinit();
-
         for (browsers) |b| {
-            var obj = json.ObjectMap.init(self.allocator);
-            try obj.put("profile", .{ .string = b.profile });
-            try obj.put("port", .{ .integer = @intCast(b.port) });
-            if (b.pid) |pid| {
-                try obj.put("pid", .{ .integer = @intCast(pid) });
-            }
-            try obj.put("managed", .{ .bool = b.managed });
+            const obj = try self.browserToJson(b);
             try arr.append(.{ .object = obj });
         }
 
-        const resp = protocol.makeResponse(id, .{ .array = arr });
-        return resp.encode(self.allocator);
+        return self.ok(id, .{ .array = arr });
     }
 
     fn handleBrowserLaunch(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {
-        const profile = extractStringParam(params, "profile") orelse {
-            const resp = protocol.makeErrorResponse(id, .invalid_params, "Missing 'profile' parameter");
-            return resp.encode(self.allocator);
-        };
+        const profile = extractStringParam(params, "profile") orelse
+            return self.fail(id, .invalid_params, "Missing 'profile' parameter");
 
-        // Discovery-first: check if this profile is already running.
+        // Already running? Return existing info.
         if (try findBrowserPort(self.allocator, profile)) |existing_port| {
-            // Already running — return existing browser info instead of launching again.
-            var result_obj = json.ObjectMap.init(self.allocator);
-            defer result_obj.deinit();
-            try result_obj.put("profile", .{ .string = profile });
-            try result_obj.put("port", .{ .integer = @intCast(existing_port) });
-            try result_obj.put("already_running", .{ .bool = true });
-
-            const resp = protocol.makeResponse(id, .{ .object = result_obj });
-            return resp.encode(self.allocator);
+            var obj = json.ObjectMap.init(self.allocator);
+            defer obj.deinit();
+            try obj.put("profile", .{ .string = profile });
+            try obj.put("port", .{ .integer = @intCast(existing_port) });
+            try obj.put("already_running", .{ .bool = true });
+            return self.ok(id, .{ .object = obj });
         }
-
-        const proxy = extractStringParam(params, "proxy");
-        const proxy_dns = extractBoolParam(params, "proxy_dns") orelse false;
 
         const b = browser_mod.launch(self.allocator, .{
             .profile = profile,
-            .proxy = proxy,
-            .proxy_dns = proxy_dns,
-        }) catch |err| {
-            const resp = protocol.makeErrorResponse(id, .browser_launch_failed, @errorName(err));
-            return resp.encode(self.allocator);
-        };
+            .proxy = extractStringParam(params, "proxy"),
+            .proxy_dns = extractBoolParam(params, "proxy_dns") orelse false,
+        }) catch |err|
+            return self.fail(id, .browser_launch_failed, @errorName(err));
         defer self.allocator.free(b.profile);
 
-        var result_obj = json.ObjectMap.init(self.allocator);
-        defer result_obj.deinit();
-        try result_obj.put("profile", .{ .string = b.profile });
-        try result_obj.put("port", .{ .integer = @intCast(b.port) });
-        if (b.pid) |pid| {
-            try result_obj.put("pid", .{ .integer = @intCast(pid) });
-        }
-
-        const resp = protocol.makeResponse(id, .{ .object = result_obj });
-        return resp.encode(self.allocator);
+        var obj = try self.browserToJson(b);
+        defer obj.deinit();
+        return self.ok(id, .{ .object = obj });
     }
 
     fn handleBrowserEval(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {
-        const profile = extractStringParam(params, "profile") orelse {
-            const resp = protocol.makeErrorResponse(id, .invalid_params, "Missing 'profile' parameter");
-            return resp.encode(self.allocator);
-        };
-        const expression = extractStringParam(params, "expression") orelse {
-            const resp = protocol.makeErrorResponse(id, .invalid_params, "Missing 'expression' parameter");
-            return resp.encode(self.allocator);
-        };
+        const profile = extractStringParam(params, "profile") orelse
+            return self.fail(id, .invalid_params, "Missing 'profile' parameter");
+        const expression = extractStringParam(params, "expression") orelse
+            return self.fail(id, .invalid_params, "Missing 'expression' parameter");
 
-        // Find the browser by profile name
-        const port = try findBrowserPort(self.allocator, profile) orelse {
-            const resp = protocol.makeErrorResponse(id, .browser_not_found, "Browser not found");
-            return resp.encode(self.allocator);
-        };
+        var result = try self.connectToProfile(id, profile);
+        switch (result) {
+            .err => |bytes| return bytes,
+            .connected => |*c| {
+                defer c.conn.deinit();
+                defer cdp.freeTargets(self.allocator, c.targets);
 
-        // Discover targets to get the WebSocket URL
-        const targets = cdp.discoverTargets(self.allocator, port) catch {
-            const resp = protocol.makeErrorResponse(id, .cdp_error, "CDP target discovery failed");
-            return resp.encode(self.allocator);
-        };
-        defer cdp.freeTargets(self.allocator, targets);
+                const eval_result = c.conn.eval(expression) catch
+                    return self.fail(id, .cdp_error, "Eval failed");
 
-        if (targets.len == 0) {
-            const resp = protocol.makeErrorResponse(id, .cdp_error, "No targets found");
-            return resp.encode(self.allocator);
+                if (eval_result.exception) |exc| {
+                    defer self.allocator.free(exc);
+                    return self.fail(id, .cdp_error, exc);
+                }
+
+                return self.ok(id, eval_result.value);
+            },
         }
-
-        // Connect to first page target
-        const ws_url = findPageTarget(targets) orelse {
-            const resp = protocol.makeErrorResponse(id, .cdp_error, "No page target found");
-            return resp.encode(self.allocator);
-        };
-
-        var conn = cdp.Connection.init(self.allocator);
-        defer conn.deinit();
-        conn.connect(ws_url) catch {
-            const resp = protocol.makeErrorResponse(id, .cdp_error, "WebSocket connection failed");
-            return resp.encode(self.allocator);
-        };
-
-        const eval_result = conn.eval(expression) catch {
-            const resp = protocol.makeErrorResponse(id, .cdp_error, "Eval failed");
-            return resp.encode(self.allocator);
-        };
-
-        if (eval_result.exception) |exc| {
-            defer self.allocator.free(exc);
-            const resp = protocol.makeErrorResponse(id, .cdp_error, exc);
-            return resp.encode(self.allocator);
-        }
-
-        const resp = protocol.makeResponse(id, eval_result.value);
-        return resp.encode(self.allocator);
     }
 
     fn handleBrowserNavigate(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {
-        const profile = extractStringParam(params, "profile") orelse {
-            const resp = protocol.makeErrorResponse(id, .invalid_params, "Missing 'profile' parameter");
-            return resp.encode(self.allocator);
-        };
-        const url = extractStringParam(params, "url") orelse {
-            const resp = protocol.makeErrorResponse(id, .invalid_params, "Missing 'url' parameter");
-            return resp.encode(self.allocator);
-        };
+        const profile = extractStringParam(params, "profile") orelse
+            return self.fail(id, .invalid_params, "Missing 'profile' parameter");
+        const url = extractStringParam(params, "url") orelse
+            return self.fail(id, .invalid_params, "Missing 'url' parameter");
 
-        const port = try findBrowserPort(self.allocator, profile) orelse {
-            const resp = protocol.makeErrorResponse(id, .browser_not_found, "Browser not found");
-            return resp.encode(self.allocator);
-        };
+        var result = try self.connectToProfile(id, profile);
+        switch (result) {
+            .err => |bytes| return bytes,
+            .connected => |*c| {
+                defer c.conn.deinit();
+                defer cdp.freeTargets(self.allocator, c.targets);
 
-        const targets = cdp.discoverTargets(self.allocator, port) catch {
-            const resp = protocol.makeErrorResponse(id, .cdp_error, "CDP discovery failed");
-            return resp.encode(self.allocator);
-        };
-        defer cdp.freeTargets(self.allocator, targets);
+                c.conn.navigate(url) catch
+                    return self.fail(id, .cdp_error, "Navigate failed");
 
-        const ws_url = findPageTarget(targets) orelse {
-            const resp = protocol.makeErrorResponse(id, .cdp_error, "No page target found");
-            return resp.encode(self.allocator);
-        };
-
-        var conn = cdp.Connection.init(self.allocator);
-        defer conn.deinit();
-        conn.connect(ws_url) catch {
-            const resp = protocol.makeErrorResponse(id, .cdp_error, "WebSocket connection failed");
-            return resp.encode(self.allocator);
-        };
-
-        conn.navigate(url) catch {
-            const resp = protocol.makeErrorResponse(id, .cdp_error, "Navigate failed");
-            return resp.encode(self.allocator);
-        };
-
-        var result_obj = json.ObjectMap.init(self.allocator);
-        defer result_obj.deinit();
-        try result_obj.put("status", .{ .string = "navigated" });
-        try result_obj.put("url", .{ .string = url });
-
-        const resp = protocol.makeResponse(id, .{ .object = result_obj });
-        return resp.encode(self.allocator);
+                var obj = json.ObjectMap.init(self.allocator);
+                defer obj.deinit();
+                try obj.put("status", .{ .string = "navigated" });
+                try obj.put("url", .{ .string = url });
+                return self.ok(id, .{ .object = obj });
+            },
+        }
     }
 
     fn handleBrowserGet(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {
-        const profile = extractStringParam(params, "profile") orelse {
-            const resp = protocol.makeErrorResponse(id, .invalid_params, "Missing 'profile' parameter");
-            return resp.encode(self.allocator);
-        };
+        const profile = extractStringParam(params, "profile") orelse
+            return self.fail(id, .invalid_params, "Missing 'profile' parameter");
 
-        // Discover browsers and find the matching profile
-        const browsers = browser_mod.discover(self.allocator) catch {
-            const resp = protocol.makeErrorResponse(id, .internal_error, "Discovery failed");
-            return resp.encode(self.allocator);
-        };
+        const browsers = browser_mod.discover(self.allocator) catch
+            return self.fail(id, .internal_error, "Discovery failed");
         defer browser_mod.freeBrowsers(self.allocator, browsers);
 
         for (browsers) |b| {
             if (mem.eql(u8, b.profile, profile)) {
-                var result_obj = json.ObjectMap.init(self.allocator);
-                defer result_obj.deinit();
-                try result_obj.put("profile", .{ .string = b.profile });
-                try result_obj.put("port", .{ .integer = @intCast(b.port) });
-                if (b.pid) |pid| {
-                    try result_obj.put("pid", .{ .integer = @intCast(pid) });
-                }
-
-                const resp = protocol.makeResponse(id, .{ .object = result_obj });
-                return resp.encode(self.allocator);
+                var obj = try self.browserToJson(b);
+                defer obj.deinit();
+                return self.ok(id, .{ .object = obj });
             }
         }
 
-        const resp = protocol.makeErrorResponse(id, .browser_not_found, "Browser not found");
-        return resp.encode(self.allocator);
+        return self.fail(id, .browser_not_found, "Browser not found");
     }
 };
 
@@ -951,8 +892,7 @@ test "Server dispatch handles gateway.status" {
     var parsed = try protocol.parseMessage(allocator, response_bytes);
     defer parsed.deinit();
     const obj = parsed.value().object;
-    const result = obj.get("result").?.object;
-    try std.testing.expectEqualStrings("running", result.get("status").?.string);
+    try std.testing.expectEqualStrings("running", obj.get("result").?.string);
 }
 
 test "Server dispatch handles gateway.shutdown" {
@@ -973,8 +913,7 @@ test "Server dispatch handles gateway.shutdown" {
     var parsed = try protocol.parseMessage(allocator, response_bytes);
     defer parsed.deinit();
     const obj = parsed.value().object;
-    const result = obj.get("result").?.object;
-    try std.testing.expectEqualStrings("shutting_down", result.get("status").?.string);
+    try std.testing.expectEqualStrings("shutting_down", obj.get("result").?.string);
 }
 
 test "sendErrorResponse produces valid response" {
