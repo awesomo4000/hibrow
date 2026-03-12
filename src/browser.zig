@@ -127,8 +127,6 @@ pub fn launch(allocator: mem.Allocator, options: LaunchOptions) !Browser {
 
     try argv_list.append(allocator, "--no-first-run");
     try argv_list.append(allocator, "--no-default-browser-check");
-    try argv_list.append(allocator, "--disable-infobars");
-    try argv_list.append(allocator, "--disable-blink-features=AutomationControlled");
     try argv_list.append(allocator, "--password-store=basic");
     try argv_list.append(allocator, "--use-mock-keychain");
 
