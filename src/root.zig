@@ -94,6 +94,51 @@ pub const Client = struct {
         return self.gw.call("browser.kill", .{ .object = params });
     }
 
+    /// Get the current URL of the named profile's active tab.
+    pub fn getUrl(self: *Client, profile: []const u8) !gateway.ParsedResponse {
+        var params = json.ObjectMap.init(self.allocator);
+        defer params.deinit();
+        try params.put("profile", .{ .string = profile });
+        return self.gw.call("browser.url", .{ .object = params });
+    }
+
+    /// List tabs for a profile.
+    pub fn tabList(self: *Client, profile: []const u8) !gateway.ParsedResponse {
+        var params = json.ObjectMap.init(self.allocator);
+        defer params.deinit();
+        try params.put("profile", .{ .string = profile });
+        return self.gw.call("tab.list", .{ .object = params });
+    }
+
+    /// Open a new tab in the named profile's browser.
+    pub fn tabNew(self: *Client, profile: []const u8, tab_url: ?[]const u8) !gateway.ParsedResponse {
+        var params = json.ObjectMap.init(self.allocator);
+        defer params.deinit();
+        try params.put("profile", .{ .string = profile });
+        if (tab_url) |u| {
+            try params.put("url", .{ .string = u });
+        }
+        return self.gw.call("tab.new", .{ .object = params });
+    }
+
+    /// Close a tab by index in the named profile's browser.
+    pub fn tabClose(self: *Client, profile: []const u8, tab_index: u32) !gateway.ParsedResponse {
+        var params = json.ObjectMap.init(self.allocator);
+        defer params.deinit();
+        try params.put("profile", .{ .string = profile });
+        try params.put("tab", .{ .integer = @intCast(tab_index) });
+        return self.gw.call("tab.close", .{ .object = params });
+    }
+
+    /// Switch to (activate) a tab by index in the named profile's browser.
+    pub fn tabSwitch(self: *Client, profile: []const u8, tab_index: u32) !gateway.ParsedResponse {
+        var params = json.ObjectMap.init(self.allocator);
+        defer params.deinit();
+        try params.put("profile", .{ .string = profile });
+        try params.put("tab", .{ .integer = @intCast(tab_index) });
+        return self.gw.call("tab.switch", .{ .object = params });
+    }
+
     /// Get gateway daemon status.
     pub fn gatewayStatus(self: *Client) !gateway.ParsedResponse {
         return self.gw.call("gateway.status", null);

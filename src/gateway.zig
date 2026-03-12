@@ -278,6 +278,11 @@ pub const Server = struct {
             .{ "browser.navigate", wrapWithParams(handleBrowserNavigate) },
             .{ "browser.get", wrapWithParams(handleBrowserGet) },
             .{ "browser.kill", wrapWithParams(handleBrowserKill) },
+            .{ "browser.url", wrapWithParams(handleBrowserUrl) },
+            .{ "tab.list", wrapWithParams(handleTabList) },
+            .{ "tab.new", wrapWithParams(handleTabNew) },
+            .{ "tab.close", wrapWithParams(handleTabClose) },
+            .{ "tab.switch", wrapWithParams(handleTabSwitch) },
         });
 
         if (methods.get(req.method)) |handler| {
@@ -543,6 +548,176 @@ pub const Server = struct {
 
         return self.ok(id, .{ .string = "killed" });
     }
+
+    fn handleBrowserUrl(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {
+        const profile = extractStringParam(params, "profile") orelse
+            return self.fail(id, .invalid_params, "Missing 'profile' parameter");
+
+        const conn = self.getConnection(profile) orelse
+            return self.fail(id, .browser_not_found, "Browser not found");
+
+        const url_str = conn.getUrl() catch {
+            self.evictConnection(profile);
+            return self.fail(id, .cdp_error, "Could not get URL");
+        };
+        defer self.allocator.free(url_str);
+
+        return self.ok(id, .{ .string = url_str });
+    }
+
+    // -----------------------------------------------------------------------
+    // Tab management handlers
+    // -----------------------------------------------------------------------
+
+    /// Helper: get page-type targets for a profile.
+    /// Returns the browser port and the filtered page targets (caller owns).
+    const PageTargetsResult = struct {
+        port: u16,
+        targets: []cdp.Target,
+    };
+
+    fn getPageTargets(self: *Server, profile: []const u8) !?PageTargetsResult {
+        const port = try findBrowserPort(self.allocator, profile) orelse return null;
+
+        const all_targets = cdp.discoverTargets(self.allocator, port) catch return null;
+        defer cdp.freeTargets(self.allocator, all_targets);
+
+        // Filter to page-type targets, duping them into owned memory
+        var pages: std.ArrayList(cdp.Target) = .{};
+        errdefer {
+            for (pages.items) |t| {
+                self.allocator.free(t.id);
+                self.allocator.free(t.title);
+                self.allocator.free(t.url);
+                self.allocator.free(t.@"type");
+                if (t.webSocketDebuggerUrl) |ws| self.allocator.free(ws);
+            }
+            pages.deinit(self.allocator);
+        }
+
+        for (all_targets) |t| {
+            if (mem.eql(u8, t.@"type", "page")) {
+                const ws_url = if (t.webSocketDebuggerUrl) |ws|
+                    try self.allocator.dupe(u8, ws)
+                else
+                    null;
+                errdefer if (ws_url) |w| self.allocator.free(w);
+
+                try pages.append(self.allocator, .{
+                    .id = try self.allocator.dupe(u8, t.id),
+                    .title = try self.allocator.dupe(u8, t.title),
+                    .url = try self.allocator.dupe(u8, t.url),
+                    .@"type" = try self.allocator.dupe(u8, t.@"type"),
+                    .webSocketDebuggerUrl = ws_url,
+                });
+            }
+        }
+
+        return .{
+            .port = port,
+            .targets = try pages.toOwnedSlice(self.allocator),
+        };
+    }
+
+    fn handleTabList(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {
+        const profile = extractStringParam(params, "profile") orelse
+            return self.fail(id, .invalid_params, "Missing 'profile' parameter");
+
+        const result = try self.getPageTargets(profile) orelse
+            return self.fail(id, .browser_not_found, "Browser not found");
+        defer cdp.freeTargets(self.allocator, result.targets);
+
+        var arr = json.Array.init(self.allocator);
+        defer arr.deinit();
+        for (result.targets, 0..) |t, i| {
+            var obj = json.ObjectMap.init(self.allocator);
+            try obj.put("index", .{ .integer = @intCast(i) });
+            try obj.put("title", .{ .string = t.title });
+            try obj.put("url", .{ .string = t.url });
+            try arr.append(.{ .object = obj });
+        }
+
+        return self.ok(id, .{ .array = arr });
+    }
+
+    fn handleTabNew(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {
+        const profile = extractStringParam(params, "profile") orelse
+            return self.fail(id, .invalid_params, "Missing 'profile' parameter");
+
+        const port = try findBrowserPort(self.allocator, profile) orelse
+            return self.fail(id, .browser_not_found, "Browser not found");
+
+        const url = extractStringParam(params, "url");
+
+        const new_target = cdp.createTarget(self.allocator, port, url) catch
+            return self.fail(id, .cdp_error, "Could not create tab");
+        defer {
+            self.allocator.free(new_target.id);
+            self.allocator.free(new_target.title);
+            self.allocator.free(new_target.url);
+            self.allocator.free(new_target.@"type");
+            if (new_target.webSocketDebuggerUrl) |ws| self.allocator.free(ws);
+        }
+
+        // Evict cached connection so next operation rediscovers tabs
+        self.evictConnection(profile);
+
+        var obj = json.ObjectMap.init(self.allocator);
+        defer obj.deinit();
+        try obj.put("status", .{ .string = "created" });
+        try obj.put("url", .{ .string = new_target.url });
+        return self.ok(id, .{ .object = obj });
+    }
+
+    fn handleTabClose(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {
+        const profile = extractStringParam(params, "profile") orelse
+            return self.fail(id, .invalid_params, "Missing 'profile' parameter");
+
+        const tab_idx = extractIntParam(params, "tab") orelse
+            return self.fail(id, .invalid_params, "Missing 'tab' parameter");
+        if (tab_idx < 0) return self.fail(id, .invalid_params, "Tab index must be non-negative");
+        const idx: usize = @intCast(tab_idx);
+
+        const result = try self.getPageTargets(profile) orelse
+            return self.fail(id, .browser_not_found, "Browser not found");
+        defer cdp.freeTargets(self.allocator, result.targets);
+
+        if (idx >= result.targets.len)
+            return self.fail(id, .invalid_params, "Tab index out of bounds");
+
+        cdp.closeTarget(self.allocator, result.port, result.targets[idx].id) catch
+            return self.fail(id, .cdp_error, "Could not close tab");
+
+        // Evict cached connection since tab layout changed
+        self.evictConnection(profile);
+
+        return self.ok(id, .{ .string = "closed" });
+    }
+
+    fn handleTabSwitch(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {
+        const profile = extractStringParam(params, "profile") orelse
+            return self.fail(id, .invalid_params, "Missing 'profile' parameter");
+
+        const tab_idx = extractIntParam(params, "tab") orelse
+            return self.fail(id, .invalid_params, "Missing 'tab' parameter");
+        if (tab_idx < 0) return self.fail(id, .invalid_params, "Tab index must be non-negative");
+        const idx: usize = @intCast(tab_idx);
+
+        const result = try self.getPageTargets(profile) orelse
+            return self.fail(id, .browser_not_found, "Browser not found");
+        defer cdp.freeTargets(self.allocator, result.targets);
+
+        if (idx >= result.targets.len)
+            return self.fail(id, .invalid_params, "Tab index out of bounds");
+
+        cdp.activateTarget(self.allocator, result.port, result.targets[idx].id) catch
+            return self.fail(id, .cdp_error, "Could not activate tab");
+
+        // Evict cached connection so next eval connects to newly active tab
+        self.evictConnection(profile);
+
+        return self.ok(id, .{ .string = "switched" });
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -672,6 +847,16 @@ fn extractBoolParam(params: ?json.Value, key: []const u8) ?bool {
     const val = p.object.get(key) orelse return null;
     if (val != .bool) return null;
     return val.bool;
+}
+
+/// Extract an integer parameter from JSON-RPC params.
+fn extractIntParam(params: ?json.Value, key: []const u8) ?i64 {
+    const p = params orelse return null;
+    if (p == .null) return null;
+    if (p != .object) return null;
+    const val = p.object.get(key) orelse return null;
+    if (val != .integer) return null;
+    return val.integer;
 }
 
 /// Find a browser's CDP port by scanning running processes for the given profile.
@@ -1047,4 +1232,123 @@ test "ParsedResponse struct layout" {
     _ = @hasField(ParsedResponse, "parsed");
     _ = @hasField(ParsedResponse, "result");
     _ = @hasField(ParsedResponse, "is_error");
+}
+
+test "extractIntParam extracts from object" {
+    const allocator = std.testing.allocator;
+    var obj = json.ObjectMap.init(allocator);
+    defer obj.deinit();
+    try obj.put("tab", .{ .integer = 3 });
+    try obj.put("name", .{ .string = "test" });
+
+    const params: json.Value = .{ .object = obj };
+    try std.testing.expectEqual(@as(?i64, 3), extractIntParam(params, "tab"));
+    try std.testing.expect(extractIntParam(params, "name") == null); // string, not integer
+    try std.testing.expect(extractIntParam(params, "missing") == null);
+}
+
+test "extractIntParam handles null and absent params" {
+    try std.testing.expect(extractIntParam(null, "key") == null);
+    try std.testing.expect(extractIntParam(.null, "key") == null);
+}
+
+test "Server dispatch handles new methods without crashing" {
+    // Verify the dispatch table includes the new methods (they will fail with
+    // browser_not_found since no browser is running, but they should not crash)
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    // browser.url — needs profile param
+    {
+        var params_obj = json.ObjectMap.init(allocator);
+        defer params_obj.deinit();
+        try params_obj.put("profile", .{ .string = "nonexistent" });
+        const req = protocol.Request{
+            .method = "browser.url",
+            .params = .{ .object = params_obj },
+            .id = .{ .integer = 10 },
+        };
+        const response_bytes = try server.dispatch(req);
+        defer allocator.free(response_bytes);
+        // Should get an error (browser not found), not a crash
+        var parsed = try protocol.parseMessage(allocator, response_bytes);
+        defer parsed.deinit();
+        const obj = parsed.value().object;
+        try std.testing.expect(obj.get("error") != null);
+    }
+
+    // tab.list — needs profile param
+    {
+        var params_obj = json.ObjectMap.init(allocator);
+        defer params_obj.deinit();
+        try params_obj.put("profile", .{ .string = "nonexistent" });
+        const req = protocol.Request{
+            .method = "tab.list",
+            .params = .{ .object = params_obj },
+            .id = .{ .integer = 11 },
+        };
+        const response_bytes = try server.dispatch(req);
+        defer allocator.free(response_bytes);
+        var parsed = try protocol.parseMessage(allocator, response_bytes);
+        defer parsed.deinit();
+        const obj = parsed.value().object;
+        try std.testing.expect(obj.get("error") != null);
+    }
+
+    // tab.new — needs profile param
+    {
+        var params_obj = json.ObjectMap.init(allocator);
+        defer params_obj.deinit();
+        try params_obj.put("profile", .{ .string = "nonexistent" });
+        const req = protocol.Request{
+            .method = "tab.new",
+            .params = .{ .object = params_obj },
+            .id = .{ .integer = 12 },
+        };
+        const response_bytes = try server.dispatch(req);
+        defer allocator.free(response_bytes);
+        var parsed = try protocol.parseMessage(allocator, response_bytes);
+        defer parsed.deinit();
+        const obj = parsed.value().object;
+        try std.testing.expect(obj.get("error") != null);
+    }
+
+    // tab.close — needs profile + tab params
+    {
+        var params_obj = json.ObjectMap.init(allocator);
+        defer params_obj.deinit();
+        try params_obj.put("profile", .{ .string = "nonexistent" });
+        try params_obj.put("tab", .{ .integer = 0 });
+        const req = protocol.Request{
+            .method = "tab.close",
+            .params = .{ .object = params_obj },
+            .id = .{ .integer = 13 },
+        };
+        const response_bytes = try server.dispatch(req);
+        defer allocator.free(response_bytes);
+        var parsed = try protocol.parseMessage(allocator, response_bytes);
+        defer parsed.deinit();
+        const obj = parsed.value().object;
+        try std.testing.expect(obj.get("error") != null);
+    }
+
+    // tab.switch — needs profile + tab params
+    {
+        var params_obj = json.ObjectMap.init(allocator);
+        defer params_obj.deinit();
+        try params_obj.put("profile", .{ .string = "nonexistent" });
+        try params_obj.put("tab", .{ .integer = 0 });
+        const req = protocol.Request{
+            .method = "tab.switch",
+            .params = .{ .object = params_obj },
+            .id = .{ .integer = 14 },
+        };
+        const response_bytes = try server.dispatch(req);
+        defer allocator.free(response_bytes);
+        var parsed = try protocol.parseMessage(allocator, response_bytes);
+        defer parsed.deinit();
+        const obj = parsed.value().object;
+        try std.testing.expect(obj.get("error") != null);
+    }
 }

@@ -237,6 +237,72 @@ out=$($HIBROW eval $PROFILE "window.location.href" 2>&1)
 assert_contains "$out" "chrome://version" "nav to chrome://version and verify location"
 
 # --------------------------------------------------------------------------
+# Test: url command
+# --------------------------------------------------------------------------
+
+echo ""
+echo "$(bold '==> URL command')"
+
+out=$($HIBROW url $PROFILE 2>&1)
+assert_contains "$out" "chrome://version" "url returns current page URL"
+
+# Navigate to about:blank and check url again
+$HIBROW nav $PROFILE "about:blank" > /dev/null 2>&1
+sleep 0.3
+
+out=$($HIBROW url $PROFILE 2>&1)
+assert_contains "$out" "about:blank" "url returns about:blank after nav"
+
+# --------------------------------------------------------------------------
+# Test: tab management
+# --------------------------------------------------------------------------
+
+echo ""
+echo "$(bold '==> Tab management')"
+
+# List tabs — should show 1 tab
+out=$($HIBROW tab list $PROFILE 2>&1)
+assert_contains "$out" "index" "tab list returns tab info"
+assert_contains "$out" "about:blank" "tab list shows current URL"
+
+# Create a new tab
+out=$($HIBROW tab new $PROFILE 2>&1)
+assert_contains "$out" "created" "tab new returns created status"
+
+sleep 0.5
+
+# List tabs — should now show 2 tabs
+out=$($HIBROW tab list $PROFILE 2>&1)
+# Count the number of "index" occurrences to verify 2 tabs
+tab_count=$(echo "$out" | grep -c '"index"')
+if [ "$tab_count" -ge 2 ]; then
+    pass "tab list shows 2 tabs after tab new"
+else
+    fail "tab list shows 2 tabs after tab new" "got $tab_count tabs"
+fi
+
+# Switch to tab 0 (first tab)
+out=$($HIBROW tab switch $PROFILE:0 2>&1)
+assert_contains "$out" "switched" "tab switch returns switched status"
+
+sleep 0.3
+
+# Close tab 1 (second tab)
+out=$($HIBROW tab close $PROFILE:1 2>&1)
+assert_contains "$out" "closed" "tab close returns closed status"
+
+sleep 0.3
+
+# List tabs — should be back to 1 tab
+out=$($HIBROW tab list $PROFILE 2>&1)
+tab_count=$(echo "$out" | grep -c '"index"')
+if [ "$tab_count" -eq 1 ]; then
+    pass "tab list shows 1 tab after closing second tab"
+else
+    fail "tab list shows 1 tab after closing second tab" "got $tab_count tabs"
+fi
+
+# --------------------------------------------------------------------------
 # Test: eyeball with random hex — visual proof of real browser control
 # --------------------------------------------------------------------------
 

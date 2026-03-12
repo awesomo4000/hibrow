@@ -341,8 +341,32 @@ fn cmdUrl(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
         writeStderr("Error: url requires a profile[:tab]\n", .{});
         std.process.exit(1);
     };
-    _ = allocator;
-    writeStdout("TODO: print URL for {s}\n", .{target});
+
+    const profile = parseProfile(target);
+
+    var client = hibrow.Client.connect(allocator) catch |err| {
+        writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer client.disconnect();
+
+    var resp = client.getUrl(profile) catch |err| {
+        writeStderr("Error: url failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer resp.deinit();
+
+    if (resp.is_error) {
+        printError(allocator, resp.result);
+        std.process.exit(1);
+    }
+
+    // Print raw URL string for clean piping (strip JSON quotes)
+    if (resp.result == .string) {
+        writeStdout("{s}\n", .{resp.result.string});
+    } else {
+        printJsonValue(allocator, resp.result);
+    }
 }
 
 fn cmdConsole(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
@@ -359,8 +383,125 @@ fn cmdTab(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
         writeStderr("Error: tab requires an action (list|new|close|switch)\n", .{});
         std.process.exit(1);
     };
-    _ = allocator;
-    writeStdout("TODO: tab {s}\n", .{action});
+
+    if (mem.eql(u8, action, "list")) {
+        const profile = args.next() orelse {
+            writeStderr("Error: tab list requires a profile name\n", .{});
+            std.process.exit(1);
+        };
+
+        var client = hibrow.Client.connect(allocator) catch |err| {
+            writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer client.disconnect();
+
+        var resp = client.tabList(profile) catch |err| {
+            writeStderr("Error: tab list failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer resp.deinit();
+
+        if (resp.is_error) {
+            printError(allocator, resp.result);
+            std.process.exit(1);
+        }
+        printJsonValue(allocator, resp.result);
+    } else if (mem.eql(u8, action, "new")) {
+        const target = args.next() orelse {
+            writeStderr("Error: tab new requires a profile name\n", .{});
+            std.process.exit(1);
+        };
+
+        const profile = parseProfile(target);
+        const url = args.next(); // optional URL
+
+        var client = hibrow.Client.connect(allocator) catch |err| {
+            writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer client.disconnect();
+
+        var resp = client.tabNew(profile, url) catch |err| {
+            writeStderr("Error: tab new failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer resp.deinit();
+
+        if (resp.is_error) {
+            printError(allocator, resp.result);
+            std.process.exit(1);
+        }
+        printJsonValue(allocator, resp.result);
+    } else if (mem.eql(u8, action, "close")) {
+        const target = args.next() orelse {
+            writeStderr("Error: tab close requires profile:tab\n", .{});
+            std.process.exit(1);
+        };
+
+        const tab_ref = hibrow.tab.parseTabRef(target) catch {
+            writeStderr("Error: invalid tab reference: {s}\n", .{target});
+            std.process.exit(1);
+        };
+        const tab_index = tab_ref.tab orelse {
+            writeStderr("Error: tab close requires a tab index (profile:N)\n", .{});
+            std.process.exit(1);
+        };
+
+        var client = hibrow.Client.connect(allocator) catch |err| {
+            writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer client.disconnect();
+
+        var resp = client.tabClose(tab_ref.profile, tab_index) catch |err| {
+            writeStderr("Error: tab close failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer resp.deinit();
+
+        if (resp.is_error) {
+            printError(allocator, resp.result);
+            std.process.exit(1);
+        }
+        printJsonValue(allocator, resp.result);
+    } else if (mem.eql(u8, action, "switch")) {
+        const target = args.next() orelse {
+            writeStderr("Error: tab switch requires profile:tab\n", .{});
+            std.process.exit(1);
+        };
+
+        const tab_ref = hibrow.tab.parseTabRef(target) catch {
+            writeStderr("Error: invalid tab reference: {s}\n", .{target});
+            std.process.exit(1);
+        };
+        const tab_index = tab_ref.tab orelse {
+            writeStderr("Error: tab switch requires a tab index (profile:N)\n", .{});
+            std.process.exit(1);
+        };
+
+        var client = hibrow.Client.connect(allocator) catch |err| {
+            writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer client.disconnect();
+
+        var resp = client.tabSwitch(tab_ref.profile, tab_index) catch |err| {
+            writeStderr("Error: tab switch failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer resp.deinit();
+
+        if (resp.is_error) {
+            printError(allocator, resp.result);
+            std.process.exit(1);
+        }
+        printJsonValue(allocator, resp.result);
+    } else {
+        writeStderr("Unknown tab action: {s}\n", .{action});
+        writeStderr("Usage: hibrow tab list|new|close|switch <profile[:tab]>\n", .{});
+        std.process.exit(1);
+    }
 }
 
 fn cmdGateway(allocator: mem.Allocator, args: *std.process.ArgIterator) void {

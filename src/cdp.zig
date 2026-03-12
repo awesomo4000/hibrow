@@ -343,6 +343,73 @@ pub const Connection = struct {
 };
 
 // ---------------------------------------------------------------------------
+// HTTP-based target management (no WebSocket needed)
+// ---------------------------------------------------------------------------
+
+/// Create a new tab/target via PUT /json/new?{url}.
+/// Returns the new target info. Caller owns the Target; free with freeTargets() on a one-element slice
+/// or manually free each string.
+pub fn createTarget(allocator: mem.Allocator, port: u16, url: ?[]const u8) !Target {
+    var url_buf: [2048]u8 = undefined;
+    const request_url = if (url) |u|
+        try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/json/new?{s}", .{ port, u })
+    else
+        try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/json/new", .{port});
+
+    const body = try httpPut(allocator, request_url);
+    defer allocator.free(body);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return error.InvalidResponse;
+    const obj = parsed.value.object;
+
+    const id = obj.get("id") orelse return error.InvalidResponse;
+    if (id != .string) return error.InvalidResponse;
+    const title_val = obj.get("title") orelse return error.InvalidResponse;
+    if (title_val != .string) return error.InvalidResponse;
+    const url_val = obj.get("url") orelse return error.InvalidResponse;
+    if (url_val != .string) return error.InvalidResponse;
+    const type_val = obj.get("type") orelse return error.InvalidResponse;
+    if (type_val != .string) return error.InvalidResponse;
+
+    const ws_url = if (obj.get("webSocketDebuggerUrl")) |v| blk: {
+        if (v == .string) break :blk try allocator.dupe(u8, v.string);
+        break :blk null;
+    } else null;
+    errdefer if (ws_url) |w| allocator.free(w);
+
+    return .{
+        .id = try allocator.dupe(u8, id.string),
+        .title = try allocator.dupe(u8, title_val.string),
+        .url = try allocator.dupe(u8, url_val.string),
+        .@"type" = try allocator.dupe(u8, type_val.string),
+        .webSocketDebuggerUrl = ws_url,
+    };
+}
+
+/// Close a target/tab via GET /json/close/{targetId}.
+pub fn closeTarget(allocator: mem.Allocator, port: u16, target_id: []const u8) !void {
+    var url_buf: [256]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/json/close/{s}", .{ port, target_id });
+
+    const body = try httpGet(allocator, url);
+    defer allocator.free(body);
+    // Chrome returns "Target is closing" on success
+}
+
+/// Activate (focus) a target/tab via GET /json/activate/{targetId}.
+pub fn activateTarget(allocator: mem.Allocator, port: u16, target_id: []const u8) !void {
+    var url_buf: [256]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/json/activate/{s}", .{ port, target_id });
+
+    const body = try httpGet(allocator, url);
+    defer allocator.free(body);
+    // Chrome returns "Target activated" on success
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
@@ -399,6 +466,28 @@ fn httpGet(allocator: mem.Allocator, url: []const u8) ![]u8 {
     defer body_writer.deinit();
 
     const result = try client.fetch(.{
+        .location = .{ .uri = uri },
+        .response_writer = &body_writer.writer,
+    });
+
+    if (result.status != .ok) return error.HttpError;
+    return try body_writer.toOwnedSlice();
+}
+
+/// HTTP PUT a URL and return the body as an allocated string.
+/// Chrome requires PUT for /json/new (GET returns 404 on modern versions).
+fn httpPut(allocator: mem.Allocator, url: []const u8) ![]u8 {
+    const uri = try std.Uri.parse(url);
+
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    var body_writer = std.Io.Writer.Allocating.init(allocator);
+    defer body_writer.deinit();
+
+    const result = try client.fetch(.{
+        .method = .PUT,
+        .payload = "",
         .location = .{ .uri = uri },
         .response_writer = &body_writer.writer,
     });
