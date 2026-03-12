@@ -101,8 +101,8 @@ pub fn launch(allocator: mem.Allocator, options: LaunchOptions) !Browser {
     const chrome = try findChromium(allocator);
     defer allocator.free(chrome);
 
-    // Resolve port
-    const port: u16 = if (options.port == 0) try findFreePort() else options.port;
+    // Resolve port from our dedicated range
+    const port: u16 = if (options.port == 0) try findFreePortInRange() else options.port;
 
     // Resolve profile directory
     const profile_dir = try getProfileDir(allocator, options.profile);
@@ -161,6 +161,8 @@ pub fn launch(allocator: mem.Allocator, options: LaunchOptions) !Browser {
         if (tcpProbe(port)) {
             // TCP is open — now verify CDP responds over HTTP
             if (verify(allocator, port) catch false) {
+                // Record in registry so discovery can map port → profile
+                registerProfile(allocator, options.profile, profile_dir, port) catch {};
                 return .{
                     .profile = try allocator.dupe(u8, options.profile),
                     .port = port,
@@ -176,29 +178,77 @@ pub fn launch(allocator: mem.Allocator, options: LaunchOptions) !Browser {
 }
 
 // ---------------------------------------------------------------------------
-// Port discovery
+// Port management
 // ---------------------------------------------------------------------------
 
-/// Find an available TCP port by binding to port 0 and reading the assigned port.
-pub fn findFreePort() !u16 {
-    const addr = try std.net.Address.resolveIp("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    const port = server.listen_address.getPort();
-    server.deinit();
-    return port;
+/// CDP port range — we allocate ports sequentially within this range.
+/// Starts at 9322 to avoid collisions with the conventional 9222 used
+/// by manual --remote-debugging-port sessions.
+pub const port_range_start: u16 = 9322;
+pub const port_range_end: u16 = 9422;
+
+/// Find the next free port in the CDP range by probing each one.
+pub fn findFreePortInRange() !u16 {
+    var port: u16 = port_range_start;
+    while (port < port_range_end) : (port += 1) {
+        if (!tcpProbe(port)) return port;
+    }
+    return error.NoFreePorts;
 }
 
 // ---------------------------------------------------------------------------
-// Process discovery
+// Network-based discovery
 // ---------------------------------------------------------------------------
 
-/// Discover running CDP-enabled browsers by scanning processes.
+/// Discover running CDP-enabled browsers by scanning the port range.
+/// Checks each port for a responsive CDP endpoint, then resolves profile
+/// names from the registry. No process scanning — pure network-based.
 /// Caller owns the returned slice. Free with freeBrowsers().
 pub fn discover(allocator: mem.Allocator) ![]Browser {
-    if (builtin.os.tag == .macos or builtin.os.tag == .linux) {
-        return discoverPosix(allocator);
+    var browsers: std.ArrayList(Browser) = .{};
+    errdefer {
+        for (browsers.items) |b| allocator.free(b.profile);
+        browsers.deinit(allocator);
     }
-    return &[_]Browser{};
+
+    // Load profile registry to map ports → profile names
+    var registry = ProfileRegistry.init(allocator) catch null;
+    defer if (registry) |*r| r.deinit();
+
+    const entries = if (registry) |*r| r.load() catch null else null;
+    defer if (entries) |e| {
+        for (e) |entry| {
+            allocator.free(entry.name);
+            allocator.free(entry.directory);
+        }
+        allocator.free(e);
+    };
+
+    var port: u16 = port_range_start;
+    while (port < port_range_end) : (port += 1) {
+        // Quick TCP probe — skip ports that aren't listening
+        if (!tcpProbe(port)) continue;
+
+        // Verify it's actually a CDP endpoint
+        if (!(verify(allocator, port) catch false)) continue;
+
+        // Look up profile name from registry
+        const profile_name = if (entries) |e| blk: {
+            for (e) |entry| {
+                if (entry.port == port) break :blk try allocator.dupe(u8, entry.name);
+            }
+            break :blk try allocator.dupe(u8, "unknown");
+        } else try allocator.dupe(u8, "unknown");
+
+        try browsers.append(allocator, .{
+            .profile = profile_name,
+            .port = port,
+            .pid = null,
+            .managed = false,
+        });
+    }
+
+    return try browsers.toOwnedSlice(allocator);
 }
 
 /// Free a browser list returned by discover().
@@ -209,102 +259,10 @@ pub fn freeBrowsers(allocator: mem.Allocator, browsers: []Browser) void {
     allocator.free(browsers);
 }
 
-fn discoverPosix(allocator: mem.Allocator) ![]Browser {
-    // Use `ps aux` to find browser processes
-    const result = try runCommand(allocator, &.{ "ps", "aux" });
-    defer allocator.free(result);
-
-    var browsers: std.ArrayList(Browser) = .{};
-    defer browsers.deinit(allocator);
-
-    var lines = mem.splitScalar(u8, result, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-
-        // Look for --remote-debugging-port= in the command
-        const port_val = extractCdpPort(line) orelse continue;
-
-        // Extract PID from ps output (second column)
-        const pid_val = extractPsPid(line);
-
-        // Extract user-data-dir for profile name
-        const profile = if (extractUserDataDir(line)) |dir|
-            try allocator.dupe(u8, profileNameFromDir(dir))
-        else
-            try allocator.dupe(u8, "unknown");
-
-        try browsers.append(allocator, .{
-            .profile = profile,
-            .port = port_val,
-            .pid = pid_val,
-            .managed = false,
-        });
-    }
-
-    return try browsers.toOwnedSlice(allocator);
-}
-
-/// Extract --remote-debugging-port=N from a string.
-pub fn extractCdpPort(line: []const u8) ?u16 {
-    const prefix = "--remote-debugging-port=";
-    const start = mem.indexOf(u8, line, prefix) orelse return null;
-    const after = line[start + prefix.len ..];
-    // Find end of number
-    var end: usize = 0;
-    while (end < after.len and after[end] >= '0' and after[end] <= '9') : (end += 1) {}
-    if (end == 0) return null;
-    return std.fmt.parseInt(u16, after[0..end], 10) catch null;
-}
-
-/// Extract --user-data-dir=<path> from a string.
-pub fn extractUserDataDir(line: []const u8) ?[]const u8 {
-    const prefix = "--user-data-dir=";
-    const start = mem.indexOf(u8, line, prefix) orelse return null;
-    const after = line[start + prefix.len ..];
-    // Value ends at space or end of string
-    const end = mem.indexOfScalar(u8, after, ' ') orelse after.len;
-    if (end == 0) return null;
-    return after[0..end];
-}
-
-/// Extract profile name from a user-data-dir path.
-/// If the path contains "hibrow/profiles/", use the last component.
-/// Otherwise, use the last path component.
-pub fn profileNameFromDir(dir: []const u8) []const u8 {
-    // Try to extract from hibrow profile path
-    const marker = "hibrow/profiles/";
-    if (mem.indexOf(u8, dir, marker)) |pos| {
-        const after = dir[pos + marker.len ..];
-        // Trim trailing slashes
-        const trimmed = mem.trimRight(u8, after, "/");
-        if (trimmed.len > 0) return trimmed;
-    }
-    // Fall back to last path component
-    const trimmed = mem.trimRight(u8, dir, "/");
-    if (mem.lastIndexOfScalar(u8, trimmed, '/')) |last_slash| {
-        return trimmed[last_slash + 1 ..];
-    }
-    return trimmed;
-}
-
-/// Extract PID from ps aux output line (second whitespace-delimited field).
-fn extractPsPid(line: []const u8) ?posix.pid_t {
-    // Skip leading whitespace and first field (USER)
-    var rest = mem.trimLeft(u8, line, " ");
-    // Skip USER field
-    const user_end = mem.indexOfScalar(u8, rest, ' ') orelse return null;
-    rest = mem.trimLeft(u8, rest[user_end..], " ");
-    // PID field
-    const pid_end = mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
-    const pid_str = rest[0..pid_end];
-    return std.fmt.parseInt(posix.pid_t, pid_str, 10) catch null;
-}
-
 // ---------------------------------------------------------------------------
 // Browser verification
 // ---------------------------------------------------------------------------
 
-/// Verify a browser is responsive by hitting its CDP endpoint.
 /// Quick TCP connect probe — returns true if the port is accepting connections.
 /// Much cheaper than a full HTTP request for polling.
 pub fn tcpProbe(port: u16) bool {
@@ -427,6 +385,40 @@ pub const ProfileRegistry = struct {
     }
 };
 
+/// Register a profile in the registry (upsert by name).
+fn registerProfile(allocator: mem.Allocator, name: []const u8, directory: []const u8, port: u16) !void {
+    var registry = try ProfileRegistry.init(allocator);
+    defer registry.deinit();
+
+    const existing = try registry.load();
+    defer {
+        for (existing) |e| {
+            allocator.free(e.name);
+            allocator.free(e.directory);
+        }
+        allocator.free(existing);
+    }
+
+    // Build new entries list: replace if name matches, append if new
+    var entries: std.ArrayList(ProfileEntry) = .{};
+    defer entries.deinit(allocator);
+
+    var found = false;
+    for (existing) |e| {
+        if (mem.eql(u8, e.name, name)) {
+            try entries.append(allocator, .{ .name = name, .directory = directory, .port = port });
+            found = true;
+        } else {
+            try entries.append(allocator, .{ .name = e.name, .directory = e.directory, .port = e.port });
+        }
+    }
+    if (!found) {
+        try entries.append(allocator, .{ .name = name, .directory = directory, .port = port });
+    }
+
+    try registry.save(entries.items);
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -443,29 +435,6 @@ fn ensureDirExists(path: []const u8) !void {
     };
 }
 
-fn runCommand(allocator: mem.Allocator, argv: []const []const u8) ![]u8 {
-    var child = std.process.Child.init(argv, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    try child.spawn();
-
-    // Read all stdout
-    var output: std.ArrayList(u8) = .{};
-    defer output.deinit(allocator);
-
-    var read_buf: [4096]u8 = undefined;
-    const stdout = child.stdout.?;
-    while (true) {
-        const n = try stdout.read(&read_buf);
-        if (n == 0) break;
-        try output.appendSlice(allocator, read_buf[0..n]);
-    }
-
-    _ = try child.wait();
-    return try output.toOwnedSlice(allocator);
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -473,12 +442,12 @@ fn runCommand(allocator: mem.Allocator, argv: []const []const u8) ![]u8 {
 test "Browser struct has expected fields" {
     const b = Browser{
         .profile = "test",
-        .port = 9222,
+        .port = 9322,
         .pid = 12345,
         .managed = true,
     };
     try std.testing.expectEqualStrings("test", b.profile);
-    try std.testing.expectEqual(@as(u16, 9222), b.port);
+    try std.testing.expectEqual(@as(u16, 9322), b.port);
     try std.testing.expectEqual(@as(?posix.pid_t, 12345), b.pid);
     try std.testing.expect(b.managed);
 }
@@ -492,49 +461,15 @@ test "LaunchOptions defaults" {
     try std.testing.expect(!opts.proxy_dns);
 }
 
-test "extractCdpPort finds port" {
-    const line = "user  12345 0.0 1.0 /usr/bin/chrome --remote-debugging-port=9222 --no-first-run";
-    try std.testing.expectEqual(@as(?u16, 9222), extractCdpPort(line));
+test "findFreePortInRange returns port in range" {
+    const port = try findFreePortInRange();
+    try std.testing.expect(port >= port_range_start);
+    try std.testing.expect(port < port_range_end);
 }
 
-test "extractCdpPort returns null for no port" {
-    const line = "/usr/bin/chrome --headless --no-first-run";
-    try std.testing.expect(extractCdpPort(line) == null);
-}
-
-test "extractCdpPort handles port at end of line" {
-    const line = "--remote-debugging-port=12345";
-    try std.testing.expectEqual(@as(?u16, 12345), extractCdpPort(line));
-}
-
-test "extractUserDataDir finds path" {
-    const line = "chrome --user-data-dir=/home/user/.hibrow/profiles/work --remote-debugging-port=9222";
-    const dir = extractUserDataDir(line).?;
-    try std.testing.expectEqualStrings("/home/user/.hibrow/profiles/work", dir);
-}
-
-test "extractUserDataDir returns null when missing" {
-    const line = "chrome --remote-debugging-port=9222";
-    try std.testing.expect(extractUserDataDir(line) == null);
-}
-
-test "profileNameFromDir extracts hibrow profile name" {
-    try std.testing.expectEqualStrings("work", profileNameFromDir("/home/user/.hibrow/profiles/work"));
-    try std.testing.expectEqualStrings("personal", profileNameFromDir("/home/user/.hibrow/profiles/personal/"));
-}
-
-test "profileNameFromDir falls back to last component" {
-    try std.testing.expectEqualStrings("custom-dir", profileNameFromDir("/tmp/custom-dir"));
-    try std.testing.expectEqualStrings("myprofile", profileNameFromDir("/tmp/myprofile/"));
-}
-
-test "profileNameFromDir handles bare name" {
-    try std.testing.expectEqualStrings("simple", profileNameFromDir("simple"));
-}
-
-test "findFreePort returns valid port" {
-    const port = try findFreePort();
-    try std.testing.expect(port > 0);
+test "tcpProbe returns false for unused port" {
+    // Port 9421 is very unlikely to be in use
+    try std.testing.expect(!tcpProbe(9421));
 }
 
 test "getProfileRegistryPath contains hibrow" {
@@ -556,15 +491,4 @@ test "getProfileDir contains profile name" {
     };
     defer allocator.free(dir);
     try std.testing.expect(mem.indexOf(u8, dir, ".hibrow/profiles/myprofile") != null);
-}
-
-test "extractPsPid parses pid from ps output" {
-    const line = "user     12345  0.0  1.0 12345 1234 ?  Sl   09:00   0:01 /usr/bin/chrome";
-    const pid = extractPsPid(line);
-    try std.testing.expectEqual(@as(?posix.pid_t, 12345), pid);
-}
-
-test "extractPsPid returns null for invalid line" {
-    try std.testing.expect(extractPsPid("") == null);
-    try std.testing.expect(extractPsPid("nopid") == null);
 }
