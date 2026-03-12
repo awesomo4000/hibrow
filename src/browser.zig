@@ -3,11 +3,13 @@
 ///!
 ///! Discovery-first design: finds browsers by scanning processes for
 ///! --remote-debugging-port flags rather than tracking complex state.
+///! Process args are the registry — zero files, fully stateless.
 const std = @import("std");
 const mem = std.mem;
 const fs = std.fs;
 const posix = std.posix;
 const builtin = @import("builtin");
+const process = @import("process.zig");
 
 /// A discovered or launched browser instance.
 pub const Browser = struct {
@@ -30,13 +32,6 @@ pub const LaunchOptions = struct {
     proxy: ?[]const u8 = null,
     /// Route DNS through the proxy (requires SOCKS5).
     proxy_dns: bool = false,
-};
-
-/// Profile registry entry (stored in ~/.hibrow/profiles.json).
-pub const ProfileEntry = struct {
-    name: []const u8,
-    directory: []const u8,
-    port: u16,
 };
 
 // ---------------------------------------------------------------------------
@@ -161,8 +156,6 @@ pub fn launch(allocator: mem.Allocator, options: LaunchOptions) !Browser {
         if (tcpProbe(port)) {
             // TCP is open — now verify CDP responds over HTTP
             if (verify(allocator, port) catch false) {
-                // Record in registry so discovery can map port → profile
-                registerProfile(allocator, options.profile, profile_dir, port) catch {};
                 return .{
                     .profile = try allocator.dupe(u8, options.profile),
                     .port = port,
@@ -197,53 +190,28 @@ pub fn findFreePortInRange() !u16 {
 }
 
 // ---------------------------------------------------------------------------
-// Network-based discovery
+// Process-based discovery
 // ---------------------------------------------------------------------------
 
-/// Discover running CDP-enabled browsers by scanning the port range.
-/// Checks each port for a responsive CDP endpoint, then resolves profile
-/// names from the registry. No process scanning — pure network-based.
+/// Discover running CDP-enabled browsers by scanning process args.
+/// Uses proc_listpids + sysctl(KERN_PROCARGS2) on macOS to find Chrome
+/// processes with --remote-debugging-port and --user-data-dir flags.
 /// Caller owns the returned slice. Free with freeBrowsers().
 pub fn discover(allocator: mem.Allocator) ![]Browser {
+    const procs = try process.findChromeBrowsers(allocator);
+    defer process.freeDiscovered(allocator, procs);
+
     var browsers: std.ArrayList(Browser) = .{};
     errdefer {
         for (browsers.items) |b| allocator.free(b.profile);
         browsers.deinit(allocator);
     }
 
-    // Load profile registry to map ports → profile names
-    var registry = ProfileRegistry.init(allocator) catch null;
-    defer if (registry) |*r| r.deinit();
-
-    const entries = if (registry) |*r| r.load() catch null else null;
-    defer if (entries) |e| {
-        for (e) |entry| {
-            allocator.free(entry.name);
-            allocator.free(entry.directory);
-        }
-        allocator.free(e);
-    };
-
-    var port: u16 = port_range_start;
-    while (port < port_range_end) : (port += 1) {
-        // Quick TCP probe — skip ports that aren't listening
-        if (!tcpProbe(port)) continue;
-
-        // Verify it's actually a CDP endpoint
-        if (!(verify(allocator, port) catch false)) continue;
-
-        // Look up profile name from registry
-        const profile_name = if (entries) |e| blk: {
-            for (e) |entry| {
-                if (entry.port == port) break :blk try allocator.dupe(u8, entry.name);
-            }
-            break :blk try allocator.dupe(u8, "unknown");
-        } else try allocator.dupe(u8, "unknown");
-
+    for (procs) |p| {
         try browsers.append(allocator, .{
-            .profile = profile_name,
-            .port = port,
-            .pid = null,
+            .profile = try allocator.dupe(u8, p.profile),
+            .port = p.port,
+            .pid = p.pid,
             .managed = false,
         });
     }
@@ -257,6 +225,20 @@ pub fn freeBrowsers(allocator: mem.Allocator, browsers: []Browser) void {
         allocator.free(b.profile);
     }
     allocator.free(browsers);
+}
+
+/// Look up a browser's CDP port by scanning processes for the given profile.
+/// Returns null if no process found with that profile name.
+pub fn lookupPort(allocator: mem.Allocator, profile: []const u8) !?u16 {
+    const procs = process.findChromeBrowsers(allocator) catch return null;
+    defer process.freeDiscovered(allocator, procs);
+
+    for (procs) |p| {
+        if (mem.eql(u8, p.profile, profile)) {
+            return p.port;
+        }
+    }
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -297,126 +279,6 @@ pub fn getProfileDir(allocator: mem.Allocator, profile: []const u8) ![]u8 {
     const home = try getHomeDir(allocator);
     defer allocator.free(home);
     return std.fmt.allocPrint(allocator, "{s}/.hibrow/profiles/{s}", .{ home, profile });
-}
-
-/// Default profile registry path: ~/.hibrow/profiles.json
-pub fn getProfileRegistryPath(allocator: mem.Allocator) ![]u8 {
-    const home = try getHomeDir(allocator);
-    defer allocator.free(home);
-    return std.fmt.allocPrint(allocator, "{s}/.hibrow/profiles.json", .{home});
-}
-
-/// Profile registry: reads/writes the profile → directory mappings.
-pub const ProfileRegistry = struct {
-    allocator: mem.Allocator,
-    path: []const u8,
-
-    pub fn init(allocator: mem.Allocator) !ProfileRegistry {
-        const path = try getProfileRegistryPath(allocator);
-        return .{ .allocator = allocator, .path = path };
-    }
-
-    pub fn deinit(self: *ProfileRegistry) void {
-        self.allocator.free(self.path);
-    }
-
-    /// Load all profile entries from the registry file.
-    /// Returns empty slice if file does not exist.
-    pub fn load(self: *ProfileRegistry) ![]ProfileEntry {
-        const data = fs.cwd().readFileAlloc(self.allocator, self.path, 1 << 20) catch |err| {
-            if (err == error.FileNotFound) return &[_]ProfileEntry{};
-            return err;
-        };
-        defer self.allocator.free(data);
-
-        const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, data, .{});
-        defer parsed.deinit();
-
-        if (parsed.value != .array) return error.InvalidRegistry;
-
-        var entries: std.ArrayList(ProfileEntry) = .{};
-        defer entries.deinit(self.allocator);
-
-        for (parsed.value.array.items) |item| {
-            if (item != .object) continue;
-            const obj = item.object;
-            const name_val = obj.get("name") orelse continue;
-            if (name_val != .string) continue;
-            const dir_val = obj.get("directory") orelse continue;
-            if (dir_val != .string) continue;
-            const port_val = obj.get("port") orelse continue;
-            if (port_val != .integer) continue;
-
-            try entries.append(self.allocator, .{
-                .name = try self.allocator.dupe(u8, name_val.string),
-                .directory = try self.allocator.dupe(u8, dir_val.string),
-                .port = @intCast(port_val.integer),
-            });
-        }
-
-        return try entries.toOwnedSlice(self.allocator);
-    }
-
-    /// Save profile entries to the registry file.
-    /// Uses atomic write (write to .tmp, then rename).
-    pub fn save(self: *ProfileRegistry, entries: []const ProfileEntry) !void {
-        // Ensure parent directory exists
-        if (std.fs.path.dirname(self.path)) |dir| {
-            ensureDirExists(dir) catch {};
-        }
-
-        // Serialize to JSON
-        const json_data = try std.json.Stringify.valueAlloc(self.allocator, entries, .{});
-        defer self.allocator.free(json_data);
-
-        // Write atomically: tmp file then rename
-        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{self.path});
-        defer self.allocator.free(tmp_path);
-
-        const file = try fs.cwd().createFile(tmp_path, .{});
-        defer file.close();
-
-        var buf: [4096]u8 = undefined;
-        var writer = file.writer(&buf);
-        try writer.interface.writeAll(json_data);
-        try writer.interface.flush();
-
-        try fs.cwd().rename(tmp_path, self.path);
-    }
-};
-
-/// Register a profile in the registry (upsert by name).
-fn registerProfile(allocator: mem.Allocator, name: []const u8, directory: []const u8, port: u16) !void {
-    var registry = try ProfileRegistry.init(allocator);
-    defer registry.deinit();
-
-    const existing = try registry.load();
-    defer {
-        for (existing) |e| {
-            allocator.free(e.name);
-            allocator.free(e.directory);
-        }
-        allocator.free(existing);
-    }
-
-    // Build new entries list: replace if name matches, append if new
-    var entries: std.ArrayList(ProfileEntry) = .{};
-    defer entries.deinit(allocator);
-
-    var found = false;
-    for (existing) |e| {
-        if (mem.eql(u8, e.name, name)) {
-            try entries.append(allocator, .{ .name = name, .directory = directory, .port = port });
-            found = true;
-        } else {
-            try entries.append(allocator, .{ .name = e.name, .directory = e.directory, .port = e.port });
-        }
-    }
-    if (!found) {
-        try entries.append(allocator, .{ .name = name, .directory = directory, .port = port });
-    }
-
-    try registry.save(entries.items);
 }
 
 // ---------------------------------------------------------------------------
@@ -472,17 +334,6 @@ test "tcpProbe returns false for unused port" {
     try std.testing.expect(!tcpProbe(9421));
 }
 
-test "getProfileRegistryPath contains hibrow" {
-    const allocator = std.testing.allocator;
-    const path = getProfileRegistryPath(allocator) catch |err| {
-        // OK if HOME is not set in test environment
-        if (err == error.NoHomeDir) return;
-        return err;
-    };
-    defer allocator.free(path);
-    try std.testing.expect(mem.indexOf(u8, path, ".hibrow/profiles.json") != null);
-}
-
 test "getProfileDir contains profile name" {
     const allocator = std.testing.allocator;
     const dir = getProfileDir(allocator, "myprofile") catch |err| {
@@ -491,4 +342,18 @@ test "getProfileDir contains profile name" {
     };
     defer allocator.free(dir);
     try std.testing.expect(mem.indexOf(u8, dir, ".hibrow/profiles/myprofile") != null);
+}
+
+test "lookupPort returns null for nonexistent profile" {
+    const allocator = std.testing.allocator;
+    const result = try lookupPort(allocator, "nonexistent-profile-xyz");
+    try std.testing.expect(result == null);
+}
+
+test "discover returns a slice" {
+    const allocator = std.testing.allocator;
+    const browsers = try discover(allocator);
+    defer freeBrowsers(allocator, browsers);
+    // Just verify it does not crash — may return 0 if no Chrome running
+    _ = browsers.len;
 }

@@ -14,6 +14,7 @@ PROFILE="test-e2e"
 PASS=0
 FAIL=0
 TOTAL=0
+RESULTS=()
 
 # --------------------------------------------------------------------------
 # Helpers
@@ -26,12 +27,14 @@ bold()  { printf '\033[1m%s\033[0m' "$*"; }
 pass() {
     PASS=$((PASS + 1))
     TOTAL=$((TOTAL + 1))
+    RESULTS+=("PASS|$1")
     echo "  $(green PASS) $1"
 }
 
 fail() {
     FAIL=$((FAIL + 1))
     TOTAL=$((TOTAL + 1))
+    RESULTS+=("FAIL|$1")
     echo "  $(red FAIL) $1"
     if [ -n "${2:-}" ]; then
         echo "       got: $2"
@@ -145,16 +148,16 @@ out=$($HIBROW launch $PROFILE 2>&1)
 assert_contains "$out" "already_running" "second launch detects already running"
 
 # --------------------------------------------------------------------------
-# Test: navigation
+# Test: navigation (local pages only — no network requests)
 # --------------------------------------------------------------------------
 
 echo ""
 echo "$(bold '==> Navigation')"
 
-out=$($HIBROW nav $PROFILE "https://example.com" 2>&1)
+out=$($HIBROW nav $PROFILE "about:blank" 2>&1)
 assert_contains "$out" "navigated" "nav returns navigated status"
 
-sleep 1  # let page load
+sleep 0.3
 
 # --------------------------------------------------------------------------
 # Test: eval
@@ -167,13 +170,21 @@ echo "$(bold '==> JavaScript evaluation')"
 out=$($HIBROW eval $PROFILE "1 + 1" 2>&1)
 assert_equals "$(echo "$out" | tr -d '[:space:]')" "2" "eval 1+1 returns 2"
 
+# Inject a test page and read it back (proves DOM round-trip without network)
+$HIBROW eval $PROFILE "
+document.title = 'Hibrow Test Page';
+const h1 = document.createElement('h1'); h1.textContent = 'Hibrow Test Page';
+document.body.appendChild(h1);
+'injected'
+" > /dev/null 2>&1
+
 # String result
 out=$($HIBROW eval $PROFILE "document.title" 2>&1)
-assert_contains "$out" "Example Domain" "eval document.title on example.com"
+assert_contains "$out" "Hibrow Test Page" "eval document.title on injected page"
 
 # DOM query
 out=$($HIBROW eval $PROFILE "document.querySelector('h1').textContent" 2>&1)
-assert_contains "$out" "Example Domain" "eval DOM query h1 text"
+assert_contains "$out" "Hibrow Test Page" "eval DOM query h1 text"
 
 # Boolean
 out=$($HIBROW eval $PROFILE "true" 2>&1)
@@ -213,17 +224,17 @@ out=$($HIBROW eval $PROFILE "undefinedVariable.foo" 2>&1) || true
 assert_contains "$out" "Error" "eval reference error returns error"
 
 # --------------------------------------------------------------------------
-# Test: navigate to different page and verify
+# Test: navigate to second page and verify location
 # --------------------------------------------------------------------------
 
 echo ""
 echo "$(bold '==> Navigate and verify')"
 
-$HIBROW nav $PROFILE "https://www.iana.org/help/example-domains" > /dev/null 2>&1
-sleep 1
+$HIBROW nav $PROFILE "chrome://version" > /dev/null 2>&1
+sleep 0.5
 
-out=$($HIBROW eval $PROFILE "window.location.hostname" 2>&1)
-assert_contains "$out" "iana.org" "nav to iana.org and verify hostname"
+out=$($HIBROW eval $PROFILE "window.location.href" 2>&1)
+assert_contains "$out" "chrome://version" "nav to chrome://version and verify location"
 
 # --------------------------------------------------------------------------
 # Test: eyeball with random hex — visual proof of real browser control
@@ -377,31 +388,7 @@ out=$($HIBROW gateway status 2>&1)
 assert_contains "$out" "not running" "gateway shows not running after stop"
 
 # --------------------------------------------------------------------------
-# Cleanup
-# --------------------------------------------------------------------------
-
-# Kill test browser if still running (belt and suspenders)
-pkill -f "user-data-dir.*$PROFILE" 2>/dev/null || true
-
-# Clean up test profile directory
-rm -rf "$HOME/.hibrow/profiles/$PROFILE" 2>/dev/null || true
-
-# Clean up profile registry entry
-if [ -f ~/.hibrow/profiles.json ]; then
-    python3 -c "
-import json, sys
-try:
-    with open('$HOME/.hibrow/profiles.json') as f:
-        profiles = json.load(f)
-    profiles = [p for p in profiles if p.get('name') != '$PROFILE']
-    with open('$HOME/.hibrow/profiles.json', 'w') as f:
-        json.dump(profiles, f)
-except: pass
-" 2>/dev/null || true
-fi
-
-# --------------------------------------------------------------------------
-# Summary
+# Terminal summary
 # --------------------------------------------------------------------------
 
 echo ""
@@ -409,6 +396,113 @@ echo "────────────────────────�
 echo "  $(bold 'Results'): $TOTAL tests, $(green "$PASS passed"), $([ $FAIL -gt 0 ] && red "$FAIL failed" || echo "$FAIL failed")"
 echo "────────────────────────────────"
 echo ""
+
+# --------------------------------------------------------------------------
+# Results display in browser
+# --------------------------------------------------------------------------
+
+# Build a JS-safe results array from the RESULTS bash array
+RESULTS_JS="["
+for r in "${RESULTS[@]}"; do
+    status="${r%%|*}"
+    label="${r#*|}"
+    # Escape single quotes in label
+    label="${label//\'/\\\'}"
+    RESULTS_JS+="['${status}','${label}'],"
+done
+RESULTS_JS+="]"
+
+# Relaunch a browser to show results (the previous one was killed)
+$HIBROW launch $PROFILE > /dev/null 2>&1
+sleep 0.5
+$HIBROW nav $PROFILE "about:blank" > /dev/null 2>&1
+sleep 0.3
+
+# Inject results page
+$HIBROW eval $PROFILE "
+const R = ${RESULTS_JS};
+const pass = ${PASS}, fail = ${FAIL}, total = ${TOTAL};
+const allPassed = fail === 0;
+
+document.title = allPassed ? 'hibrow e2e: ALL PASSED' : 'hibrow e2e: FAILURES';
+
+document.body.style.cssText = 'margin:0;padding:24px 32px;background:#111;color:#eee;font-family:-apple-system,system-ui,sans-serif;overflow-y:auto';
+
+// Header
+const h = document.createElement('div');
+h.style.cssText = 'margin-bottom:20px';
+h.innerHTML = '<h1 style=\"margin:0 0 8px;font-size:28px;color:#eee\">hibrow e2e results</h1>'
+  + '<div style=\"font-size:18px\">'
+  + '<span style=\"color:#4f4\">' + pass + ' passed</span>'
+  + ' &middot; '
+  + (fail > 0 ? '<span style=\"color:#f44\">' + fail + ' failed</span>' : '<span>' + fail + ' failed</span>')
+  + ' &middot; '
+  + total + ' total'
+  + '</div>';
+document.body.appendChild(h);
+
+// Test list
+const list = document.createElement('div');
+list.style.cssText = 'margin-bottom:24px';
+for (const [s, label] of R) {
+  const row = document.createElement('div');
+  row.style.cssText = 'padding:4px 0;font-size:14px;font-family:monospace';
+  const dot = s === 'PASS' ? '\u2714' : '\u2718';
+  const color = s === 'PASS' ? '#4f4' : '#f44';
+  row.innerHTML = '<span style=\"color:' + color + ';margin-right:8px\">' + dot + '</span>' + label;
+  list.appendChild(row);
+}
+document.body.appendChild(list);
+
+// Footer: countdown or close button
+const footer = document.createElement('div');
+footer.style.cssText = 'padding-top:16px;border-top:1px solid #333';
+document.body.appendChild(footer);
+
+window._done = false;
+
+if (allPassed) {
+  let secs = 30;
+  footer.innerHTML = '<span id=\"countdown\" style=\"font-size:16px;color:#888\">Auto-closing in ' + secs + '...</span>'
+    + ' <button id=\"closebtn\" style=\"margin-left:12px;padding:6px 16px;background:#333;color:#eee;border:1px solid #555;border-radius:4px;cursor:pointer;font-size:14px\">Close now</button>';
+  const cd = document.getElementById('countdown');
+  const timer = setInterval(() => {
+    secs--;
+    if (secs <= 0) { clearInterval(timer); window._done = true; cd.textContent = 'Closing...'; return; }
+    cd.textContent = 'Auto-closing in ' + secs + '...';
+  }, 1000);
+  document.getElementById('closebtn').onclick = () => { clearInterval(timer); window._done = true; };
+} else {
+  footer.innerHTML = '<button id=\"closebtn\" style=\"padding:6px 16px;background:#333;color:#eee;border:1px solid #555;border-radius:4px;cursor:pointer;font-size:14px\">Close</button>';
+  document.getElementById('closebtn').onclick = () => { window._done = true; };
+}
+
+'results_rendered'
+" > /dev/null 2>&1
+
+# Poll window._done every second
+for i in $(seq 1 60); do
+    done_val=$($HIBROW eval $PROFILE "window._done" 2>&1 | tr -d '[:space:]') || true
+    if [ "$done_val" = "true" ]; then
+        break
+    fi
+    sleep 1
+done
+
+# --------------------------------------------------------------------------
+# Cleanup
+# --------------------------------------------------------------------------
+
+# Kill test browser and stop gateway
+$HIBROW kill $PROFILE > /dev/null 2>&1 || true
+sleep 0.3
+$HIBROW gateway stop > /dev/null 2>&1 || true
+
+# Kill test browser if still running (belt and suspenders)
+pkill -f "user-data-dir.*$PROFILE" 2>/dev/null || true
+
+# Clean up test profile directory
+rm -rf "$HOME/.hibrow/profiles/$PROFILE" 2>/dev/null || true
 
 if [ $FAIL -gt 0 ]; then
     exit 1

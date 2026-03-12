@@ -15,6 +15,7 @@ const mem = std.mem;
 pub const protocol = @import("protocol.zig");
 pub const gateway = @import("gateway.zig");
 pub const browser = @import("browser.zig");
+pub const process = @import("process.zig");
 pub const tab = @import("tab.zig");
 pub const cdp = @import("cdp.zig");
 pub const websocket = @import("websocket.zig");
@@ -121,6 +122,7 @@ test "public API re-exports are accessible" {
     _ = gateway.Server;
     _ = browser.Browser;
     _ = browser.LaunchOptions;
+    _ = process.DiscoveredProcess;
     _ = tab.TabRef;
     _ = tab.TabMap;
     _ = cdp.Target;
@@ -148,6 +150,7 @@ test {
     _ = protocol;
     _ = gateway;
     _ = browser;
+    _ = process;
     _ = tab;
     _ = cdp;
     _ = websocket;

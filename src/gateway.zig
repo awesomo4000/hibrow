@@ -144,6 +144,12 @@ pub const ParsedResponse = struct {
 // Gateway Server
 // ---------------------------------------------------------------------------
 
+/// A cached CDP connection to a profile's browser page.
+const ProfileConn = struct {
+    port: u16,
+    conn: cdp.Connection, // owns the WebSocket + next_id
+};
+
 /// The gateway daemon server. Listens on a Unix domain socket and dispatches
 /// JSON-RPC requests to browser management handlers.
 pub const Server = struct {
@@ -151,12 +157,25 @@ pub const Server = struct {
     listener: ?std.net.Server = null,
     socket_path: ?[]u8 = null,
     running: bool = false,
+    /// Cached CDP connections keyed by profile name (owned strings).
+    connections: std.StringHashMap(ProfileConn),
 
     pub fn init(allocator: mem.Allocator) Server {
-        return .{ .allocator = allocator };
+        return .{
+            .allocator = allocator,
+            .connections = std.StringHashMap(ProfileConn).init(allocator),
+        };
     }
 
     pub fn deinit(self: *Server) void {
+        // Close all cached CDP connections
+        var it = self.connections.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.conn.deinit();
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.connections.deinit();
+
         if (self.listener) |*l| l.deinit();
         if (self.socket_path) |p| {
             // Remove socket file on cleanup
@@ -300,33 +319,56 @@ pub const Server = struct {
         return resp.encode(self.allocator) catch &.{};
     }
 
-    /// Connect to a profile's active page via CDP. Returns a live connection
-    /// or an encoded error response ready to send back to the client.
-    const CdpResult = union(enum) {
-        connected: struct { conn: cdp.Connection, targets: []cdp.Target },
-        err: []u8,
-    };
+    /// Get a cached CDP connection for a profile, or create one if not cached.
+    /// Returns a pointer to the cached Connection, or null if browser not found.
+    fn getConnection(self: *Server, profile: []const u8) ?*cdp.Connection {
+        // Check cache first
+        if (self.connections.getPtr(profile)) |pc| {
+            return &pc.conn;
+        }
 
-    fn connectToProfile(self: *Server, id: json.Value, profile: []const u8) !CdpResult {
-        const port = try findBrowserPort(self.allocator, profile) orelse
-            return .{ .err = self.fail(id, .browser_not_found, "Browser not found") };
+        // Not cached — look up port via process scan
+        const resolved_port = browser_mod.lookupPort(self.allocator, profile) catch null orelse
+            return null;
 
-        const targets = cdp.discoverTargets(self.allocator, port) catch
-            return .{ .err = self.fail(id, .cdp_error, "CDP target discovery failed") };
+        // Discover targets via HTTP
+        const targets = cdp.discoverTargets(self.allocator, resolved_port) catch return null;
+        defer cdp.freeTargets(self.allocator, targets);
 
-        const ws_url = findPageTarget(targets) orelse {
-            cdp.freeTargets(self.allocator, targets);
-            return .{ .err = self.fail(id, .cdp_error, "No page target found") };
-        };
+        const ws_url = findPageTarget(targets) orelse return null;
 
+        // Connect WebSocket
         var conn = cdp.Connection.init(self.allocator);
         conn.connect(ws_url) catch {
             conn.deinit();
-            cdp.freeTargets(self.allocator, targets);
-            return .{ .err = self.fail(id, .cdp_error, "WebSocket connection failed") };
+            return null;
         };
 
-        return .{ .connected = .{ .conn = conn, .targets = targets } };
+        // Store in cache — we need to dupe the profile key
+        const key = self.allocator.dupe(u8, profile) catch {
+            conn.deinit();
+            return null;
+        };
+
+        self.connections.put(key, .{
+            .port = resolved_port,
+            .conn = conn,
+        }) catch {
+            self.allocator.free(key);
+            conn.deinit();
+            return null;
+        };
+
+        return &self.connections.getPtr(profile).?.conn;
+    }
+
+    /// Evict a cached connection for a profile, closing the WebSocket.
+    fn evictConnection(self: *Server, profile: []const u8) void {
+        if (self.connections.fetchRemove(profile)) |kv| {
+            var pc = kv.value;
+            pc.conn.deinit();
+            self.allocator.free(kv.key);
+        }
     }
 
     /// Serialize a Browser struct to a JSON object value.
@@ -349,6 +391,14 @@ pub const Server = struct {
 
     fn handleGatewayShutdown(self: *Server, id: json.Value) ![]u8 {
         const encoded = try self.ok(id, .{ .string = "shutting_down" });
+
+        // Close all cached CDP connections before shutting down
+        var it = self.connections.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.conn.deinit();
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.connections.clearRetainingCapacity();
 
         // Shut down after encoding the response so the client gets the reply.
         self.running = false;
@@ -377,12 +427,14 @@ pub const Server = struct {
         const profile = extractStringParam(params, "profile") orelse
             return self.fail(id, .invalid_params, "Missing 'profile' parameter");
 
-        // Already running? Return existing info.
-        if (try findBrowserPort(self.allocator, profile)) |existing_port| {
+        // Already running? Check via process scan.
+        const existing_port = try findBrowserPort(self.allocator, profile);
+
+        if (existing_port) |ep| {
             var obj = json.ObjectMap.init(self.allocator);
             defer obj.deinit();
             try obj.put("profile", .{ .string = profile });
-            try obj.put("port", .{ .integer = @intCast(existing_port) });
+            try obj.put("port", .{ .integer = @intCast(ep) });
             try obj.put("already_running", .{ .bool = true });
             return self.ok(id, .{ .object = obj });
         }
@@ -406,24 +458,20 @@ pub const Server = struct {
         const expression = extractStringParam(params, "expression") orelse
             return self.fail(id, .invalid_params, "Missing 'expression' parameter");
 
-        var result = try self.connectToProfile(id, profile);
-        switch (result) {
-            .err => |bytes| return bytes,
-            .connected => |*c| {
-                defer c.conn.deinit();
-                defer cdp.freeTargets(self.allocator, c.targets);
+        const conn = self.getConnection(profile) orelse
+            return self.fail(id, .browser_not_found, "Browser not found");
 
-                const eval_result = c.conn.eval(expression) catch
-                    return self.fail(id, .cdp_error, "Eval failed");
+        const eval_result = conn.eval(expression) catch {
+            self.evictConnection(profile);
+            return self.fail(id, .cdp_error, "Eval failed");
+        };
 
-                if (eval_result.exception) |exc| {
-                    defer self.allocator.free(exc);
-                    return self.fail(id, .cdp_error, exc);
-                }
-
-                return self.ok(id, eval_result.value);
-            },
+        if (eval_result.exception) |exc| {
+            defer self.allocator.free(exc);
+            return self.fail(id, .cdp_error, exc);
         }
+
+        return self.ok(id, eval_result.value);
     }
 
     fn handleBrowserNavigate(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {
@@ -432,23 +480,19 @@ pub const Server = struct {
         const url = extractStringParam(params, "url") orelse
             return self.fail(id, .invalid_params, "Missing 'url' parameter");
 
-        var result = try self.connectToProfile(id, profile);
-        switch (result) {
-            .err => |bytes| return bytes,
-            .connected => |*c| {
-                defer c.conn.deinit();
-                defer cdp.freeTargets(self.allocator, c.targets);
+        const conn = self.getConnection(profile) orelse
+            return self.fail(id, .browser_not_found, "Browser not found");
 
-                c.conn.navigate(url) catch
-                    return self.fail(id, .cdp_error, "Navigate failed");
+        conn.navigate(url) catch {
+            self.evictConnection(profile);
+            return self.fail(id, .cdp_error, "Navigate failed");
+        };
 
-                var obj = json.ObjectMap.init(self.allocator);
-                defer obj.deinit();
-                try obj.put("status", .{ .string = "navigated" });
-                try obj.put("url", .{ .string = url });
-                return self.ok(id, .{ .object = obj });
-            },
-        }
+        var obj = json.ObjectMap.init(self.allocator);
+        defer obj.deinit();
+        try obj.put("status", .{ .string = "navigated" });
+        try obj.put("url", .{ .string = url });
+        return self.ok(id, .{ .object = obj });
     }
 
     fn handleBrowserGet(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {
@@ -493,6 +537,9 @@ pub const Server = struct {
 
         conn.closeBrowser() catch
             return self.fail(id, .cdp_error, "Browser.close failed");
+
+        // Evict cached page connection for this profile
+        self.evictConnection(profile);
 
         return self.ok(id, .{ .string = "killed" });
     }
@@ -774,7 +821,17 @@ test "findPageTarget returns null when no ws urls" {
 test "Server initializes and deinitializes cleanly" {
     const allocator = std.testing.allocator;
     var server = Server.init(allocator);
+    // Verify connection cache is empty
+    try std.testing.expectEqual(@as(u32, 0), server.connections.count());
     server.deinit();
+}
+
+test "Server evictConnection on empty cache is safe" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+    // Should not crash or leak
+    server.evictConnection("nonexistent");
 }
 
 test "readLine reads up to newline" {

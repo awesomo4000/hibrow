@@ -40,6 +40,7 @@ pub fn build(b: *std.Build) void {
         "src/protocol.zig",
         "src/gateway.zig",
         "src/browser.zig",
+        "src/process.zig",
         "src/tab.zig",
         "src/cdp.zig",
         "src/websocket.zig",

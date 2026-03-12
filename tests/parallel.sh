@@ -13,7 +13,7 @@ set -euo pipefail
 
 HIBROW="./zig-out/bin/hibrow"
 PROFILE="test-parallel"
-NUM_TAGGERS=5
+NUM_TAGGERS=20
 DURATION=5  # seconds
 PASS=0
 FAIL=0
@@ -112,8 +112,14 @@ echo ""
 echo "$(bold '==> Spawning taggers')"
 
 # Colors for each tagger
-COLORS=("#ff4444" "#44ff44" "#4444ff" "#ffff44" "#ff44ff")
-NAMES=("ALPHA" "BRAVO" "CHARLIE" "DELTA" "ECHO")
+COLORS=("#ff4444" "#44ff44" "#4444ff" "#ffff44" "#ff44ff"
+        "#ff8844" "#44ffff" "#8844ff" "#ff4488" "#88ff44"
+        "#4488ff" "#ffaa00" "#00ffaa" "#aa00ff" "#ff0088"
+        "#00ff88" "#8800ff" "#ff8800" "#0088ff" "#88ff00")
+NAMES=("ALPHA" "BRAVO" "CHARLIE" "DELTA" "ECHO"
+       "FOXTROT" "GOLF" "HOTEL" "INDIA" "JULIET"
+       "KILO" "LIMA" "MIKE" "NOVEMBER" "OSCAR"
+       "PAPA" "QUEBEC" "ROMEO" "SIERRA" "TANGO")
 
 # Temp dir for tagger output
 TMPDIR=$(mktemp -d)
@@ -142,7 +148,7 @@ for i in $(seq 0 $((NUM_TAGGERS - 1))); do
 done
 
 echo ""
-echo "$(bold '==> Racing for ${DURATION}s...')"
+echo "$(bold "==> Racing for ${DURATION}s...")"
 echo ""
 
 # Wait for all taggers to finish
