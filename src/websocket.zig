@@ -346,17 +346,19 @@ pub const WebSocket = struct {
     pub fn readFrame(self: *WebSocket) !ReadResult {
         const stream = self.stream orelse return error.NotConnected;
 
-        // Read into buffer, accumulating until we have a complete frame
-        var buf: [65536]u8 = undefined;
-        var buf_len: usize = 0;
+        // Read into a dynamic buffer that grows as needed (no fixed size limit).
+        // Previous fixed 64KB buffer silently truncated large CDP responses.
+        var buf: std.ArrayList(u8) = .{};
+        defer buf.deinit(self.allocator);
 
+        var read_buf: [8192]u8 = undefined;
         while (true) {
-            const n = try stream.read(buf[buf_len..]);
+            const n = try stream.read(&read_buf);
             if (n == 0) return error.ConnectionClosed;
-            buf_len += n;
+            try buf.appendSlice(self.allocator, read_buf[0..n]);
 
             // Try to decode
-            const result = decodeFrameAlloc(self.allocator, buf[0..buf_len]) catch |err| {
+            const result = decodeFrameAlloc(self.allocator, buf.items) catch |err| {
                 if (err == error.Incomplete) continue;
                 return err;
             };
