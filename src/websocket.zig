@@ -349,12 +349,15 @@ pub const WebSocket = struct {
         // Read into a dynamic buffer that grows as needed (no fixed size limit).
         // Previous fixed 64KB buffer silently truncated large CDP responses.
         var buf: std.ArrayList(u8) = .{};
-        defer buf.deinit(self.allocator);
+        errdefer buf.deinit(self.allocator);
 
         var read_buf: [8192]u8 = undefined;
         while (true) {
             const n = try stream.read(&read_buf);
-            if (n == 0) return error.ConnectionClosed;
+            if (n == 0) {
+                buf.deinit(self.allocator);
+                return error.ConnectionClosed;
+            }
             try buf.appendSlice(self.allocator, read_buf[0..n]);
 
             // Try to decode
@@ -362,7 +365,21 @@ pub const WebSocket = struct {
                 if (err == error.Incomplete) continue;
                 return err;
             };
-            return .{ .frame = result.frame, .owned_payload = result.owned_payload };
+
+            if (result.owned_payload != null) {
+                // Masked frame: payload was copied into owned_payload, safe to free buf
+                buf.deinit(self.allocator);
+                return .{ .frame = result.frame, .owned_payload = result.owned_payload };
+            } else {
+                // Unmasked frame: payload points into buf.items. We must keep that
+                // memory alive, so hand ownership to the caller via owned_payload.
+                const payload_copy = try self.allocator.dupe(u8, result.frame.payload);
+                buf.deinit(self.allocator);
+                return .{
+                    .frame = .{ .fin = result.frame.fin, .opcode = result.frame.opcode, .payload = payload_copy },
+                    .owned_payload = payload_copy,
+                };
+            }
         }
     }
 
