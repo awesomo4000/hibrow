@@ -42,6 +42,9 @@ const usage =
     \\      URL mode: fetches the URL through the browser (with cookies/auth).
     \\      JS mode: evaluates expression that returns base64 or a URL to fetch.
     \\
+    \\  screenshot <profile[:tab]> -o <file>
+    \\      Capture a screenshot of the browser tab and save as PNG.
+    \\
     \\  gateway status
     \\      Show gateway daemon status.
     \\
@@ -97,6 +100,7 @@ pub fn main() !void {
         .{ "console", cmdConsole },
         .{ "tab", cmdTab },
         .{ "grab", cmdGrab },
+        .{ "screenshot", cmdScreenshot },
         .{ "gateway", cmdGateway },
     });
 
@@ -577,6 +581,98 @@ fn cmdGrab(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     // Print result
     var buf: [256]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, "Saved {s} ({d} bytes)\n", .{ out_path, result.data.len }) catch return;
+    writeStderr("{s}", .{msg});
+}
+
+fn cmdScreenshot(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
+    const target = args.next() orelse {
+        writeStderr("Error: screenshot requires a profile[:tab]\n", .{});
+        std.process.exit(1);
+    };
+
+    var output: ?[]const u8 = null;
+
+    // Parse remaining args: -o <file>
+    while (args.next()) |arg| {
+        if (mem.eql(u8, arg, "-o")) {
+            output = args.next() orelse {
+                writeStderr("Error: -o requires a filename\n", .{});
+                std.process.exit(1);
+            };
+        } else {
+            writeStderr("Error: unexpected argument: {s}\n", .{arg});
+            std.process.exit(1);
+        }
+    }
+
+    const out_path = output orelse {
+        writeStderr("Error: screenshot requires -o <output-file>\n", .{});
+        std.process.exit(1);
+    };
+
+    const profile = parseProfile(target);
+    const tab: ?i64 = blk: {
+        if (mem.indexOfScalar(u8, target, ':')) |colon| {
+            const tab_str = target[colon + 1 ..];
+            break :blk std.fmt.parseInt(i64, tab_str, 10) catch null;
+        }
+        break :blk null;
+    };
+
+    var client = hibrow.Client.connect(allocator) catch |err| {
+        writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer client.disconnect();
+
+    var resp = client.screenshot(profile, tab) catch |err| {
+        writeStderr("Error: screenshot failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer resp.deinit();
+
+    if (resp.is_error) {
+        printError(allocator, resp.result);
+        std.process.exit(1);
+    }
+
+    // Result is base64 PNG string
+    if (resp.result != .string) {
+        writeStderr("Error: unexpected response format\n", .{});
+        std.process.exit(1);
+    }
+
+    // Decode base64
+    const b64 = resp.result.string;
+    const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(b64) catch {
+        writeStderr("Error: invalid base64 data\n", .{});
+        std.process.exit(1);
+    };
+    const decoded = allocator.alloc(u8, decoded_size) catch {
+        writeStderr("Error: out of memory\n", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(decoded);
+
+    std.base64.standard.Decoder.decode(decoded, b64) catch {
+        writeStderr("Error: base64 decode failed\n", .{});
+        std.process.exit(1);
+    };
+
+    // Write to file
+    const file = std.fs.cwd().createFile(out_path, .{}) catch |err| {
+        writeStderr("Error: could not create file: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer file.close();
+
+    file.writeAll(decoded) catch |err| {
+        writeStderr("Error: could not write file: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "Saved {s} ({d} bytes)\n", .{ out_path, decoded.len }) catch return;
     writeStderr("{s}", .{msg});
 }
 

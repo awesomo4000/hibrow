@@ -90,6 +90,15 @@ pub const Client = struct {
         return self.gw.call("browser.navigate", .{ .object = params });
     }
 
+    /// Take a screenshot of the named profile's browser. Returns base64 PNG.
+    pub fn screenshot(self: *Client, profile: []const u8, tab_idx: ?i64) !gateway.ParsedResponse {
+        var params = json.ObjectMap.init(self.allocator);
+        defer params.deinit();
+        try params.put("profile", .{ .string = profile });
+        if (tab_idx) |t| try params.put("tab", .{ .integer = t });
+        return self.gw.call("browser.screenshot", .{ .object = params });
+    }
+
     /// Kill (gracefully close) the named profile's browser.
     /// The profile directory is preserved for next launch.
     pub fn kill(self: *Client, profile: []const u8) !gateway.ParsedResponse {

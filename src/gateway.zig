@@ -280,6 +280,7 @@ pub const Server = struct {
             .{ "browser.get", wrapWithParams(handleBrowserGet) },
             .{ "browser.kill", wrapWithParams(handleBrowserKill) },
             .{ "browser.url", wrapWithParams(handleBrowserUrl) },
+            .{ "browser.screenshot", wrapWithParams(handleBrowserScreenshot) },
             .{ "tab.list", wrapWithParams(handleTabList) },
             .{ "tab.new", wrapWithParams(handleTabNew) },
             .{ "tab.close", wrapWithParams(handleTabClose) },
@@ -850,6 +851,54 @@ pub const Server = struct {
 
                 self.evictConnection(profile);
                 return self.ok(id, .{ .string = "closed" });
+            },
+        }
+    }
+
+    fn handleBrowserScreenshot(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {
+        const profile = extractStringParam(params, "profile") orelse
+            return self.fail(id, .invalid_params, "Missing 'profile' parameter");
+
+        const info = try findBrowserInfo(self.allocator, profile) orelse
+            return self.fail(id, .browser_not_found, "Browser not found");
+
+        switch (info.browser_type) {
+            .firefox => {
+                var conn = marionette_mod.Connection.init(self.allocator);
+                defer conn.deinit();
+                conn.connect(info.port) catch
+                    return self.fail(id, .cdp_error, "Marionette connection failed");
+
+                // Switch tab if requested
+                if (extractIntParam(params, "tab")) |tab_idx| {
+                    if (tab_idx < 0) return self.fail(id, .invalid_params, "Tab index must be non-negative");
+                    const idx: usize = @intCast(tab_idx);
+                    const handles = conn.getWindowHandles() catch
+                        return self.fail(id, .cdp_error, "Could not list windows");
+                    defer {
+                        for (handles) |h| self.allocator.free(h);
+                        self.allocator.free(handles);
+                    }
+                    if (idx >= handles.len)
+                        return self.fail(id, .invalid_params, "Tab index out of bounds");
+                    conn.switchToWindow(handles[idx]) catch
+                        return self.fail(id, .cdp_error, "Could not switch tab");
+                }
+
+                const b64 = conn.takeScreenshot() catch
+                    return self.fail(id, .cdp_error, "Screenshot failed");
+                defer self.allocator.free(b64);
+                return self.ok(id, .{ .string = b64 });
+            },
+            .chrome => {
+                const conn = self.getConnection(profile) orelse
+                    return self.fail(id, .browser_not_found, "Browser not found");
+                const b64 = conn.takeScreenshot() catch {
+                    self.evictConnection(profile);
+                    return self.fail(id, .cdp_error, "Screenshot failed");
+                };
+                defer self.allocator.free(b64);
+                return self.ok(id, .{ .string = b64 });
             },
         }
     }

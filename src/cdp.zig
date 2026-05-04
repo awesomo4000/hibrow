@@ -340,6 +340,63 @@ pub const Connection = struct {
         }
         return error.InvalidResponse;
     }
+
+    /// Take a screenshot. Returns base64-encoded PNG data.
+    pub fn takeScreenshot(self: *Connection) ![]const u8 {
+        // Get full page dimensions via layout metrics
+        var metrics_result = try self.send("Page.getLayoutMetrics", null);
+        defer metrics_result.deinit();
+
+        var width: f64 = 1280;
+        var height: f64 = 800;
+        if (metrics_result.result == .object) {
+            if (metrics_result.result.object.get("contentSize")) |cs| {
+                if (cs == .object) {
+                    if (cs.object.get("width")) |w| {
+                        width = switch (w) {
+                            .integer => |i| @floatFromInt(i),
+                            .float => |f| f,
+                            else => 1280,
+                        };
+                    }
+                    if (cs.object.get("height")) |h| {
+                        height = switch (h) {
+                            .integer => |i| @floatFromInt(i),
+                            .float => |f| f,
+                            else => 800,
+                        };
+                    }
+                }
+            }
+        }
+
+        // Capture with clip covering full content
+        var clip = json.ObjectMap.init(self.allocator);
+        defer clip.deinit();
+        try clip.put("x", .{ .integer = 0 });
+        try clip.put("y", .{ .integer = 0 });
+        try clip.put("width", .{ .float = width });
+        try clip.put("height", .{ .float = height });
+        try clip.put("scale", .{ .integer = 1 });
+
+        var params = json.ObjectMap.init(self.allocator);
+        defer params.deinit();
+        try params.put("clip", .{ .object = clip });
+        try params.put("captureBeyondViewport", .{ .bool = true });
+
+        var cdp_result = try self.send("Page.captureScreenshot", .{ .object = params });
+        defer cdp_result.deinit();
+
+        // Response: {"data": "<base64 png>"}
+        if (cdp_result.result == .object) {
+            if (cdp_result.result.object.get("data")) |val| {
+                if (val == .string) {
+                    return try self.allocator.dupe(u8, val.string);
+                }
+            }
+        }
+        return error.InvalidResponse;
+    }
 };
 
 // ---------------------------------------------------------------------------
