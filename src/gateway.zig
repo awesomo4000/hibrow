@@ -480,20 +480,37 @@ pub const Server = struct {
         const expression = extractStringParam(params, "expression") orelse
             return self.fail(id, .invalid_params, "Missing 'expression' parameter");
 
-        const conn = self.getConnection(profile) orelse
+        const info = try findBrowserInfo(self.allocator, profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
-        const eval_result = conn.eval(expression) catch {
-            self.evictConnection(profile);
-            return self.fail(id, .cdp_error, "Eval failed");
-        };
-
-        if (eval_result.exception) |exc| {
-            defer self.allocator.free(exc);
-            return self.fail(id, .cdp_error, exc);
+        switch (info.browser_type) {
+            .firefox => {
+                var conn = marionette_mod.Connection.init(self.allocator);
+                defer conn.deinit();
+                conn.connect(info.port) catch
+                    return self.fail(id, .cdp_error, "Marionette connection failed");
+                const eval_result = conn.eval(expression) catch
+                    return self.fail(id, .cdp_error, "Eval failed");
+                if (eval_result.exception) |exc| {
+                    defer self.allocator.free(exc);
+                    return self.fail(id, .cdp_error, exc);
+                }
+                return self.ok(id, eval_result.value);
+            },
+            .chrome => {
+                const conn = self.getConnection(profile) orelse
+                    return self.fail(id, .browser_not_found, "Browser not found");
+                const eval_result = conn.eval(expression) catch {
+                    self.evictConnection(profile);
+                    return self.fail(id, .cdp_error, "Eval failed");
+                };
+                if (eval_result.exception) |exc| {
+                    defer self.allocator.free(exc);
+                    return self.fail(id, .cdp_error, exc);
+                }
+                return self.ok(id, eval_result.value);
+            },
         }
-
-        return self.ok(id, eval_result.value);
     }
 
     fn handleBrowserNavigate(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {
@@ -594,16 +611,31 @@ pub const Server = struct {
         const profile = extractStringParam(params, "profile") orelse
             return self.fail(id, .invalid_params, "Missing 'profile' parameter");
 
-        const conn = self.getConnection(profile) orelse
+        const info = try findBrowserInfo(self.allocator, profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
-        const url_str = conn.getUrl() catch {
-            self.evictConnection(profile);
-            return self.fail(id, .cdp_error, "Could not get URL");
-        };
-        defer self.allocator.free(url_str);
-
-        return self.ok(id, .{ .string = url_str });
+        switch (info.browser_type) {
+            .firefox => {
+                var conn = marionette_mod.Connection.init(self.allocator);
+                defer conn.deinit();
+                conn.connect(info.port) catch
+                    return self.fail(id, .cdp_error, "Marionette connection failed");
+                const url_str = conn.getCurrentUrl() catch
+                    return self.fail(id, .cdp_error, "Could not get URL");
+                defer self.allocator.free(url_str);
+                return self.ok(id, .{ .string = url_str });
+            },
+            .chrome => {
+                const conn = self.getConnection(profile) orelse
+                    return self.fail(id, .browser_not_found, "Browser not found");
+                const url_str = conn.getUrl() catch {
+                    self.evictConnection(profile);
+                    return self.fail(id, .cdp_error, "Could not get URL");
+                };
+                defer self.allocator.free(url_str);
+                return self.ok(id, .{ .string = url_str });
+            },
+        }
     }
 
     // -----------------------------------------------------------------------
