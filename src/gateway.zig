@@ -16,6 +16,7 @@ const json = std.json;
 const protocol = @import("protocol.zig");
 const browser_mod = @import("browser.zig");
 const cdp = @import("cdp.zig");
+const marionette_mod = @import("marionette.zig");
 
 /// Default socket directory pattern.
 const socket_dir_prefix = "/tmp/hibrow-";
@@ -386,7 +387,8 @@ pub const Server = struct {
             try pids_arr.append(.{ .integer = @intCast(pid) });
         }
         try obj.put("pids", .{ .array = pids_arr });
-        try obj.put("managed", .{ .bool = b.managed });
+        const display_dir = try collapseTilde(self.allocator, b.profile_dir);
+        try obj.put("profile_dir", .{ .string = display_dir });
         try obj.put("browser_type", .{ .string = b.browser_type.toString() });
         return obj;
     }
@@ -445,9 +447,10 @@ pub const Server = struct {
             browser_mod.BrowserType.chrome;
 
         // Already running? Check via process scan.
-        const existing_port = try findBrowserPort(self.allocator, profile);
+        const existing_info = try findBrowserInfo(self.allocator, profile);
 
-        if (existing_port) |ep| {
+        if (existing_info) |ei| {
+            const ep = ei.port;
             var obj = json.ObjectMap.init(self.allocator);
             defer obj.deinit();
             try obj.put("profile", .{ .string = profile });
@@ -537,25 +540,35 @@ pub const Server = struct {
         const profile = extractStringParam(params, "profile") orelse
             return self.fail(id, .invalid_params, "Missing 'profile' parameter");
 
-        const port = try findBrowserPort(self.allocator, profile) orelse
+        const info = try findBrowserInfo(self.allocator, profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
-        // Get browser-level WebSocket URL from /json/version
-        const version = cdp.getVersion(self.allocator, port) catch
-            return self.fail(id, .cdp_error, "Could not reach browser");
-        defer cdp.freeVersionInfo(self.allocator, version);
+        switch (info.browser_type) {
+            .firefox => {
+                var conn = marionette_mod.Connection.init(self.allocator);
+                defer conn.deinit();
+                conn.connect(info.port) catch
+                    return self.fail(id, .cdp_error, "Marionette connection failed");
+                conn.quit() catch {};
+            },
+            .chrome => {
+                // Get browser-level WebSocket URL from /json/version
+                const version = cdp.getVersion(self.allocator, info.port) catch
+                    return self.fail(id, .cdp_error, "Could not reach browser");
+                defer cdp.freeVersionInfo(self.allocator, version);
 
-        const browser_ws = version.webSocketDebuggerUrl orelse
-            return self.fail(id, .cdp_error, "No browser WebSocket URL");
+                const browser_ws = version.webSocketDebuggerUrl orelse
+                    return self.fail(id, .cdp_error, "No browser WebSocket URL");
 
-        // Connect to browser-level WebSocket and send Browser.close
-        var conn = cdp.Connection.init(self.allocator);
-        defer conn.deinit();
-        conn.connect(browser_ws) catch
-            return self.fail(id, .cdp_error, "WebSocket connection failed");
+                var conn = cdp.Connection.init(self.allocator);
+                defer conn.deinit();
+                conn.connect(browser_ws) catch
+                    return self.fail(id, .cdp_error, "WebSocket connection failed");
 
-        conn.closeBrowser() catch
-            return self.fail(id, .cdp_error, "Browser.close failed");
+                conn.closeBrowser() catch
+                    return self.fail(id, .cdp_error, "Browser.close failed");
+            },
+        }
 
         // Evict cached page connection for this profile
         self.evictConnection(profile);
@@ -591,7 +604,7 @@ pub const Server = struct {
     };
 
     fn getPageTargets(self: *Server, profile: []const u8) !?PageTargetsResult {
-        const port = try findBrowserPort(self.allocator, profile) orelse return null;
+        const port = (try findBrowserInfo(self.allocator, profile) orelse return null).port;
 
         const all_targets = cdp.discoverTargets(self.allocator, port) catch return null;
         defer cdp.freeTargets(self.allocator, all_targets);
@@ -658,8 +671,8 @@ pub const Server = struct {
         const profile = extractStringParam(params, "profile") orelse
             return self.fail(id, .invalid_params, "Missing 'profile' parameter");
 
-        const port = try findBrowserPort(self.allocator, profile) orelse
-            return self.fail(id, .browser_not_found, "Browser not found");
+        const port = (try findBrowserInfo(self.allocator, profile) orelse
+            return self.fail(id, .browser_not_found, "Browser not found")).port;
 
         const url = extractStringParam(params, "url");
 
@@ -874,16 +887,32 @@ fn extractIntParam(params: ?json.Value, key: []const u8) ?i64 {
 }
 
 /// Find a browser's CDP port by scanning running processes for the given profile.
-fn findBrowserPort(allocator: mem.Allocator, profile: []const u8) !?u16 {
+const BrowserInfo = struct {
+    port: u16,
+    browser_type: browser_mod.BrowserType,
+};
+
+fn findBrowserInfo(allocator: mem.Allocator, profile: []const u8) !?BrowserInfo {
     const browsers = try browser_mod.discover(allocator);
     defer browser_mod.freeBrowsers(allocator, browsers);
 
     for (browsers) |b| {
         if (mem.eql(u8, b.profile, profile)) {
-            return b.port;
+            return .{ .port = b.port, .browser_type = b.browser_type };
         }
     }
     return null;
+}
+
+/// Replace the user's home directory prefix with "~" for display.
+/// Returns an allocated string if replacement was made, or a dupe of the input.
+fn collapseTilde(allocator: mem.Allocator, path: []const u8) ![]const u8 {
+    const home = std.posix.getenv("HOME") orelse return try allocator.dupe(u8, path);
+    if (mem.startsWith(u8, path, home)) {
+        const rest = path[home.len..];
+        return try std.fmt.allocPrint(allocator, "~{s}", .{rest});
+    }
+    return try allocator.dupe(u8, path);
 }
 
 /// Find the first "page" type target with a webSocketDebuggerUrl.
@@ -1365,4 +1394,26 @@ test "Server dispatch handles new methods without crashing" {
         const obj = parsed.value().object;
         try std.testing.expect(obj.get("error") != null);
     }
+}
+
+test "collapseTilde replaces home prefix with ~" {
+    const allocator = std.testing.allocator;
+    const home = std.posix.getenv("HOME") orelse return;
+
+    // Path under home
+    const input = try std.fmt.allocPrint(allocator, "{s}/.hibrow/profiles/test", .{home});
+    defer allocator.free(input);
+    const result = try collapseTilde(allocator, input);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("~/.hibrow/profiles/test", result);
+
+    // Path not under home
+    const other = try collapseTilde(allocator, "/tmp/something");
+    defer allocator.free(other);
+    try std.testing.expectEqualStrings("/tmp/something", other);
+
+    // Empty path
+    const empty = try collapseTilde(allocator, "");
+    defer allocator.free(empty);
+    try std.testing.expectEqualStrings("", empty);
 }

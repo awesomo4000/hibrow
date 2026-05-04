@@ -39,7 +39,7 @@ pub const Browser = struct {
     /// OS process IDs (Chrome spawns multiple processes per browser).
     pids: []const posix.pid_t = &.{},
     /// Whether we launched this browser (vs discovered it).
-    managed: bool = false,
+    profile_dir: []const u8 = "",
     /// Browser engine type.
     browser_type: BrowserType = .chrome,
 };
@@ -243,7 +243,7 @@ fn launchChrome(allocator: mem.Allocator, options: LaunchOptions) !Browser {
                     .profile = try allocator.dupe(u8, options.profile),
                     .port = port,
                     .pids = pid_slice,
-                    .managed = true,
+                    .profile_dir = try allocator.dupe(u8, profile_dir),
                     .browser_type = .chrome,
                 };
             }
@@ -305,7 +305,7 @@ fn launchFirefox(allocator: mem.Allocator, options: LaunchOptions) !Browser {
                 .profile = try allocator.dupe(u8, options.profile),
                 .port = port,
                 .pids = pid_slice,
-                .managed = true,
+                .profile_dir = try allocator.dupe(u8, profile_dir),
                 .browser_type = .firefox,
             };
         }
@@ -404,6 +404,7 @@ pub fn discover(allocator: mem.Allocator) ![]Browser {
         for (browsers.items) |b| {
             allocator.free(b.profile);
             allocator.free(b.pids);
+            if (b.profile_dir.len > 0) allocator.free(b.profile_dir);
         }
         browsers.deinit(allocator);
     }
@@ -431,7 +432,7 @@ pub fn discover(allocator: mem.Allocator) ![]Browser {
                 .profile = try allocator.dupe(u8, p.profile),
                 .port = p.port,
                 .pids = pid_slice,
-                .managed = false,
+                .profile_dir = try allocator.dupe(u8, p.user_data_dir),
                 .browser_type = p.browser_type,
             });
         }
@@ -445,6 +446,7 @@ pub fn freeBrowsers(allocator: mem.Allocator, browsers: []Browser) void {
     for (browsers) |b| {
         allocator.free(b.profile);
         allocator.free(b.pids);
+        if (b.profile_dir.len > 0) allocator.free(b.profile_dir);
     }
     allocator.free(browsers);
 }
@@ -529,14 +531,14 @@ test "Browser struct has expected fields" {
         .profile = "test",
         .port = 9322,
         .pids = &pids,
-        .managed = true,
+        .profile_dir = "/home/user/.hibrow/profiles/test",
         .browser_type = .chrome,
     };
     try std.testing.expectEqualStrings("test", b.profile);
     try std.testing.expectEqual(@as(u16, 9322), b.port);
     try std.testing.expectEqual(@as(usize, 1), b.pids.len);
     try std.testing.expectEqual(@as(posix.pid_t, 12345), b.pids[0]);
-    try std.testing.expect(b.managed);
+    try std.testing.expectEqualStrings("/home/user/.hibrow/profiles/test", b.profile_dir);
     try std.testing.expectEqual(BrowserType.chrome, b.browser_type);
 }
 
