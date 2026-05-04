@@ -37,6 +37,11 @@ const usage =
     \\  tab list|new|close|switch <profile[:tab]>
     \\      Manage tabs within a browser profile.
     \\
+    \\  grab <profile> <url-or-js-expr> -o <file>
+    \\      Grab binary data from browser and save to file.
+    \\      URL mode: fetches the URL through the browser (with cookies/auth).
+    \\      JS mode: evaluates expression that returns base64 or a URL to fetch.
+    \\
     \\  gateway status
     \\      Show gateway daemon status.
     \\
@@ -91,6 +96,7 @@ pub fn main() !void {
         .{ "url", cmdUrl },
         .{ "console", cmdConsole },
         .{ "tab", cmdTab },
+        .{ "grab", cmdGrab },
         .{ "gateway", cmdGateway },
     });
 
@@ -513,6 +519,65 @@ fn cmdTab(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
         writeStderr("Usage: hibrow tab list|new|close|switch <profile[:tab]>\n", .{});
         std.process.exit(1);
     }
+}
+
+fn cmdGrab(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
+    const profile_arg = args.next() orelse {
+        writeStderr("Error: grab requires a profile and source (URL or JS expression)\n", .{});
+        std.process.exit(1);
+    };
+    const profile = parseProfile(profile_arg);
+
+    var source: ?[]const u8 = null;
+    var output: ?[]const u8 = null;
+
+    // Parse remaining args: <source> -o <file>
+    while (args.next()) |arg| {
+        if (mem.eql(u8, arg, "-o")) {
+            output = args.next() orelse {
+                writeStderr("Error: -o requires a filename\n", .{});
+                std.process.exit(1);
+            };
+        } else if (source == null) {
+            source = arg;
+        } else {
+            writeStderr("Error: unexpected argument: {s}\n", .{arg});
+            std.process.exit(1);
+        }
+    }
+
+    const src = source orelse {
+        writeStderr("Error: grab requires a source (URL or JS expression)\n", .{});
+        std.process.exit(1);
+    };
+    const out_path = output orelse {
+        writeStderr("Error: grab requires -o <output-file>\n", .{});
+        std.process.exit(1);
+    };
+
+    const grab_mod = hibrow.grab;
+    var result = grab_mod.grab(allocator, profile, src) catch |err| {
+        writeStderr("Error: grab failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer result.deinit(allocator);
+
+    // Write to file
+    const file = std.fs.cwd().createFile(out_path, .{}) catch |err| {
+        writeStderr("Error: could not create file: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer file.close();
+
+    file.writeAll(result.data) catch |err| {
+        writeStderr("Error: could not write file: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    // Print result
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "Saved {s} ({d} bytes)\n", .{ out_path, result.data.len }) catch return;
+    writeStderr("{s}", .{msg});
 }
 
 fn cmdGateway(allocator: mem.Allocator, args: *std.process.ArgIterator) void {

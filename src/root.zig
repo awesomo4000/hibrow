@@ -20,6 +20,7 @@ pub const tab = @import("tab.zig");
 pub const cdp = @import("cdp.zig");
 pub const websocket = @import("websocket.zig");
 pub const marionette = @import("marionette.zig");
+pub const grab = @import("grab.zig");
 
 /// High-level client for communicating with the hibrow gateway.
 /// This is the primary API for embedding hibrow in other Zig programs.
