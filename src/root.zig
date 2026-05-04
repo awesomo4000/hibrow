@@ -64,6 +64,9 @@ pub const Client = struct {
         if (opts.proxy_dns) {
             try params.put("proxy_dns", .{ .bool = true });
         }
+        if (opts.browser_type != .chrome) {
+            try params.put("browser_type", .{ .string = opts.browser_type.toString() });
+        }
         return self.gw.call("browser.launch", .{ .object = params });
     }
 
@@ -154,6 +157,7 @@ pub const Client = struct {
 pub const LaunchOpts = struct {
     proxy: ?[]const u8 = null,
     proxy_dns: bool = false,
+    browser_type: browser.BrowserType = .chrome,
 };
 
 // ---------------------------------------------------------------------------

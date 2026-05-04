@@ -13,7 +13,7 @@ const usage =
     \\Usage: hibrow <command> [options]
     \\
     \\Commands:
-    \\  launch <profile> [--proxy <url>] [--proxy-dns]
+    \\  launch <profile> [--browser chrome|firefox|ff] [--proxy <url>] [--proxy-dns]
     \\      Launch a new browser with the given profile name.
     \\
     \\  ls [profile]
@@ -146,6 +146,7 @@ fn cmdLaunch(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     // Parse optional flags
     var proxy: ?[]const u8 = null;
     var proxy_dns = false;
+    var browser_type: hibrow.browser.BrowserType = .chrome;
     while (args.next()) |arg| {
         if (mem.eql(u8, arg, "--proxy")) {
             proxy = args.next() orelse {
@@ -154,6 +155,15 @@ fn cmdLaunch(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
             };
         } else if (mem.eql(u8, arg, "--proxy-dns")) {
             proxy_dns = true;
+        } else if (mem.eql(u8, arg, "--browser")) {
+            const bt_str = args.next() orelse {
+                writeStderr("Error: --browser requires an argument (chrome, firefox, ff)\n", .{});
+                std.process.exit(1);
+            };
+            browser_type = hibrow.browser.BrowserType.fromString(bt_str) orelse {
+                writeStderr("Error: unknown browser type: {s}\n", .{bt_str});
+                std.process.exit(1);
+            };
         } else {
             writeStderr("Unknown option: {s}\n", .{arg});
             std.process.exit(1);
@@ -169,6 +179,7 @@ fn cmdLaunch(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     var resp = client.launch(profile, .{
         .proxy = proxy,
         .proxy_dns = proxy_dns,
+        .browser_type = browser_type,
     }) catch |err| {
         writeStderr("Error: launch failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);

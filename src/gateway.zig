@@ -383,6 +383,7 @@ pub const Server = struct {
         try obj.put("port", .{ .integer = @intCast(b.port) });
         if (b.pid) |pid| try obj.put("pid", .{ .integer = @intCast(pid) });
         try obj.put("managed", .{ .bool = b.managed });
+        try obj.put("browser_type", .{ .string = b.browser_type.toString() });
         return obj;
     }
 
@@ -432,6 +433,13 @@ pub const Server = struct {
         const profile = extractStringParam(params, "profile") orelse
             return self.fail(id, .invalid_params, "Missing 'profile' parameter");
 
+        // Parse browser type (default: chrome)
+        const browser_type = if (extractStringParam(params, "browser_type")) |bt_str|
+            browser_mod.BrowserType.fromString(bt_str) orelse
+                return self.fail(id, .invalid_params, "Invalid browser_type")
+        else
+            browser_mod.BrowserType.chrome;
+
         // Already running? Check via process scan.
         const existing_port = try findBrowserPort(self.allocator, profile);
 
@@ -441,6 +449,7 @@ pub const Server = struct {
             try obj.put("profile", .{ .string = profile });
             try obj.put("port", .{ .integer = @intCast(ep) });
             try obj.put("already_running", .{ .bool = true });
+            try obj.put("browser_type", .{ .string = browser_type.toString() });
             return self.ok(id, .{ .object = obj });
         }
 
@@ -448,6 +457,7 @@ pub const Server = struct {
             .profile = profile,
             .proxy = extractStringParam(params, "proxy"),
             .proxy_dns = extractBoolParam(params, "proxy_dns") orelse false,
+            .browser_type = browser_type,
         }) catch |err|
             return self.fail(id, .browser_launch_failed, @errorName(err));
         defer self.allocator.free(b.profile);
