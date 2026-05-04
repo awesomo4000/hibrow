@@ -188,8 +188,13 @@ pub const Connection = struct {
         var params = json.ObjectMap.init(self.allocator);
         defer params.deinit();
 
-        // Wrap expression: "return (expression)"
-        const script = try std.fmt.allocPrint(self.allocator, "return ({s})", .{expression});
+        // Use indirect eval (0,eval)() so multi-statement code works.
+        // Indirect eval runs in global scope, avoiding strict-mode restrictions.
+        // JSON-encode the expression to safely embed it as a string literal.
+        const expr_json = try json.Stringify.valueAlloc(self.allocator, json.Value{ .string = expression }, .{});
+        defer self.allocator.free(expr_json);
+
+        const script = try std.fmt.allocPrint(self.allocator, "return (0,eval)({s})", .{expr_json});
         defer self.allocator.free(script);
 
         try params.put("script", .{ .string = script });

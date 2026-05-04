@@ -7,7 +7,7 @@
 # color in a tight loop. Tests that the gateway serializes correctly — no
 # crashes, no garbled responses, and we can see who won at the end.
 #
-# Usage: ./tests/parallel.sh
+# Usage: ./tests/parallel.sh [--browser chrome|firefox] [--taggers N] [--duration N]
 #
 set -euo pipefail
 
@@ -15,9 +15,20 @@ HIBROW="./zig-out/bin/hibrow"
 PROFILE="test-parallel"
 NUM_TAGGERS=20
 DURATION=5  # seconds
+BROWSER="chrome"
 PASS=0
 FAIL=0
 TOTAL=0
+
+# Parse args
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --browser) BROWSER="$2"; shift 2 ;;
+        --taggers) NUM_TAGGERS="$2"; shift 2 ;;
+        --duration) DURATION="$2"; shift 2 ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+done
 
 # --------------------------------------------------------------------------
 # Helpers (same as e2e.sh)
@@ -60,6 +71,7 @@ bold "hibrow parallel stress test"
 echo ""
 echo "taggers: $NUM_TAGGERS"
 echo "duration: ${DURATION}s"
+echo "browser: $BROWSER"
 echo "profile: $PROFILE"
 echo ""
 
@@ -71,41 +83,44 @@ sleep 0.5
 
 # Launch a fresh browser
 echo "$(bold '==> Setup')"
-out=$($HIBROW launch $PROFILE 2>&1)
+out=$($HIBROW launch $PROFILE --browser $BROWSER 2>&1)
 assert_contains "$out" "\"profile\"" "browser launched"
+
+# Firefox/Marionette needs a moment to be ready
+if [ "$BROWSER" = "firefox" ] || [ "$BROWSER" = "ff" ]; then
+    sleep 2
+fi
 
 # Set up the arena: blank page with a tag element and a counter per tagger
 $HIBROW nav $PROFILE "about:blank" > /dev/null 2>&1
 sleep 0.3
 
 cat << 'JSEOF' | $HIBROW eval $PROFILE -f- > /dev/null 2>&1
+(function() {
 document.body.style.cssText = 'margin:0;background:#111;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:monospace';
 
-// The "wall" — taggers write their name here
-const wall = document.createElement('div');
+var wall = document.createElement('div');
 wall.id = 'wall';
 wall.style.cssText = 'font-size:72px;font-weight:bold;color:#fff;text-shadow:0 0 30px currentColor;transition:color 0.1s';
 wall.textContent = '...';
 document.body.appendChild(wall);
 
-// Scoreboard — tracks how many writes each tagger got
-const board = document.createElement('div');
+var board = document.createElement('div');
 board.id = 'scoreboard';
 board.style.cssText = 'margin-top:40px;font-size:18px;color:#888;white-space:pre';
 board.textContent = 'waiting for taggers...';
 document.body.appendChild(board);
 
-// Log area — shows recent writes
-const log = document.createElement('div');
+var log = document.createElement('div');
 log.id = 'log';
 log.style.cssText = 'margin-top:20px;font-size:14px;color:#555;max-height:200px;overflow:hidden;white-space:pre';
 document.body.appendChild(log);
 
-// Global state
 window._scores = {};
 window._log = [];
 window._totalWrites = 0;
-'ready';
+return 'ready';
+})()
 JSEOF
 
 echo ""
@@ -126,13 +141,29 @@ TMPDIR=$(mktemp -d)
 trap "rm -rf $TMPDIR" EXIT
 
 # Spawn taggers as background processes
-# Each tagger gets its own JS file (sed-templated from tagger.js)
+# Each tagger gets its own JS file (IIFE format works for both Chrome and Firefox)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 for i in $(seq 0 $((NUM_TAGGERS - 1))); do
     NAME="${NAMES[$i]}"
     COLOR="${COLORS[$i]}"
-    sed -e "s/__TAGGER_NAME__/${NAME}/g" -e "s/__TAGGER_COLOR__/${COLOR}/g" \
-        "$SCRIPT_DIR/tagger.js" > "$TMPDIR/tagger_${NAME}.js"
+    cat > "$TMPDIR/tagger_${NAME}.js" << JSEOF
+(function() {
+var _wall = document.getElementById('wall');
+_wall.textContent = '${NAME}';
+_wall.style.color = '${COLOR}';
+document.body.style.backgroundColor = '${COLOR}' + '22';
+window._scores['${NAME}'] = (window._scores['${NAME}'] || 0) + 1;
+window._totalWrites++;
+window._log.unshift(window._totalWrites + ': ${NAME}');
+if (window._log.length > 20) window._log.pop();
+document.getElementById('log').textContent = window._log.join('\\n');
+document.getElementById('scoreboard').textContent = Object.entries(window._scores)
+    .sort(function(a, b) { return b[1] - a[1]; })
+    .map(function(e) { return e[0].padEnd(10) + e[1]; })
+    .join('\\n');
+return '${NAME}:' + window._scores['${NAME}'];
+})()
+JSEOF
     (
         end=$((SECONDS + DURATION))
         count=0
