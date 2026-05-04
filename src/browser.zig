@@ -387,9 +387,7 @@ pub fn findFreePortInRangeFor(browser_type: BrowserType) !u16 {
 // Process-based discovery
 // ---------------------------------------------------------------------------
 
-/// Discover running CDP-enabled browsers by scanning process args.
-/// Uses proc_listpids + sysctl(KERN_PROCARGS2) on macOS to find Chrome
-/// processes with --remote-debugging-port and --user-data-dir flags.
+/// Discover running browsers (Chrome and Firefox) by scanning process args.
 /// Caller owns the returned slice. Free with freeBrowsers().
 pub fn discover(allocator: mem.Allocator) ![]Browser {
     const procs = try process.findChromeBrowsers(allocator);
@@ -407,6 +405,7 @@ pub fn discover(allocator: mem.Allocator) ![]Browser {
             .port = p.port,
             .pid = p.pid,
             .managed = false,
+            .browser_type = p.browser_type,
         });
     }
 

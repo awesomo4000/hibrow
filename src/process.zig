@@ -8,16 +8,19 @@ const std = @import("std");
 const mem = std.mem;
 const posix = std.posix;
 const builtin = @import("builtin");
+const browser_mod = @import("browser.zig");
 
 /// A discovered Chrome process with its CDP port and profile info.
 pub const DiscoveredProcess = struct {
     pid: posix.pid_t,
-    /// CDP debugging port (from --remote-debugging-port=N).
+    /// CDP debugging port (Chrome) or Marionette port (Firefox).
     port: u16,
-    /// Profile name (basename of --user-data-dir path).
+    /// Profile name (basename of profile/user-data-dir path).
     profile: []const u8,
-    /// Full --user-data-dir path.
+    /// Full profile directory path.
     user_data_dir: []const u8,
+    /// Browser engine type.
+    browser_type: browser_mod.BrowserType = .chrome,
 };
 
 /// Find all Chrome processes with --remote-debugging-port in their args.
@@ -25,7 +28,7 @@ pub const DiscoveredProcess = struct {
 /// Free with freeDiscovered().
 pub fn findChromeBrowsers(allocator: mem.Allocator) ![]DiscoveredProcess {
     if (comptime builtin.os.tag == .macos) {
-        return findChromeBrowsersMacOS(allocator);
+        return findBrowsersMacOS(allocator);
     } else {
         // Linux: TODO — use /proc/PID/cmdline
         return &[_]DiscoveredProcess{};
@@ -66,7 +69,7 @@ extern "c" fn proc_listpids(
 const CTL_KERN: c_int = 1;
 const KERN_PROCARGS2: c_int = 49;
 
-fn findChromeBrowsersMacOS(allocator: mem.Allocator) ![]DiscoveredProcess {
+fn findBrowsersMacOS(allocator: mem.Allocator) ![]DiscoveredProcess {
     // Step 1: Get list of all PIDs
     const pids = try listAllPids(allocator);
     defer allocator.free(pids);
@@ -85,40 +88,99 @@ fn findChromeBrowsersMacOS(allocator: mem.Allocator) ![]DiscoveredProcess {
         defer allocator.free(parsed.raw_buf);
         defer allocator.free(parsed.argv);
 
-        // Look for --remote-debugging-port= in the argv
-        var port: ?u16 = null;
+        // Check for Chrome: --remote-debugging-port= and --user-data-dir=
+        var cdp_port: ?u16 = null;
         var user_data_dir: ?[]const u8 = null;
+        // Check for Firefox: --marionette and --profile <dir>
+        var has_marionette = false;
+        var profile_dir: ?[]const u8 = null;
 
-        for (parsed.argv) |arg| {
+        var i: usize = 0;
+        while (i < parsed.argv.len) : (i += 1) {
+            const arg = parsed.argv[i];
             if (mem.startsWith(u8, arg, "--remote-debugging-port=")) {
                 const val = arg["--remote-debugging-port=".len..];
-                port = std.fmt.parseInt(u16, val, 10) catch null;
+                cdp_port = std.fmt.parseInt(u16, val, 10) catch null;
             } else if (mem.startsWith(u8, arg, "--user-data-dir=")) {
                 user_data_dir = arg["--user-data-dir=".len..];
+            } else if (mem.eql(u8, arg, "--marionette")) {
+                has_marionette = true;
+            } else if (mem.eql(u8, arg, "--profile")) {
+                // --profile <dir> (next arg is the directory)
+                if (i + 1 < parsed.argv.len) {
+                    i += 1;
+                    profile_dir = parsed.argv[i];
+                }
             }
         }
 
-        // Only include processes that have a debugging port
-        if (port) |p| {
+        // Chrome: has debugging port and user-data-dir
+        if (cdp_port) |p| {
             if (user_data_dir) |udd| {
-                // Dupe the user_data_dir string so it outlives parsed.raw_buf
                 const udd_owned = try allocator.dupe(u8, udd);
                 errdefer allocator.free(udd_owned);
-
-                // Profile name = basename of user-data-dir
                 const profile = std.fs.path.basename(udd_owned);
-
                 try results.append(allocator, .{
                     .pid = pid,
                     .port = p,
                     .profile = profile,
                     .user_data_dir = udd_owned,
+                    .browser_type = .chrome,
                 });
+            }
+        }
+
+        // Firefox: has --marionette and --profile
+        if (has_marionette) {
+            if (profile_dir) |pdir| {
+                const pdir_owned = try allocator.dupe(u8, pdir);
+                errdefer allocator.free(pdir_owned);
+                const profile = std.fs.path.basename(pdir_owned);
+
+                // Read marionette port from user.js in profile dir
+                const m_port = readMarionettePort(allocator, pdir_owned) catch null;
+                if (m_port) |port| {
+                    try results.append(allocator, .{
+                        .pid = pid,
+                        .port = port,
+                        .profile = profile,
+                        .user_data_dir = pdir_owned,
+                        .browser_type = .firefox,
+                    });
+                } else {
+                    allocator.free(pdir_owned);
+                }
             }
         }
     }
 
     return try results.toOwnedSlice(allocator);
+}
+
+/// Read the marionette.port value from a Firefox profile's user.js.
+/// Parses the line: user_pref("marionette.port", NNNN);
+fn readMarionettePort(allocator: mem.Allocator, profile_dir: []const u8) !?u16 {
+    const prefs_path = try std.fmt.allocPrint(allocator, "{s}/user.js", .{profile_dir});
+    defer allocator.free(prefs_path);
+
+    const content = std.fs.cwd().readFileAlloc(allocator, prefs_path, 1 << 16) catch return null;
+    defer allocator.free(content);
+
+    // Look for: user_pref("marionette.port", NNNN);
+    const needle = "\"marionette.port\",";
+    const pos = mem.indexOf(u8, content, needle) orelse return null;
+    const after = content[pos + needle.len ..];
+
+    // Skip whitespace
+    var start: usize = 0;
+    while (start < after.len and (after[start] == ' ' or after[start] == '\t')) : (start += 1) {}
+
+    // Read digits
+    var end = start;
+    while (end < after.len and after[end] >= '0' and after[end] <= '9') : (end += 1) {}
+
+    if (end == start) return null;
+    return std.fmt.parseInt(u16, after[start..end], 10) catch null;
 }
 
 /// Get all PIDs on the system.
