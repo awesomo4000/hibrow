@@ -502,13 +502,27 @@ pub const Server = struct {
         const url = extractStringParam(params, "url") orelse
             return self.fail(id, .invalid_params, "Missing 'url' parameter");
 
-        const conn = self.getConnection(profile) orelse
+        const info = try findBrowserInfo(self.allocator, profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
-        conn.navigate(url) catch {
-            self.evictConnection(profile);
-            return self.fail(id, .cdp_error, "Navigate failed");
-        };
+        switch (info.browser_type) {
+            .firefox => {
+                var conn = marionette_mod.Connection.init(self.allocator);
+                defer conn.deinit();
+                conn.connect(info.port) catch
+                    return self.fail(id, .cdp_error, "Marionette connection failed");
+                conn.navigate(url) catch
+                    return self.fail(id, .cdp_error, "Navigate failed");
+            },
+            .chrome => {
+                const conn = self.getConnection(profile) orelse
+                    return self.fail(id, .browser_not_found, "Browser not found");
+                conn.navigate(url) catch {
+                    self.evictConnection(profile);
+                    return self.fail(id, .cdp_error, "Navigate failed");
+                };
+            },
+        }
 
         var obj = json.ObjectMap.init(self.allocator);
         defer obj.deinit();
