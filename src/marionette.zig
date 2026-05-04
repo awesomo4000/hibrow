@@ -269,6 +269,86 @@ pub const Connection = struct {
         _ = self.send("Marionette:Quit", .{ .object = params }) catch {};
     }
 
+    /// Get list of window handles (tabs).
+    pub fn getWindowHandles(self: *Connection) ![][]const u8 {
+        var result = try self.send("WebDriver:GetWindowHandles", .null);
+        defer result.deinit();
+
+        if (result.err) |_| return error.CommandFailed;
+
+        // Result is an array of handle strings
+        if (result.result != .array) return error.InvalidResponse;
+        const arr = result.result.array;
+
+        var handles: std.ArrayList([]const u8) = .{};
+        errdefer {
+            for (handles.items) |h| self.allocator.free(h);
+            handles.deinit(self.allocator);
+        }
+
+        for (arr.items) |item| {
+            if (item == .string) {
+                try handles.append(self.allocator, try self.allocator.dupe(u8, item.string));
+            }
+        }
+
+        return try handles.toOwnedSlice(self.allocator);
+    }
+
+    /// Get the current window handle.
+    pub fn getWindowHandle(self: *Connection) ![]const u8 {
+        var result = try self.send("WebDriver:GetWindowHandle", .null);
+        defer result.deinit();
+
+        if (result.err) |_| return error.CommandFailed;
+        if (result.result == .object) {
+            if (result.result.object.get("value")) |val| {
+                if (val == .string) return try self.allocator.dupe(u8, val.string);
+            }
+        }
+        if (result.result == .string) return try self.allocator.dupe(u8, result.result.string);
+        return error.InvalidResponse;
+    }
+
+    /// Switch to a window/tab by handle.
+    pub fn switchToWindow(self: *Connection, handle: []const u8) !void {
+        var params = json.ObjectMap.init(self.allocator);
+        defer params.deinit();
+        try params.put("handle", .{ .string = handle });
+
+        var result = try self.send("WebDriver:SwitchToWindow", .{ .object = params });
+        defer result.deinit();
+
+        if (result.err) |_| return error.CommandFailed;
+    }
+
+    /// Open a new tab/window. Returns the new handle.
+    pub fn newWindow(self: *Connection, window_type: []const u8) ![]const u8 {
+        var params = json.ObjectMap.init(self.allocator);
+        defer params.deinit();
+        try params.put("type", .{ .string = window_type });
+
+        var result = try self.send("WebDriver:NewWindow", .{ .object = params });
+        defer result.deinit();
+
+        if (result.err) |_| return error.CommandFailed;
+
+        // Returns {"handle": "...", "type": "tab"|"window"}
+        if (result.result == .object) {
+            if (result.result.object.get("handle")) |val| {
+                if (val == .string) return try self.allocator.dupe(u8, val.string);
+            }
+        }
+        return error.InvalidResponse;
+    }
+
+    /// Close the current window/tab.
+    pub fn closeWindow(self: *Connection) !void {
+        var result = try self.send("WebDriver:CloseWindow", .null);
+        defer result.deinit();
+        // Ignore errors — if it was the last window, connection drops
+    }
+
     // -----------------------------------------------------------------------
     // Wire protocol helpers
     // -----------------------------------------------------------------------

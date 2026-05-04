@@ -696,50 +696,108 @@ pub const Server = struct {
         const profile = extractStringParam(params, "profile") orelse
             return self.fail(id, .invalid_params, "Missing 'profile' parameter");
 
-        const result = try self.getPageTargets(profile) orelse
+        const info = try findBrowserInfo(self.allocator, profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
-        defer cdp.freeTargets(self.allocator, result.targets);
 
-        var arr = json.Array.init(self.allocator);
-        defer arr.deinit();
-        for (result.targets, 0..) |t, i| {
-            var obj = json.ObjectMap.init(self.allocator);
-            try obj.put("index", .{ .integer = @intCast(i) });
-            try obj.put("title", .{ .string = t.title });
-            try obj.put("url", .{ .string = t.url });
-            try arr.append(.{ .object = obj });
+        switch (info.browser_type) {
+            .firefox => {
+                var conn = marionette_mod.Connection.init(self.allocator);
+                defer conn.deinit();
+                conn.connect(info.port) catch
+                    return self.fail(id, .cdp_error, "Marionette connection failed");
+
+                const handles = conn.getWindowHandles() catch
+                    return self.fail(id, .cdp_error, "Could not list windows");
+                defer {
+                    for (handles) |h| self.allocator.free(h);
+                    self.allocator.free(handles);
+                }
+
+                // For each handle, switch to it, get title+url
+                var arr = json.Array.init(self.allocator);
+                defer arr.deinit();
+                for (handles, 0..) |handle, i| {
+                    conn.switchToWindow(handle) catch continue;
+                    const title = conn.getTitle() catch try self.allocator.dupe(u8, "");
+                    const url = conn.getCurrentUrl() catch try self.allocator.dupe(u8, "");
+
+                    var obj = json.ObjectMap.init(self.allocator);
+                    try obj.put("index", .{ .integer = @intCast(i) });
+                    try obj.put("title", .{ .string = title });
+                    try obj.put("url", .{ .string = url });
+                    try arr.append(.{ .object = obj });
+                }
+                return self.ok(id, .{ .array = arr });
+            },
+            .chrome => {
+                const result = try self.getPageTargets(profile) orelse
+                    return self.fail(id, .browser_not_found, "Browser not found");
+                defer cdp.freeTargets(self.allocator, result.targets);
+
+                var arr = json.Array.init(self.allocator);
+                defer arr.deinit();
+                for (result.targets, 0..) |t, i| {
+                    var obj = json.ObjectMap.init(self.allocator);
+                    try obj.put("index", .{ .integer = @intCast(i) });
+                    try obj.put("title", .{ .string = t.title });
+                    try obj.put("url", .{ .string = t.url });
+                    try arr.append(.{ .object = obj });
+                }
+                return self.ok(id, .{ .array = arr });
+            },
         }
-
-        return self.ok(id, .{ .array = arr });
     }
 
     fn handleTabNew(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {
         const profile = extractStringParam(params, "profile") orelse
             return self.fail(id, .invalid_params, "Missing 'profile' parameter");
 
-        const port = (try findBrowserInfo(self.allocator, profile) orelse
-            return self.fail(id, .browser_not_found, "Browser not found")).port;
+        const info = try findBrowserInfo(self.allocator, profile) orelse
+            return self.fail(id, .browser_not_found, "Browser not found");
 
         const url = extractStringParam(params, "url");
 
-        const new_target = cdp.createTarget(self.allocator, port, url) catch
-            return self.fail(id, .cdp_error, "Could not create tab");
-        defer {
-            self.allocator.free(new_target.id);
-            self.allocator.free(new_target.title);
-            self.allocator.free(new_target.url);
-            self.allocator.free(new_target.@"type");
-            if (new_target.webSocketDebuggerUrl) |ws| self.allocator.free(ws);
+        switch (info.browser_type) {
+            .firefox => {
+                var conn = marionette_mod.Connection.init(self.allocator);
+                defer conn.deinit();
+                conn.connect(info.port) catch
+                    return self.fail(id, .cdp_error, "Marionette connection failed");
+
+                const handle = conn.newWindow("tab") catch
+                    return self.fail(id, .cdp_error, "Could not create tab");
+                defer self.allocator.free(handle);
+
+                // Switch to new tab and navigate if URL provided
+                conn.switchToWindow(handle) catch {};
+                if (url) |u| conn.navigate(u) catch {};
+
+                self.evictConnection(profile);
+                var obj = json.ObjectMap.init(self.allocator);
+                defer obj.deinit();
+                try obj.put("status", .{ .string = "created" });
+                try obj.put("url", .{ .string = url orelse "about:blank" });
+                return self.ok(id, .{ .object = obj });
+            },
+            .chrome => {
+                const new_target = cdp.createTarget(self.allocator, info.port, url) catch
+                    return self.fail(id, .cdp_error, "Could not create tab");
+                defer {
+                    self.allocator.free(new_target.id);
+                    self.allocator.free(new_target.title);
+                    self.allocator.free(new_target.url);
+                    self.allocator.free(new_target.@"type");
+                    if (new_target.webSocketDebuggerUrl) |ws| self.allocator.free(ws);
+                }
+
+                self.evictConnection(profile);
+                var obj = json.ObjectMap.init(self.allocator);
+                defer obj.deinit();
+                try obj.put("status", .{ .string = "created" });
+                try obj.put("url", .{ .string = new_target.url });
+                return self.ok(id, .{ .object = obj });
+            },
         }
-
-        // Evict cached connection so next operation rediscovers tabs
-        self.evictConnection(profile);
-
-        var obj = json.ObjectMap.init(self.allocator);
-        defer obj.deinit();
-        try obj.put("status", .{ .string = "created" });
-        try obj.put("url", .{ .string = new_target.url });
-        return self.ok(id, .{ .object = obj });
     }
 
     fn handleTabClose(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {
@@ -751,20 +809,49 @@ pub const Server = struct {
         if (tab_idx < 0) return self.fail(id, .invalid_params, "Tab index must be non-negative");
         const idx: usize = @intCast(tab_idx);
 
-        const result = try self.getPageTargets(profile) orelse
+        const info = try findBrowserInfo(self.allocator, profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
-        defer cdp.freeTargets(self.allocator, result.targets);
 
-        if (idx >= result.targets.len)
-            return self.fail(id, .invalid_params, "Tab index out of bounds");
+        switch (info.browser_type) {
+            .firefox => {
+                var conn = marionette_mod.Connection.init(self.allocator);
+                defer conn.deinit();
+                conn.connect(info.port) catch
+                    return self.fail(id, .cdp_error, "Marionette connection failed");
 
-        cdp.closeTarget(self.allocator, result.port, result.targets[idx].id) catch
-            return self.fail(id, .cdp_error, "Could not close tab");
+                const handles = conn.getWindowHandles() catch
+                    return self.fail(id, .cdp_error, "Could not list windows");
+                defer {
+                    for (handles) |h| self.allocator.free(h);
+                    self.allocator.free(handles);
+                }
 
-        // Evict cached connection since tab layout changed
-        self.evictConnection(profile);
+                if (idx >= handles.len)
+                    return self.fail(id, .invalid_params, "Tab index out of bounds");
 
-        return self.ok(id, .{ .string = "closed" });
+                conn.switchToWindow(handles[idx]) catch
+                    return self.fail(id, .cdp_error, "Could not switch to tab");
+                conn.closeWindow() catch
+                    return self.fail(id, .cdp_error, "Could not close tab");
+
+                self.evictConnection(profile);
+                return self.ok(id, .{ .string = "closed" });
+            },
+            .chrome => {
+                const result = try self.getPageTargets(profile) orelse
+                    return self.fail(id, .browser_not_found, "Browser not found");
+                defer cdp.freeTargets(self.allocator, result.targets);
+
+                if (idx >= result.targets.len)
+                    return self.fail(id, .invalid_params, "Tab index out of bounds");
+
+                cdp.closeTarget(self.allocator, result.port, result.targets[idx].id) catch
+                    return self.fail(id, .cdp_error, "Could not close tab");
+
+                self.evictConnection(profile);
+                return self.ok(id, .{ .string = "closed" });
+            },
+        }
     }
 
     fn handleTabSwitch(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {
@@ -776,20 +863,47 @@ pub const Server = struct {
         if (tab_idx < 0) return self.fail(id, .invalid_params, "Tab index must be non-negative");
         const idx: usize = @intCast(tab_idx);
 
-        const result = try self.getPageTargets(profile) orelse
+        const info = try findBrowserInfo(self.allocator, profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
-        defer cdp.freeTargets(self.allocator, result.targets);
 
-        if (idx >= result.targets.len)
-            return self.fail(id, .invalid_params, "Tab index out of bounds");
+        switch (info.browser_type) {
+            .firefox => {
+                var conn = marionette_mod.Connection.init(self.allocator);
+                defer conn.deinit();
+                conn.connect(info.port) catch
+                    return self.fail(id, .cdp_error, "Marionette connection failed");
 
-        cdp.activateTarget(self.allocator, result.port, result.targets[idx].id) catch
-            return self.fail(id, .cdp_error, "Could not activate tab");
+                const handles = conn.getWindowHandles() catch
+                    return self.fail(id, .cdp_error, "Could not list windows");
+                defer {
+                    for (handles) |h| self.allocator.free(h);
+                    self.allocator.free(handles);
+                }
 
-        // Evict cached connection so next eval connects to newly active tab
-        self.evictConnection(profile);
+                if (idx >= handles.len)
+                    return self.fail(id, .invalid_params, "Tab index out of bounds");
 
-        return self.ok(id, .{ .string = "switched" });
+                conn.switchToWindow(handles[idx]) catch
+                    return self.fail(id, .cdp_error, "Could not switch tab");
+
+                self.evictConnection(profile);
+                return self.ok(id, .{ .string = "switched" });
+            },
+            .chrome => {
+                const result = try self.getPageTargets(profile) orelse
+                    return self.fail(id, .browser_not_found, "Browser not found");
+                defer cdp.freeTargets(self.allocator, result.targets);
+
+                if (idx >= result.targets.len)
+                    return self.fail(id, .invalid_params, "Tab index out of bounds");
+
+                cdp.activateTarget(self.allocator, result.port, result.targets[idx].id) catch
+                    return self.fail(id, .cdp_error, "Could not activate tab");
+
+                self.evictConnection(profile);
+                return self.ok(id, .{ .string = "switched" });
+            },
+        }
     }
 };
 
