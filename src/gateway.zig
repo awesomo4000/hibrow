@@ -27,8 +27,6 @@ const socket_filename = "gateway.sock";
 /// PID filename within the per-user directory.
 const pid_filename = "gateway.pid";
 
-/// Maximum line length for JSON-RPC messages.
-const max_line_len = 1 << 20; // 1 MiB
 
 /// Read buffer size for socket I/O.
 const read_buf_size = 8192;
@@ -1017,7 +1015,7 @@ fn readLine(allocator: mem.Allocator, stream: std.net.Stream) ![]u8 {
     errdefer buf.deinit(allocator);
 
     var read_buf: [read_buf_size]u8 = undefined;
-    while (buf.items.len < max_line_len) {
+    while (true) {
         const n = try stream.read(&read_buf);
         if (n == 0) break; // EOF
 
