@@ -42,6 +42,10 @@ const usage =
     \\      URL mode: fetches the URL through the browser (with cookies/auth).
     \\      JS mode: evaluates expression that returns base64 or a URL to fetch.
     \\
+    \\  push <profile[:tab]> <target> <text> | -f <file> | -f-
+    \\      Push text into the browser. Target is a CSS selector (sets .value)
+    \\      or a window.* variable name (assigns directly).
+    \\
     \\  screenshot <profile[:tab]> -o <file>
     \\      Capture a screenshot of the browser tab and save as PNG.
     \\
@@ -100,6 +104,7 @@ pub fn main() !void {
         .{ "console", cmdConsole },
         .{ "tab", cmdTab },
         .{ "grab", cmdGrab },
+        .{ "push", cmdPush },
         .{ "screenshot", cmdScreenshot },
         .{ "gateway", cmdGateway },
     });
@@ -582,6 +587,57 @@ fn cmdGrab(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     var buf: [256]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, "Saved {s} ({d} bytes)\n", .{ out_path, result.data.len }) catch return;
     writeStderr("{s}", .{msg});
+}
+
+fn cmdPush(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
+    const target_arg = args.next() orelse {
+        writeStderr("Error: push requires a profile[:tab] and target\n", .{});
+        std.process.exit(1);
+    };
+    const profile = parseProfile(target_arg);
+
+    const target = args.next() orelse {
+        writeStderr("Error: push requires a target (CSS selector or window.* variable)\n", .{});
+        std.process.exit(1);
+    };
+
+    // Get content: positional arg, -f <file>, or -f- (stdin)
+    const next_arg = args.next() orelse {
+        writeStderr("Error: push requires content (text, -f <file>, or -f-)\n", .{});
+        std.process.exit(1);
+    };
+
+    var content: []const u8 = undefined;
+    var owned_content: ?[]u8 = null;
+
+    if (mem.eql(u8, next_arg, "-f")) {
+        const filename = args.next() orelse {
+            writeStderr("Error: -f requires a filename\n", .{});
+            std.process.exit(1);
+        };
+        owned_content = std.fs.cwd().readFileAlloc(allocator, filename, 10 << 20) catch |err| {
+            writeStderr("Error: could not read file: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        content = owned_content.?;
+    } else if (mem.eql(u8, next_arg, "-f-")) {
+        owned_content = std.fs.File.stdin().readToEndAlloc(allocator, 10 << 20) catch |err| {
+            writeStderr("Error: could not read stdin: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        content = owned_content.?;
+    } else {
+        content = next_arg;
+    }
+    defer if (owned_content) |c| allocator.free(c);
+
+    const push_mod = hibrow.push;
+    push_mod.push(allocator, profile, target, content) catch |err| {
+        writeStderr("Error: push failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    writeStderr("ok\n", .{});
 }
 
 fn cmdScreenshot(allocator: mem.Allocator, args: *std.process.ArgIterator) void {

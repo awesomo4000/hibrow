@@ -46,6 +46,7 @@ pub fn build(b: *std.Build) void {
         "src/websocket.zig",
         "src/marionette.zig",
         "src/grab.zig",
+        "src/push.zig",
     };
 
     const test_step = b.step("test", "Run all unit tests");
