@@ -381,7 +381,11 @@ pub const Server = struct {
         var obj = json.ObjectMap.init(self.allocator);
         try obj.put("profile", .{ .string = b.profile });
         try obj.put("port", .{ .integer = @intCast(b.port) });
-        if (b.pid) |pid| try obj.put("pid", .{ .integer = @intCast(pid) });
+        var pids_arr = json.Array.init(self.allocator);
+        for (b.pids) |pid| {
+            try pids_arr.append(.{ .integer = @intCast(pid) });
+        }
+        try obj.put("pids", .{ .array = pids_arr });
         try obj.put("managed", .{ .bool = b.managed });
         try obj.put("browser_type", .{ .string = b.browser_type.toString() });
         return obj;

@@ -36,8 +36,8 @@ pub const Browser = struct {
     profile: []const u8,
     /// CDP debugging port (Chrome) or Marionette port (Firefox).
     port: u16,
-    /// OS process ID.
-    pid: ?posix.pid_t = null,
+    /// OS process IDs (Chrome spawns multiple processes per browser).
+    pids: []const posix.pid_t = &.{},
     /// Whether we launched this browser (vs discovered it).
     managed: bool = false,
     /// Browser engine type.
@@ -237,10 +237,12 @@ fn launchChrome(allocator: mem.Allocator, options: LaunchOptions) !Browser {
         if (tcpProbe(port)) {
             // TCP is open — now verify CDP responds over HTTP
             if (verify(allocator, port) catch false) {
+                const pid_slice = try allocator.alloc(posix.pid_t, 1);
+                pid_slice[0] = pid;
                 return .{
                     .profile = try allocator.dupe(u8, options.profile),
                     .port = port,
-                    .pid = pid,
+                    .pids = pid_slice,
                     .managed = true,
                     .browser_type = .chrome,
                 };
@@ -297,10 +299,12 @@ fn launchFirefox(allocator: mem.Allocator, options: LaunchOptions) !Browser {
     var attempts: u32 = 0;
     while (attempts < 100) : (attempts += 1) {
         if (tcpProbe(port)) {
+            const pid_slice = try allocator.alloc(posix.pid_t, 1);
+            pid_slice[0] = pid;
             return .{
                 .profile = try allocator.dupe(u8, options.profile),
                 .port = port,
-                .pid = pid,
+                .pids = pid_slice,
                 .managed = true,
                 .browser_type = .firefox,
             };
@@ -388,25 +392,49 @@ pub fn findFreePortInRangeFor(browser_type: BrowserType) !u16 {
 // ---------------------------------------------------------------------------
 
 /// Discover running browsers (Chrome and Firefox) by scanning process args.
+/// Groups multiple processes with the same port into a single Browser entry.
 /// Caller owns the returned slice. Free with freeBrowsers().
 pub fn discover(allocator: mem.Allocator) ![]Browser {
     const procs = try process.findChromeBrowsers(allocator);
     defer process.freeDiscovered(allocator, procs);
 
+    // Group by port — multiple Chrome processes share the same port
     var browsers: std.ArrayList(Browser) = .{};
     errdefer {
-        for (browsers.items) |b| allocator.free(b.profile);
+        for (browsers.items) |b| {
+            allocator.free(b.profile);
+            allocator.free(b.pids);
+        }
         browsers.deinit(allocator);
     }
 
     for (procs) |p| {
-        try browsers.append(allocator, .{
-            .profile = try allocator.dupe(u8, p.profile),
-            .port = p.port,
-            .pid = p.pid,
-            .managed = false,
-            .browser_type = p.browser_type,
-        });
+        // Check if we already have a browser on this port
+        var found = false;
+        for (browsers.items) |*b| {
+            if (b.port == p.port) {
+                // Append pid to existing entry
+                const old_len = b.pids.len;
+                const new_pids = try allocator.alloc(posix.pid_t, old_len + 1);
+                @memcpy(new_pids[0..old_len], b.pids);
+                new_pids[old_len] = p.pid;
+                allocator.free(b.pids);
+                b.pids = new_pids;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            const pid_slice = try allocator.alloc(posix.pid_t, 1);
+            pid_slice[0] = p.pid;
+            try browsers.append(allocator, .{
+                .profile = try allocator.dupe(u8, p.profile),
+                .port = p.port,
+                .pids = pid_slice,
+                .managed = false,
+                .browser_type = p.browser_type,
+            });
+        }
     }
 
     return try browsers.toOwnedSlice(allocator);
@@ -416,6 +444,7 @@ pub fn discover(allocator: mem.Allocator) ![]Browser {
 pub fn freeBrowsers(allocator: mem.Allocator, browsers: []Browser) void {
     for (browsers) |b| {
         allocator.free(b.profile);
+        allocator.free(b.pids);
     }
     allocator.free(browsers);
 }
@@ -495,16 +524,18 @@ fn ensureDirExists(path: []const u8) !void {
 // ---------------------------------------------------------------------------
 
 test "Browser struct has expected fields" {
+    const pids = [_]posix.pid_t{12345};
     const b = Browser{
         .profile = "test",
         .port = 9322,
-        .pid = 12345,
+        .pids = &pids,
         .managed = true,
         .browser_type = .chrome,
     };
     try std.testing.expectEqualStrings("test", b.profile);
     try std.testing.expectEqual(@as(u16, 9322), b.port);
-    try std.testing.expectEqual(@as(?posix.pid_t, 12345), b.pid);
+    try std.testing.expectEqual(@as(usize, 1), b.pids.len);
+    try std.testing.expectEqual(@as(posix.pid_t, 12345), b.pids[0]);
     try std.testing.expect(b.managed);
     try std.testing.expectEqual(BrowserType.chrome, b.browser_type);
 }
