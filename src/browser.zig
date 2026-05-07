@@ -653,7 +653,8 @@ pub fn getProfileDir(allocator: mem.Allocator, profile: []const u8) ![]u8 {
 // ---------------------------------------------------------------------------
 
 fn getHomeDir(allocator: mem.Allocator) ![]u8 {
-    return std.process.getEnvVarOwned(allocator, "HOME") catch error.NoHomeDir;
+    const var_name = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
+    return std.process.getEnvVarOwned(allocator, var_name) catch error.NoHomeDir;
 }
 
 fn ensureDirExists(path: []const u8) !void {

@@ -29,6 +29,8 @@ pub const DiscoveredProcess = struct {
 pub fn findChromeBrowsers(allocator: mem.Allocator) ![]DiscoveredProcess {
     if (comptime builtin.os.tag == .macos) {
         return findBrowsersMacOS(allocator);
+    } else if (comptime builtin.os.tag == .windows) {
+        return findBrowsersWindows(allocator);
     } else {
         // Linux: TODO — use /proc/PID/cmdline
         return &[_]DiscoveredProcess{};
@@ -155,6 +157,120 @@ fn findBrowsersMacOS(allocator: mem.Allocator) ![]DiscoveredProcess {
     }
 
     return try results.toOwnedSlice(allocator);
+}
+
+// ===========================================================================
+// Windows discovery: port scan + socket→PID + PID→cmdline
+//
+// Port-range scan in our reserved Chrome/Firefox ranges. For each live
+// port we ask the kernel which PID owns the listening socket
+// (GetExtendedTcpTable), then ask that PID for its full command line
+// (NtQueryInformationProcess(ProcessCommandLineInformation)). We extract
+// --user-data-dir / -profile from there exactly the way the macOS path
+// extracts them from KERN_PROCARGS2 argv.
+//
+// Both Win32 helpers live in win_proc.zig as standalone reusable snippets.
+// ===========================================================================
+
+fn findBrowsersWindows(allocator: mem.Allocator) ![]DiscoveredProcess {
+    const win_proc = @import("win_proc.zig");
+
+    var results: std.ArrayList(DiscoveredProcess) = .{};
+    errdefer {
+        for (results.items) |p| allocator.free(p.user_data_dir);
+        results.deinit(allocator);
+    }
+
+    // Pull the listener table once and filter, instead of scanning each port
+    // individually (which would re-fetch the whole TCP table per probe).
+    const listeners = try win_proc.listTcpListeners(allocator);
+    defer allocator.free(listeners);
+
+    for (listeners) |l| {
+        const browser_type = browserTypeForPort(l.port) orelse continue;
+        if (!browser_mod.tcpProbe(l.port)) continue;
+
+        const cmdline = (win_proc.getProcessCommandLine(allocator, l.pid) catch null) orelse continue;
+        defer allocator.free(cmdline);
+
+        const dir = switch (browser_type) {
+            .chrome => parseChromeUserDataDir(cmdline) orelse continue,
+            .firefox => blk: {
+                if (!hasMarionetteFlag(cmdline)) continue;
+                break :blk parseFirefoxProfile(cmdline) orelse continue;
+            },
+        };
+
+        const dir_owned = try allocator.dupe(u8, dir);
+        errdefer allocator.free(dir_owned);
+        const profile = std.fs.path.basename(dir_owned);
+
+        try results.append(allocator, .{
+            .pid = pidFromU32(l.pid),
+            .port = l.port,
+            .profile = profile,
+            .user_data_dir = dir_owned,
+            .browser_type = browser_type,
+        });
+    }
+
+    return try results.toOwnedSlice(allocator);
+}
+
+fn browserTypeForPort(port: u16) ?browser_mod.BrowserType {
+    if (port >= browser_mod.port_range_start and port < browser_mod.port_range_end) return .chrome;
+    if (port >= browser_mod.firefox_port_range_start and port < browser_mod.firefox_port_range_end) return .firefox;
+    return null;
+}
+
+/// Convert a Windows DWORD pid back into the platform's pid_t. On Windows
+/// the field is a HANDLE-shaped pointer; we encode the numeric pid into it.
+fn pidFromU32(pid: u32) posix.pid_t {
+    if (builtin.os.tag == .windows) return @ptrFromInt(pid);
+    return @intCast(pid);
+}
+
+/// Extract the value of --user-data-dir=<value> from a command line.
+/// Handles both unquoted (no spaces in path) and "...quoted..." forms.
+/// Returns a slice into the input — caller must dupe if it needs to outlive
+/// the cmdline buffer.
+fn parseChromeUserDataDir(cmdline: []const u8) ?[]const u8 {
+    const needle = "--user-data-dir=";
+    const start = mem.indexOf(u8, cmdline, needle) orelse return null;
+    return readArgValue(cmdline[start + needle.len ..]);
+}
+
+/// Detect Firefox marionette flag in a command line, in either single- or
+/// double-dash form.
+fn hasMarionetteFlag(cmdline: []const u8) bool {
+    return mem.indexOf(u8, cmdline, "--marionette") != null or
+        mem.indexOf(u8, cmdline, " -marionette") != null;
+}
+
+/// Extract the directory argument that follows `-profile` or `--profile`.
+/// Firefox passes this as two tokens: `-profile <dir>`.
+fn parseFirefoxProfile(cmdline: []const u8) ?[]const u8 {
+    const idx = mem.indexOf(u8, cmdline, "--profile ") orelse
+        mem.indexOf(u8, cmdline, " -profile ") orelse return null;
+    // Skip past the flag itself, then any whitespace.
+    var pos = idx;
+    while (pos < cmdline.len and cmdline[pos] != ' ') : (pos += 1) {}
+    while (pos < cmdline.len and cmdline[pos] == ' ') : (pos += 1) {}
+    if (pos >= cmdline.len) return null;
+    return readArgValue(cmdline[pos..]);
+}
+
+/// Read an argument value from the start of a string. Stops at whitespace,
+/// or at the matching closing quote if the value is quoted.
+fn readArgValue(s: []const u8) ?[]const u8 {
+    if (s.len == 0) return null;
+    if (s[0] == '"') {
+        const end = mem.indexOfScalar(u8, s[1..], '"') orelse return null;
+        return s[1 .. 1 + end];
+    }
+    const end = mem.indexOfAny(u8, s, " \t") orelse s.len;
+    if (end == 0) return null;
+    return s[0..end];
 }
 
 /// Read the marionette.port value from a Firefox profile's user.js.
