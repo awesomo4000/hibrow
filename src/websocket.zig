@@ -7,31 +7,10 @@
 ///! Frame encode/decode are pure functions (no I/O) for easy testing.
 ///! The WebSocket struct wraps them with stream I/O for real connections.
 const std = @import("std");
-const builtin = @import("builtin");
 const mem = std.mem;
 const net = std.net;
 const crypto = std.crypto;
-
-/// Cross-platform socket read. On Windows, std.net.Stream.read goes through
-/// ReadFile, which returns ERROR_INVALID_PARAMETER on overlapped sockets
-/// (as created by std.net.tcpConnectToHost). recv() works correctly on
-/// overlapped sockets, so we use it directly there. Returns 0 on EOF.
-fn streamRead(stream: net.Stream, buffer: []u8) !usize {
-    if (builtin.os.tag == .windows) {
-        const ws2 = std.os.windows.ws2_32;
-        const len: c_int = @intCast(@min(buffer.len, std.math.maxInt(c_int)));
-        const n = ws2.recv(@ptrCast(stream.handle), buffer.ptr, len, 0);
-        if (n == ws2.SOCKET_ERROR) {
-            const err = ws2.WSAGetLastError();
-            return switch (err) {
-                .WSAESHUTDOWN, .WSAECONNRESET, .WSAECONNABORTED => 0,
-                else => error.SocketReadFailed,
-            };
-        }
-        return @intCast(n);
-    }
-    return stream.read(buffer);
-}
+const streamRead = @import("net_compat.zig").streamRead;
 
 /// WebSocket opcodes (RFC 6455 §5.2).
 pub const Opcode = enum(u4) {

@@ -15,6 +15,7 @@ const std = @import("std");
 const mem = std.mem;
 const json = std.json;
 const net = std.net;
+const streamRead = @import("net_compat.zig").streamRead;
 
 /// Marionette handshake data sent by Firefox on connect.
 pub const Handshake = struct {
@@ -387,7 +388,7 @@ pub const Connection = struct {
         var length: usize = 0;
         var buf: [1]u8 = undefined;
         while (true) {
-            const n = try s.read(&buf);
+            const n = try streamRead(s, &buf);
             if (n == 0) return error.ConnectionClosed;
             const ch = buf[0];
             if (ch == ':') break;
@@ -406,7 +407,7 @@ pub const Connection = struct {
 
         var total: usize = 0;
         while (total < length) {
-            const n = try s.read(payload[total..]);
+            const n = try streamRead(s, payload[total..]);
             if (n == 0) return error.ConnectionClosed;
             total += n;
         }
