@@ -72,6 +72,14 @@ const chromium_search_names_linux = [_][]const u8{
     "chromium",
 };
 
+/// Hardcoded fallback locations for Chrome on Windows. The leading token
+/// is an environment variable name; if unset, the entry is skipped.
+const chromium_search_paths_windows = [_][]const u8{
+    "ProgramFiles\\Google\\Chrome\\Application\\chrome.exe",
+    "ProgramFiles(x86)\\Google\\Chrome\\Application\\chrome.exe",
+    "LOCALAPPDATA\\Google\\Chrome\\Application\\chrome.exe",
+};
+
 /// Find the chromium binary path.
 /// Priority: HIBROW_BROWSER env var > platform-specific search.
 /// Caller owns the returned string.
@@ -104,6 +112,10 @@ pub fn findChromium(allocator: mem.Allocator) ![]const u8 {
                 }
             }
         } else |_| {}
+    } else if (builtin.os.tag == .windows) {
+        if (try findWindowsBrowser(allocator, "chrome.exe", &chromium_search_paths_windows)) |path| {
+            return path;
+        }
     }
 
     return error.ChromiumNotFound;
@@ -122,6 +134,11 @@ const firefox_search_names_linux = [_][]const u8{
     "firefox",
 };
 
+const firefox_search_paths_windows = [_][]const u8{
+    "ProgramFiles\\Mozilla Firefox\\firefox.exe",
+    "ProgramFiles(x86)\\Mozilla Firefox\\firefox.exe",
+};
+
 /// Find the Firefox binary path.
 /// Priority: HIBROW_FIREFOX env var > platform-specific search.
 /// Caller owns the returned string.
@@ -138,6 +155,11 @@ pub fn findFirefox(allocator: mem.Allocator) ![]const u8 {
                 return try allocator.dupe(u8, path);
             } else |_| {}
         }
+    } else if (builtin.os.tag == .windows) {
+        if (try findWindowsBrowser(allocator, "firefox.exe", &firefox_search_paths_windows)) |path| {
+            return path;
+        }
+        return error.FirefoxNotFound;
     } else if (builtin.os.tag == .linux) {
         // Search PATH for known Firefox binary names
         if (std.process.getEnvVarOwned(allocator, "PATH")) |path_env| {
@@ -158,6 +180,127 @@ pub fn findFirefox(allocator: mem.Allocator) ![]const u8 {
 
     return error.FirefoxNotFound;
 }
+
+/// Windows-specific browser discovery: App Paths registry first, then
+/// hardcoded fallback locations under Program Files / LocalAppData.
+/// Returns null if nothing was found; allocated path otherwise.
+fn findWindowsBrowser(
+    allocator: mem.Allocator,
+    exe_name: []const u8,
+    fallback_paths: []const []const u8,
+) !?[]const u8 {
+    if (builtin.os.tag != .windows) return null;
+
+    // 1. App Paths: HKCU first (per-user installs), then HKLM (system-wide).
+    if (try win.queryAppPath(allocator, true, exe_name)) |path| return path;
+    if (try win.queryAppPath(allocator, false, exe_name)) |path| return path;
+
+    // 2. Hardcoded fallbacks. Each entry starts with an env-var name we
+    //    expand against the rest of the path; entries with missing env
+    //    vars are skipped (e.g. ProgramFiles(x86) on 32-bit-only systems).
+    for (fallback_paths) |entry| {
+        const sep_idx = mem.indexOfScalar(u8, entry, '\\') orelse continue;
+        const env_name = entry[0..sep_idx];
+        const rest = entry[sep_idx + 1 ..];
+        const env_val = std.process.getEnvVarOwned(allocator, env_name) catch continue;
+        defer allocator.free(env_val);
+        const full_path = try std.fmt.allocPrint(allocator, "{s}\\{s}", .{ env_val, rest });
+        if (fs.accessAbsolute(full_path, .{})) |_| {
+            return full_path;
+        } else |_| {
+            allocator.free(full_path);
+        }
+    }
+
+    return null;
+}
+
+/// Windows-only registry helpers. Definitions live inside a comptime
+/// switch so non-Windows targets never analyze them.
+const win = if (builtin.os.tag == .windows) struct {
+    const windows = std.os.windows;
+    const advapi32 = std.os.windows.advapi32;
+
+    const ERROR_SUCCESS: windows.LSTATUS = 0;
+    const KEY_QUERY_VALUE: windows.REGSAM = 0x0001;
+    const REG_SZ: windows.DWORD = 1;
+    const REG_EXPAND_SZ: windows.DWORD = 2;
+
+    /// Read the default value of HKxx\Software\Microsoft\Windows\
+    /// CurrentVersion\App Paths\{exe_name}. Caller owns the result.
+    fn queryAppPath(
+        allocator: mem.Allocator,
+        per_user: bool,
+        exe_name: []const u8,
+    ) !?[]u8 {
+        const root: windows.HKEY = if (per_user)
+            windows.HKEY_CURRENT_USER
+        else
+            windows.HKEY_LOCAL_MACHINE;
+
+        // Build the UTF-16 subkey path on the stack.
+        var subkey_utf8_buf: [256]u8 = undefined;
+        const subkey_utf8 = try std.fmt.bufPrint(
+            &subkey_utf8_buf,
+            "Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\{s}",
+            .{exe_name},
+        );
+        var subkey_w: [320]u16 = undefined;
+        const len = try std.unicode.wtf8ToWtf16Le(subkey_w[0 .. subkey_w.len - 1], subkey_utf8);
+        subkey_w[len] = 0;
+
+        var hkey: windows.HKEY = undefined;
+        const open_rc = advapi32.RegOpenKeyExW(
+            root,
+            @ptrCast(&subkey_w),
+            0,
+            KEY_QUERY_VALUE,
+            &hkey,
+        );
+        if (open_rc != ERROR_SUCCESS) return null;
+        defer _ = advapi32.RegCloseKey(hkey);
+
+        // RegQueryValueExW takes lpValueName as non-optional; an empty
+        // null-terminated string is documented as equivalent to NULL and
+        // selects the default value.
+        const empty_w: [*:0]const u16 = &[_:0]u16{};
+
+        // First call: ask for the size.
+        var data_size: windows.DWORD = 0;
+        const size_rc = advapi32.RegQueryValueExW(hkey, empty_w, null, null, null, &data_size);
+        if (size_rc != ERROR_SUCCESS or data_size == 0) return null;
+
+        // Second call: read the value into an allocated buffer.
+        const data_buf = try allocator.alloc(u8, data_size);
+        defer allocator.free(data_buf);
+        var actual_size = data_size;
+        var value_type: windows.DWORD = 0;
+        const query_rc = advapi32.RegQueryValueExW(
+            hkey,
+            empty_w,
+            null,
+            &value_type,
+            @ptrCast(data_buf.ptr),
+            &actual_size,
+        );
+        if (query_rc != ERROR_SUCCESS) return null;
+        if (value_type != REG_SZ and value_type != REG_EXPAND_SZ) return null;
+
+        // The data is a UTF-16 string, possibly with a trailing null.
+        const wide_count = actual_size / 2;
+        const wide_ptr: [*]const u16 = @ptrCast(@alignCast(data_buf.ptr));
+        var wide_slice = wide_ptr[0..wide_count];
+        if (wide_slice.len > 0 and wide_slice[wide_slice.len - 1] == 0) {
+            wide_slice = wide_slice[0 .. wide_slice.len - 1];
+        }
+
+        return try std.unicode.wtf16LeToWtf8Alloc(allocator, wide_slice);
+    }
+} else struct {
+    fn queryAppPath(_: mem.Allocator, _: bool, _: []const u8) !?[]u8 {
+        return null;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Browser launching
