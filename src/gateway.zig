@@ -197,8 +197,11 @@ pub const Server = struct {
             if (err != error.PathAlreadyExists) return err;
         };
 
-        // Remove stale socket file if it exists
-        std.fs.deleteFileAbsolute(sock_path) catch {};
+        // Remove stale socket file if it exists (Unix only — Windows pipes
+        // are kernel objects, not filesystem entries).
+        if (builtin.os.tag != .windows) {
+            std.fs.deleteFileAbsolute(sock_path) catch {};
+        }
 
         // Write PID file
         try writePidFile(self.allocator, sock_dir);
@@ -416,7 +419,9 @@ pub const Server = struct {
         // Shut down after encoding the response so the client gets the reply.
         self.running = false;
         if (self.listener) |*l| { l.deinit(); self.listener = null; }
-        if (self.socket_path) |p| std.fs.deleteFileAbsolute(p) catch {};
+        if (builtin.os.tag != .windows) {
+            if (self.socket_path) |p| std.fs.deleteFileAbsolute(p) catch {};
+        }
 
         return encoded;
     }
@@ -980,11 +985,15 @@ pub fn getSocketDir(allocator: mem.Allocator) ![]u8 {
 }
 
 /// Get the full socket path.
+/// Unix: filesystem path under the per-user socket dir.
+/// Windows: named-pipe identifier (`\\.\pipe\hibrow-gateway`).
 pub fn getSocketPath(allocator: mem.Allocator) ![]u8 {
+    if (builtin.os.tag == .windows) {
+        return try allocator.dupe(u8, "\\\\.\\pipe\\hibrow-gateway");
+    }
     const dir = try getSocketDir(allocator);
     defer allocator.free(dir);
-    const sep: u8 = if (builtin.os.tag == .windows) '\\' else '/';
-    return std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ dir, sep, socket_filename });
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, socket_filename });
 }
 
 /// Get the PID file path.
