@@ -18,6 +18,7 @@ const protocol = @import("protocol.zig");
 const browser_mod = @import("browser.zig");
 const cdp = @import("cdp.zig");
 const marionette_mod = @import("marionette.zig");
+const transport = @import("transport.zig");
 
 /// Default socket directory pattern.
 const socket_dir_prefix = "/tmp/hibrow-";
@@ -39,7 +40,7 @@ const read_buf_size = 8192;
 /// Client for communicating with the gateway daemon over a Unix socket.
 pub const Client = struct {
     allocator: mem.Allocator,
-    stream: std.net.Stream,
+    stream: transport.Stream,
     /// Monotonically increasing request ID.
     next_id: u64 = 1,
 
@@ -154,7 +155,7 @@ const ProfileConn = struct {
 /// JSON-RPC requests to browser management handlers.
 pub const Server = struct {
     allocator: mem.Allocator,
-    listener: ?std.net.Server = null,
+    listener: ?transport.Listener = null,
     socket_path: ?[]u8 = null,
     running: bool = false,
     /// Cached CDP connections keyed by profile name (owned strings).
@@ -203,16 +204,12 @@ pub const Server = struct {
         try writePidFile(self.allocator, sock_dir);
 
         // Bind and listen
-        const addr = try std.net.Address.initUnix(sock_path);
-        self.listener = try addr.listen(.{
-            .kernel_backlog = 128,
-            .reuse_address = true,
-        });
+        self.listener = try transport.listen(sock_path);
         self.running = true;
 
         // Accept loop
         while (self.running) {
-            const connection = self.listener.?.accept() catch |err| {
+            const stream = self.listener.?.accept() catch |err| {
                 if (!self.running) break;
                 // Log and continue on transient errors
                 std.debug.print("accept error: {any}\n", .{err});
@@ -220,7 +217,7 @@ pub const Server = struct {
             };
             // Handle each connection synchronously (simple, correct).
             // CDP is not thread-safe per-browser anyway, so serial is fine.
-            self.handleConnection(connection.stream);
+            self.handleConnection(stream);
         }
     }
 
@@ -235,7 +232,7 @@ pub const Server = struct {
     }
 
     /// Handle a single client connection: read request, dispatch, write response.
-    fn handleConnection(self: *Server, stream: std.net.Stream) void {
+    fn handleConnection(self: *Server, stream: transport.Stream) void {
         defer stream.close();
 
         const line = readLine(self.allocator, stream) catch return;
@@ -1028,13 +1025,13 @@ pub fn autoStartDaemon(allocator: mem.Allocator) !void {
 // ---------------------------------------------------------------------------
 
 /// Connect to an existing Unix domain socket.
-fn connectToSocket(path: []const u8) !std.net.Stream {
-    return std.net.connectUnixSocket(path);
+fn connectToSocket(path: []const u8) !transport.Stream {
+    return transport.connect(path);
 }
 
 /// Read a newline-delimited line from a stream.
 /// Returns allocated slice (caller owns). Does not include the newline.
-fn readLine(allocator: mem.Allocator, stream: std.net.Stream) ![]u8 {
+fn readLine(allocator: mem.Allocator, stream: transport.Stream) ![]u8 {
     var buf: std.ArrayList(u8) = .{};
     errdefer buf.deinit(allocator);
 
@@ -1058,7 +1055,7 @@ fn readLine(allocator: mem.Allocator, stream: std.net.Stream) ![]u8 {
 /// Send a JSON-RPC error response directly to a stream.
 fn sendErrorResponse(
     allocator: mem.Allocator,
-    stream: std.net.Stream,
+    stream: transport.Stream,
     id: json.Value,
     code: protocol.ErrorCode,
     message: []const u8,
