@@ -10,6 +10,7 @@
 ///!
 ///! Wire format: line-delimited JSON-RPC 2.0 (each message ends with '\n').
 const std = @import("std");
+const builtin = @import("builtin");
 const mem = std.mem;
 const posix = std.posix;
 const json = std.json;
@@ -383,7 +384,11 @@ pub const Server = struct {
         try obj.put("port", .{ .integer = @intCast(b.port) });
         var pids_arr = json.Array.init(self.allocator);
         for (b.pids) |pid| {
-            try pids_arr.append(.{ .integer = @intCast(pid) });
+            const pid_int: i64 = if (builtin.os.tag == .windows)
+                @intCast(@intFromPtr(pid))
+            else
+                @intCast(pid);
+            try pids_arr.append(.{ .integer = pid_int });
         }
         try obj.put("pids", .{ .array = pids_arr });
         const display_dir = try collapseTilde(self.allocator, b.profile_dir);
@@ -958,22 +963,39 @@ pub const Server = struct {
 // Path Helpers
 // ---------------------------------------------------------------------------
 
+/// Current process id.
+fn currentPid() i32 {
+    if (builtin.os.tag == .windows) {
+        return @intCast(std.os.windows.GetCurrentProcessId());
+    }
+    return std.c.getpid();
+}
+
 /// Get the socket directory path for the current user.
+/// Unix: /tmp/hibrow-{uid}.  Windows: %LOCALAPPDATA%\hibrow.
 pub fn getSocketDir(allocator: mem.Allocator) ![]u8 {
-    const uid = posix.getuid();
-    return std.fmt.allocPrint(allocator, "{s}{d}", .{ socket_dir_prefix, uid });
+    if (builtin.os.tag == .windows) {
+        const local_app_data = try std.process.getEnvVarOwned(allocator, "LOCALAPPDATA");
+        defer allocator.free(local_app_data);
+        return std.fmt.allocPrint(allocator, "{s}\\hibrow", .{local_app_data});
+    }
+    return std.fmt.allocPrint(allocator, "{s}{d}", .{ socket_dir_prefix, posix.getuid() });
 }
 
 /// Get the full socket path.
 pub fn getSocketPath(allocator: mem.Allocator) ![]u8 {
-    const uid = posix.getuid();
-    return std.fmt.allocPrint(allocator, "{s}{d}/{s}", .{ socket_dir_prefix, uid, socket_filename });
+    const dir = try getSocketDir(allocator);
+    defer allocator.free(dir);
+    const sep: u8 = if (builtin.os.tag == .windows) '\\' else '/';
+    return std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ dir, sep, socket_filename });
 }
 
 /// Get the PID file path.
 pub fn getPidFilePath(allocator: mem.Allocator) ![]u8 {
-    const uid = posix.getuid();
-    return std.fmt.allocPrint(allocator, "{s}{d}/{s}", .{ socket_dir_prefix, uid, pid_filename });
+    const dir = try getSocketDir(allocator);
+    defer allocator.free(dir);
+    const sep: u8 = if (builtin.os.tag == .windows) '\\' else '/';
+    return std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ dir, sep, pid_filename });
 }
 
 // ---------------------------------------------------------------------------
@@ -992,8 +1014,10 @@ pub fn autoStartDaemon(allocator: mem.Allocator) !void {
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
-    // New process group so it survives our exit
-    child.pgid = 0;
+    // New process group so it survives our exit (Unix only — Windows has no pgid).
+    if (builtin.os.tag != .windows) {
+        child.pgid = 0;
+    }
 
     try child.spawn();
     // Don't wait — let the daemon run independently
@@ -1055,7 +1079,7 @@ fn writePidFile(allocator: mem.Allocator, sock_dir: []const u8) !void {
 
     var buf: [64]u8 = undefined;
     var writer = file.writer(&buf);
-    try writer.interface.print("{d}\n", .{std.c.getpid()});
+    try writer.interface.print("{d}\n", .{currentPid()});
     try writer.interface.flush();
 }
 
@@ -1114,7 +1138,9 @@ fn findBrowserInfo(allocator: mem.Allocator, profile: []const u8) !?BrowserInfo 
 /// Replace the user's home directory prefix with "~" for display.
 /// Returns an allocated string if replacement was made, or a dupe of the input.
 fn collapseTilde(allocator: mem.Allocator, path: []const u8) ![]const u8 {
-    const home = std.posix.getenv("HOME") orelse return try allocator.dupe(u8, path);
+    const home_var = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
+    const home = std.process.getEnvVarOwned(allocator, home_var) catch return try allocator.dupe(u8, path);
+    defer allocator.free(home);
     if (mem.startsWith(u8, path, home)) {
         const rest = path[home.len..];
         return try std.fmt.allocPrint(allocator, "~{s}", .{rest});

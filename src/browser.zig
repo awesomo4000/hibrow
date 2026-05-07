@@ -225,7 +225,7 @@ fn launchChrome(allocator: mem.Allocator, options: LaunchOptions) !Browser {
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
     // pgid = 0 → create new process group (setsid equivalent)
-    child.pgid = 0;
+    if (builtin.os.tag != .windows) child.pgid = 0;
 
     try child.spawn();
     const pid = child.id;
@@ -288,7 +288,7 @@ fn launchFirefox(allocator: mem.Allocator, options: LaunchOptions) !Browser {
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
-    child.pgid = 0;
+    if (builtin.os.tag != .windows) child.pgid = 0;
 
     try child.spawn();
     const pid = child.id;
