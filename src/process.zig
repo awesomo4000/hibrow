@@ -287,6 +287,7 @@ fn getProcArgs(allocator: mem.Allocator, pid: posix.pid_t) !ProcArgs {
 // ===========================================================================
 
 test "DiscoveredProcess struct has expected fields" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const p = DiscoveredProcess{
         .pid = 1234,
         .port = 9322,

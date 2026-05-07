@@ -1179,13 +1179,23 @@ test "socket path constants are sensible" {
 }
 
 test "getSocketDir contains uid" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const dir = try getSocketDir(allocator);
     defer allocator.free(dir);
     try std.testing.expect(mem.startsWith(u8, dir, "/tmp/hibrow-"));
 }
 
+test "getSocketDir lives under LOCALAPPDATA (Windows)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const dir = try getSocketDir(allocator);
+    defer allocator.free(dir);
+    try std.testing.expect(mem.endsWith(u8, dir, "\\hibrow"));
+}
+
 test "getSocketPath contains socket filename" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const path = try getSocketPath(allocator);
     defer allocator.free(path);
@@ -1193,11 +1203,28 @@ test "getSocketPath contains socket filename" {
     try std.testing.expect(mem.startsWith(u8, path, "/tmp/hibrow-"));
 }
 
+test "getSocketPath returns named pipe identifier (Windows)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const path = try getSocketPath(allocator);
+    defer allocator.free(path);
+    try std.testing.expectEqualStrings("\\\\.\\pipe\\hibrow-gateway", path);
+}
+
 test "getPidFilePath contains pid filename" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const path = try getPidFilePath(allocator);
     defer allocator.free(path);
     try std.testing.expect(mem.endsWith(u8, path, "/gateway.pid"));
+}
+
+test "getPidFilePath contains pid filename (Windows)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const path = try getPidFilePath(allocator);
+    defer allocator.free(path);
+    try std.testing.expect(mem.endsWith(u8, path, "\\gateway.pid"));
 }
 
 test "extractStringParam extracts from object" {
@@ -1302,6 +1329,7 @@ test "Server evictConnection on empty cache is safe" {
 }
 
 test "readLine reads up to newline" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     // Use a socket pair (Stream methods require socket fds on some platforms)
     var fds: [2]posix.fd_t = undefined;
     const rc = std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
@@ -1324,6 +1352,7 @@ test "readLine reads up to newline" {
 }
 
 test "readLine handles EOF without newline" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var fds: [2]posix.fd_t = undefined;
     const rc = std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
     if (rc != 0) return error.SocketPairFailed;
@@ -1344,6 +1373,7 @@ test "readLine handles EOF without newline" {
 }
 
 test "Unix socket round-trip" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     // Use a unique socket path to avoid collisions between parallel test runs
@@ -1469,6 +1499,7 @@ test "Server dispatch handles gateway.shutdown" {
 }
 
 test "sendErrorResponse produces valid response" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     // Use a Unix socket pair (Stream uses sendmsg, which requires sockets)
@@ -1636,6 +1667,7 @@ test "Server dispatch handles new methods without crashing" {
 }
 
 test "collapseTilde replaces home prefix with ~" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const home = std.posix.getenv("HOME") orelse return;
 
@@ -1652,6 +1684,99 @@ test "collapseTilde replaces home prefix with ~" {
     try std.testing.expectEqualStrings("/tmp/something", other);
 
     // Empty path
+    const empty = try collapseTilde(allocator, "");
+    defer allocator.free(empty);
+    try std.testing.expectEqualStrings("", empty);
+}
+
+// ---------------------------------------------------------------------------
+// Windows-specific tests
+//
+// These mirror the Unix-only tests above but use Windows-native primitives
+// (CreatePipe for stream pairs, USERPROFILE for the home path). They are
+// gated to Windows so they don't run anywhere else.
+// ---------------------------------------------------------------------------
+
+const win_test = struct {
+    const windows = std.os.windows;
+
+    /// Anonymous pipe pair wrapped in transport.Stream values for testing.
+    const PipePair = struct {
+        read: transport.Stream,
+        write: transport.Stream,
+
+        fn deinit(self: PipePair) void {
+            self.read.close();
+            self.write.close();
+        }
+    };
+
+    fn createPipePair() !PipePair {
+        var sattr = windows.SECURITY_ATTRIBUTES{
+            .nLength = @sizeOf(windows.SECURITY_ATTRIBUTES),
+            .lpSecurityDescriptor = null,
+            .bInheritHandle = 0,
+        };
+        var rd: windows.HANDLE = undefined;
+        var wr: windows.HANDLE = undefined;
+        try windows.CreatePipe(&rd, &wr, &sattr);
+        return .{
+            .read = .{ .handle = rd },
+            .write = .{ .handle = wr },
+        };
+    }
+};
+
+test "readLine reads up to newline (Windows)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const pair = try win_test.createPipePair();
+
+    const test_data = "{\"jsonrpc\":\"2.0\",\"method\":\"test\",\"id\":1}\n";
+    try pair.write.writeAll(test_data);
+    pair.write.close();
+
+    const allocator = std.testing.allocator;
+    const line = try readLine(allocator, pair.read);
+    defer allocator.free(line);
+    defer pair.read.close();
+
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"method\":\"test\",\"id\":1}", line);
+}
+
+test "readLine handles EOF without newline (Windows)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const pair = try win_test.createPipePair();
+
+    try pair.write.writeAll("partial data");
+    pair.write.close();
+
+    const allocator = std.testing.allocator;
+    const line = try readLine(allocator, pair.read);
+    defer allocator.free(line);
+    defer pair.read.close();
+
+    try std.testing.expectEqualStrings("partial data", line);
+}
+
+test "collapseTilde replaces home prefix with ~ (Windows)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const home = std.process.getEnvVarOwned(allocator, "USERPROFILE") catch return;
+    defer allocator.free(home);
+
+    // Path under home.
+    const input = try std.fmt.allocPrint(allocator, "{s}\\.hibrow\\profiles\\test", .{home});
+    defer allocator.free(input);
+    const result = try collapseTilde(allocator, input);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("~\\.hibrow\\profiles\\test", result);
+
+    // Path not under home.
+    const other = try collapseTilde(allocator, "C:\\temp\\something");
+    defer allocator.free(other);
+    try std.testing.expectEqualStrings("C:\\temp\\something", other);
+
+    // Empty path.
     const empty = try collapseTilde(allocator, "");
     defer allocator.free(empty);
     try std.testing.expectEqualStrings("", empty);

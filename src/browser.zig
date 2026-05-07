@@ -526,6 +526,7 @@ fn ensureDirExists(path: []const u8) !void {
 // ---------------------------------------------------------------------------
 
 test "Browser struct has expected fields" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const pids = [_]posix.pid_t{12345};
     const b = Browser{
         .profile = "test",
