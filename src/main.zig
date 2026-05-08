@@ -632,8 +632,14 @@ fn cmdPush(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     defer if (owned_content) |c| allocator.free(c);
 
     const push_mod = hibrow.push;
-    push_mod.push(allocator, profile, target, content) catch |err| {
-        writeStderr("Error: push failed: {s}\n", .{@errorName(err)});
+    var err_msg: ?[]u8 = null;
+    defer if (err_msg) |m| allocator.free(m);
+    push_mod.push(allocator, profile, target, content, &err_msg) catch |err| {
+        if (err_msg) |m| {
+            writeStderr("Error: {s}\n", .{m});
+        } else {
+            writeStderr("Error: push failed: {s}\n", .{@errorName(err)});
+        }
         std.process.exit(1);
     };
 

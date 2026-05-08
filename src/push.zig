@@ -26,9 +26,30 @@ fn evalOnce(allocator: mem.Allocator, profile: []const u8, expression: []const u
     return client.eval(profile, expression);
 }
 
+/// Extract the JSON-RPC error message from a failed eval response.
+/// Returns an allocated copy; caller frees. Returns null if the response
+/// shape doesn't include a string message.
+fn extractErrorMessage(allocator: mem.Allocator, err_val: json.Value) !?[]u8 {
+    if (err_val == .object) {
+        if (err_val.object.get("message")) |m| {
+            if (m == .string) return try allocator.dupe(u8, m.string);
+        }
+    }
+    return null;
+}
+
 /// Push content into the browser at the given target.
 /// Target is either a "window.*" variable name or a CSS selector.
-pub fn push(allocator: mem.Allocator, profile: []const u8, target: []const u8, content: []const u8) !void {
+///
+/// On EvalFailed, `err_msg` (if non-null) receives an allocated copy of the
+/// underlying JS error message — caller frees. On success it stays null.
+pub fn push(
+    allocator: mem.Allocator,
+    profile: []const u8,
+    target: []const u8,
+    content: []const u8,
+    err_msg: ?*?[]u8,
+) !void {
     const is_variable = mem.startsWith(u8, target, "window.");
 
     if (content.len <= CHUNK_SIZE) {
@@ -44,7 +65,10 @@ pub fn push(allocator: mem.Allocator, profile: []const u8, target: []const u8, c
 
         var resp = try evalOnce(allocator, profile, js);
         defer resp.deinit();
-        if (resp.is_error) return PushError.EvalFailed;
+        if (resp.is_error) {
+            if (err_msg) |slot| slot.* = try extractErrorMessage(allocator, resp.result);
+            return PushError.EvalFailed;
+        }
     } else {
         // Chunked: push pieces into a temp array, then concatenate
         const num_chunks = (content.len + CHUNK_SIZE - 1) / CHUNK_SIZE;
@@ -53,7 +77,10 @@ pub fn push(allocator: mem.Allocator, profile: []const u8, target: []const u8, c
         {
             var resp = try evalOnce(allocator, profile, "window.__hibrowPushBuf = []; 'ok'");
             defer resp.deinit();
-            if (resp.is_error) return PushError.EvalFailed;
+            if (resp.is_error) {
+                if (err_msg) |slot| slot.* = try extractErrorMessage(allocator, resp.result);
+                return PushError.EvalFailed;
+            }
         }
 
         // Push each chunk
@@ -70,7 +97,10 @@ pub fn push(allocator: mem.Allocator, profile: []const u8, target: []const u8, c
 
             var resp = try evalOnce(allocator, profile, chunk_js);
             defer resp.deinit();
-            if (resp.is_error) return PushError.EvalFailed;
+            if (resp.is_error) {
+                if (err_msg) |slot| slot.* = try extractErrorMessage(allocator, resp.result);
+                return PushError.EvalFailed;
+            }
         }
 
         // Concatenate and assign to target
@@ -83,7 +113,10 @@ pub fn push(allocator: mem.Allocator, profile: []const u8, target: []const u8, c
 
         var resp = try evalOnce(allocator, profile, final_js);
         defer resp.deinit();
-        if (resp.is_error) return PushError.EvalFailed;
+        if (resp.is_error) {
+            if (err_msg) |slot| slot.* = try extractErrorMessage(allocator, resp.result);
+            return PushError.EvalFailed;
+        }
 
         // Clean up temp
         var cleanup = try evalOnce(allocator, profile, "delete window.__hibrowPushBuf; 'ok'");

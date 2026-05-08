@@ -271,9 +271,35 @@ pub const Connection = struct {
         if (cdp_result.result == .object) {
             const result_obj = cdp_result.result.object;
 
-            // Check for exception
+            // Check for exception. CDP's exceptionDetails.text is always
+            // literally "Uncaught"; the readable message is in
+            // exceptionDetails.exception.description (a stack-trace string
+            // whose first line is e.g. "Error: push: no element matched X").
+            // Fall back to text only if description is missing.
             if (result_obj.get("exceptionDetails")) |exception| {
                 if (exception == .object) {
+                    if (exception.object.get("exception")) |exc_obj| {
+                        if (exc_obj == .object) {
+                            if (exc_obj.object.get("description")) |desc| {
+                                if (desc == .string) {
+                                    // Take the first line — the rest is the JS stack.
+                                    // Strip the generic "Error: " class prefix so callers
+                                    // don't print "Error: Error: ...". Class names like
+                                    // "TypeError:" / "SyntaxError:" are kept since they
+                                    // carry useful information.
+                                    const full = desc.string;
+                                    const first_line_end = std.mem.indexOfScalar(u8, full, '\n') orelse full.len;
+                                    var line = full[0..first_line_end];
+                                    if (std.mem.startsWith(u8, line, "Error: ")) {
+                                        line = line["Error: ".len..];
+                                    }
+                                    return .{
+                                        .exception = try self.allocator.dupe(u8, line),
+                                    };
+                                }
+                            }
+                        }
+                    }
                     if (exception.object.get("text")) |text| {
                         if (text == .string) {
                             return .{
