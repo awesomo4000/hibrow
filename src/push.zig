@@ -106,7 +106,7 @@ fn buildSelectorJs(allocator: mem.Allocator, target: []const u8, value_expr: []c
     return std.fmt.allocPrint(allocator,
         \\(function() {{
         \\  var el = document.querySelector({0s});
-        \\  if (!el) return 'error: element not found';
+        \\  if (!el) throw new Error('push: no element matched ' + {0s});
         \\  el.value = {1s};
         \\  el.dispatchEvent(new Event('input', {{bubbles: true}}));
         \\  el.dispatchEvent(new Event('change', {{bubbles: true}}));
