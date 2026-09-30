@@ -274,18 +274,36 @@ pub const Connection = struct {
         _ = self.send("Marionette:Quit", .{ .object = params }) catch {};
     }
 
-    /// Take a screenshot. Returns base64-encoded PNG data (full page).
+    /// Take a screenshot. Returns base64-encoded PNG data.
+    /// Attempts full-page first; if Firefox fails (page too tall for canvas),
+    /// falls back to viewport-only screenshot.
     pub fn takeScreenshot(self: *Connection) ![]const u8 {
-        var params = json.ObjectMap.init(self.allocator);
-        defer params.deinit();
-        try params.put("full", .{ .bool = true });
+        // Try full-page screenshot first
+        {
+            var params = json.ObjectMap.init(self.allocator);
+            defer params.deinit();
+            try params.put("full", .{ .bool = true });
 
-        var result = try self.send("WebDriver:TakeScreenshot", .{ .object = params });
+            var result = try self.send("WebDriver:TakeScreenshot", .{ .object = params });
+            defer result.deinit();
+
+            if (result.err == null) {
+                if (result.result == .object) {
+                    if (result.result.object.get("value")) |val| {
+                        if (val == .string) return try self.allocator.dupe(u8, val.string);
+                    }
+                }
+            }
+            // Full-page failed (likely page too tall for Firefox canvas limit ~30000px),
+            // fall through to viewport-only attempt.
+        }
+
+        // Fallback: viewport-only screenshot
+        var result = try self.send("WebDriver:TakeScreenshot", .null);
         defer result.deinit();
 
         if (result.err) |_| return error.CommandFailed;
 
-        // Returns {"value": "<base64 png>"}
         if (result.result == .object) {
             if (result.result.object.get("value")) |val| {
                 if (val == .string) return try self.allocator.dupe(u8, val.string);
