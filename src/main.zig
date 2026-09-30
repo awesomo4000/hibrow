@@ -124,7 +124,11 @@ pub fn main() !void {
 
 fn writeStdout(comptime fmt: []const u8, fmt_args: anytype) void {
     var buf: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&buf);
+    // Use streaming mode: `writer()` defaults to positional writes (pwrite at
+    // pos=0), which overwrite from the start of the file when stdout is
+    // redirected to a regular file. Streaming uses write()/writev(), which
+    // respects the kernel file offset and O_APPEND so output appends correctly.
+    var stdout_writer = std.fs.File.stdout().writerStreaming(&buf);
     const stdout = &stdout_writer.interface;
     stdout.print(fmt, fmt_args) catch {};
     stdout.flush() catch {};
@@ -132,7 +136,9 @@ fn writeStdout(comptime fmt: []const u8, fmt_args: anytype) void {
 
 fn writeStderr(comptime fmt: []const u8, fmt_args: anytype) void {
     var buf: [4096]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&buf);
+    // Streaming mode for the same reason as writeStdout: avoid positional
+    // pwrite-at-pos=0 clobbering when stderr is redirected to a file.
+    var stderr_writer = std.fs.File.stderr().writerStreaming(&buf);
     const stderr = &stderr_writer.interface;
     stderr.print(fmt, fmt_args) catch {};
     stderr.flush() catch {};
