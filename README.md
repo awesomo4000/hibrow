@@ -274,6 +274,21 @@ zig build test               # run all unit tests
 
 The binary is at `./zig-out/bin/hibrow`. No external dependencies — Zig's standard library provides HTTP, WebSocket, JSON, and Unix socket support.
 
+### macOS SDK note
+
+If `zig build` fails to link with `undefined symbol: __availability_version_check`
+(and every libc symbol undefined), your Command Line Tools default to a newer
+macOS SDK (26.x/27.x) whose `.tbd` files Zig 0.15.2's linker can't parse. Build
+with SDK detection disabled so Zig uses its bundled libSystem stub:
+
+```bash
+DEVELOPER_DIR=/dev/null zig build
+```
+
+Alternatively, point at an older installed SDK, e.g.
+`SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX15.2.sdk` (may require
+clearing `~/.cache/zig` since native libc detection is cached).
+
 ## Environment variables
 
 | Variable | Description |
