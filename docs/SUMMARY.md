@@ -2,7 +2,7 @@
 
 ## Source Information
 
-All APIs extracted from: `/Users/aarhodes/.zvm/0.15.2/lib/std/net.zig`
+All APIs extracted from: `<zig>/lib/std/net.zig`
 
 ## Quick Summary Table
 
@@ -253,7 +253,7 @@ test "unix socket basic" {
 
 ## References
 
-- Stdlib path: `/Users/aarhodes/.zvm/0.15.2/lib/std/net.zig`
+- Stdlib path: `<zig>/lib/std/net.zig`
 - Zig version: 0.15.2
 - Target: hibrow gateway daemon with Unix domain socket communication
 - Documentation: See source code for detailed comments
