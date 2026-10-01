@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>hibrow test lab</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; }
+  section { border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin: 14px 0; }
+  h2 { font-size: 14px; color: #555; margin: 0 0 8px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #ccc; padding: 6px 10px; text-align: left; }
+  #late { color: green; font-weight: bold; }
+</style>
+</head>
+<body>
+  <h1 id="lab-title">hibrow test lab</h1>
+
+  <!-- T1: scrape a known fact -->
+  <section>
+    <h2>fact</h2>
+    <p id="fact">The answer is 42.</p>
+  </section>
+
+  <!-- T2: table -> JSON -->
+  <section>
+    <h2>data</h2>
+    <table id="data">
+      <thead><tr><th>Name</th><th>Score</th></tr></thead>
+      <tbody>
+        <tr><td>alice</td><td>90</td></tr>
+        <tr><td>bob</td><td>75</td></tr>
+        <tr><td>carol</td><td>88</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- T3: click to change state -->
+  <section>
+    <h2>counter</h2>
+    <button id="inc">+1</button>
+    <span id="count">0</span>
+  </section>
+
+  <!-- T4: React-style controlled input (naive .value= is ignored) -->
+  <section>
+    <h2>controlled input</h2>
+    <input id="name" placeholder="type here">
+    <div>committed: <span id="nameEcho"></span></div>
+  </section>
+
+  <!-- T5: element that appears after a delay -->
+  <section>
+    <h2>delayed</h2>
+    <div id="slot">(waiting...)</div>
+  </section>
+
+  <!-- T6: trigger a fetch (for network capture) -->
+  <section>
+    <h2>network</h2>
+    <button id="load">load data</button>
+  </section>
+
+<script>
+  // --- T3: counter ---
+  var count = 0;
+  document.getElementById("inc").addEventListener("click", function () {
+    count += 1;
+    document.getElementById("count").textContent = count;
+  });
+
+  // --- T4: faithful React-style controlled input ---
+  // Direct `el.value = x` is IGNORED (like a React-controlled input reclaiming
+  // the value). Only the native prototype setter + a dispatched "input" event
+  // commits the value. window.__committed is the graded signal.
+  (function () {
+    var input = document.getElementById("name");
+    var protoDesc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
+    var committed = "";
+    Object.defineProperty(input, "value", {
+      configurable: true,
+      get: function () { return committed; },
+      set: function (_v) { /* ignored: controlled input */ }
+    });
+    input.addEventListener("input", function () {
+      committed = protoDesc.get.call(input);          // read the real underlying value
+      window.__committed = committed;
+      document.getElementById("nameEcho").textContent = committed;
+    });
+  })();
+
+  // --- T5: delayed element ---
+  setTimeout(function () {
+    var d = document.createElement("div");
+    d.id = "late";
+    d.textContent = "loaded";
+    document.getElementById("slot").replaceWith(d);
+  }, 1500);
+
+  // --- T6: fetch on click (resolvable offline via data: URL) ---
+  document.getElementById("load").addEventListener("click", function () {
+    fetch("data:application/json,%7B%22pong%22%3Atrue%7D");
+  });
+</script>
+</body>
+</html>
