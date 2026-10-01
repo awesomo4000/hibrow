@@ -61,10 +61,18 @@ const usage =
     \\Options:
     \\  --help, -h    Show this help message.
     \\  --version     Show version information.
+    \\  --skill       Print the hibrow skill: a guide teaching agents to use
+    \\                hibrow well (common ops, React gotchas, page instrumentation).
+    \\                Tip: hibrow --skill > .claude/skills/hibrow/SKILL.md
     \\
 ;
 
 const version = "0.1.0";
+
+/// The hibrow skill — a self-contained guide that teaches any agent how to use
+/// hibrow well. Printed by `hibrow --skill`. Pipe it into a skills directory
+/// (e.g. `hibrow --skill > .claude/skills/hibrow/SKILL.md`) to install it.
+const skill = @embedFile("skill.md");
 
 /// Process-wide Io backend, set once in main(). Zig 0.16 routes all socket and
 /// file operations through an `Io` instance; the output helpers below use this,
@@ -93,6 +101,11 @@ pub fn main(init: std.process.Init) !void {
 
     if (mem.eql(u8, command, "--version")) {
         printVersion();
+        return;
+    }
+
+    if (mem.eql(u8, command, "--skill")) {
+        printSkill();
         return;
     }
 
@@ -805,6 +818,10 @@ fn printUsage() void {
 
 fn printVersion() void {
     writeStdout("hibrow {s}\n", .{version});
+}
+
+fn printSkill() void {
+    writeStdout("{s}", .{skill});
 }
 
 /// Parse profile from "profile" or "profile:tab" format.
