@@ -231,9 +231,8 @@ get wrong:
 hibrow eval work '(function(){
   var seen=[]; var of=window.fetch;
   window.fetch=function(u){ seen.push(typeof u==="string"?u:u.url); return of.apply(this,arguments); };
-  document.querySelector("#load").click();      // the action that triggers the fetch
-  window.__answer = seen[0] || null;            // the captured URL, read immediately
-  return window.__answer;
+  document.querySelector("#the-trigger").click();  // the element that fires the request
+  return seen[0] || null;                          // eval returns the captured URL
 })()'
 ```
 
