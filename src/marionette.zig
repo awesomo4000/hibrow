@@ -14,7 +14,26 @@
 const std = @import("std");
 const mem = std.mem;
 const json = std.json;
-const net = std.net;
+const posix = std.posix;
+
+/// The 0.16 network stream type.
+const Stream = std.Io.net.Stream;
+
+/// Raw blocking read from the stream's socket fd (fds from the Io backend are
+/// blocking, so raw posix I/O matches the pre-0.16 Stream.read semantics).
+fn streamRead(stream: Stream, buf: []u8) !usize {
+    return posix.read(stream.socket.handle, buf);
+}
+
+/// Write all bytes to the stream's socket fd, looping over partial writes.
+fn streamWriteAll(stream: Stream, bytes: []const u8) !void {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const rc = std.c.write(stream.socket.handle, bytes[i..].ptr, bytes.len - i);
+        if (rc <= 0) return error.WriteFailed;
+        i += @intCast(rc);
+    }
+}
 
 /// Marionette handshake data sent by Firefox on connect.
 pub const Handshake = struct {
@@ -42,24 +61,25 @@ pub const EvalResult = struct {
 /// Marionette TCP connection to Firefox.
 pub const Connection = struct {
     allocator: mem.Allocator,
-    stream: ?net.Stream = null,
+    io: std.Io,
+    stream: ?Stream = null,
     next_id: u32 = 1,
     session_id: ?[]const u8 = null,
 
-    pub fn init(allocator: mem.Allocator) Connection {
-        return .{ .allocator = allocator };
+    pub fn init(allocator: mem.Allocator, io: std.Io) Connection {
+        return .{ .allocator = allocator, .io = io };
     }
 
     pub fn deinit(self: *Connection) void {
         if (self.session_id) |sid| self.allocator.free(sid);
-        if (self.stream) |s| s.close();
+        if (self.stream) |s| s.close(self.io);
     }
 
     /// Connect to Firefox Marionette on the given port.
     /// Reads the handshake and creates a session.
     pub fn connect(self: *Connection, port: u16) !void {
-        const addr = try net.Address.resolveIp("127.0.0.1", port);
-        self.stream = try net.tcpConnectToAddress(addr);
+        var addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+        self.stream = try addr.connect(self.io, .{ .mode = .stream });
 
         // Read handshake (Firefox sends it unprompted)
         _ = try self.readHandshake();
@@ -131,7 +151,7 @@ pub const Connection = struct {
         const msg = try std.fmt.allocPrint(self.allocator, "{d}:{s}", .{ payload.len, payload });
         defer self.allocator.free(msg);
 
-        try s.writeAll(msg);
+        try streamWriteAll(s, msg);
 
         // Read response
         const resp_data = try self.readLengthPrefixed();
@@ -185,8 +205,8 @@ pub const Connection = struct {
     /// The expression is auto-wrapped with `return (...)` since Marionette's
     /// ExecuteScript runs the script as a function body.
     pub fn eval(self: *Connection, expression: []const u8) !EvalResult {
-        var params = json.ObjectMap.init(self.allocator);
-        defer params.deinit();
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
 
         // Use indirect eval (0,eval)() so multi-statement code works.
         // Indirect eval runs in global scope, avoiding strict-mode restrictions.
@@ -197,10 +217,10 @@ pub const Connection = struct {
         const script = try std.fmt.allocPrint(self.allocator, "return (0,eval)({s})", .{expr_json});
         defer self.allocator.free(script);
 
-        try params.put("script", .{ .string = script });
+        try params.put(self.allocator, "script", .{ .string = script });
         var args_arr = json.Array.init(self.allocator);
         defer args_arr.deinit();
-        try params.put("args", .{ .array = args_arr });
+        try params.put(self.allocator, "args", .{ .array = args_arr });
 
         var result = try self.send("WebDriver:ExecuteScript", .{ .object = params });
         defer result.deinit();
@@ -221,9 +241,9 @@ pub const Connection = struct {
 
     /// Navigate to a URL.
     pub fn navigate(self: *Connection, url: []const u8) !void {
-        var params = json.ObjectMap.init(self.allocator);
-        defer params.deinit();
-        try params.put("url", .{ .string = url });
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
+        try params.put(self.allocator, "url", .{ .string = url });
 
         var result = try self.send("WebDriver:Navigate", .{ .object = params });
         defer result.deinit();
@@ -263,12 +283,12 @@ pub const Connection = struct {
 
     /// Ask Firefox to quit cleanly via Marionette:Quit.
     pub fn quit(self: *Connection) !void {
-        var params = json.ObjectMap.init(self.allocator);
-        defer params.deinit();
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
         var flags = json.Array.init(self.allocator);
         defer flags.deinit();
         try flags.append(.{ .string = "eForceQuit" });
-        try params.put("flags", .{ .array = flags });
+        try params.put(self.allocator, "flags", .{ .array = flags });
 
         // Firefox closes the connection after quitting, so ignore read errors.
         _ = self.send("Marionette:Quit", .{ .object = params }) catch {};
@@ -280,9 +300,9 @@ pub const Connection = struct {
     pub fn takeScreenshot(self: *Connection) ![]const u8 {
         // Try full-page screenshot first
         {
-            var params = json.ObjectMap.init(self.allocator);
-            defer params.deinit();
-            try params.put("full", .{ .bool = true });
+            var params: json.ObjectMap = .empty;
+            defer params.deinit(self.allocator);
+            try params.put(self.allocator, "full", .{ .bool = true });
 
             var result = try self.send("WebDriver:TakeScreenshot", .{ .object = params });
             defer result.deinit();
@@ -323,7 +343,7 @@ pub const Connection = struct {
         if (result.result != .array) return error.InvalidResponse;
         const arr = result.result.array;
 
-        var handles: std.ArrayList([]const u8) = .{};
+        var handles: std.ArrayList([]const u8) = .empty;
         errdefer {
             for (handles.items) |h| self.allocator.free(h);
             handles.deinit(self.allocator);
@@ -355,9 +375,9 @@ pub const Connection = struct {
 
     /// Switch to a window/tab by handle.
     pub fn switchToWindow(self: *Connection, handle: []const u8) !void {
-        var params = json.ObjectMap.init(self.allocator);
-        defer params.deinit();
-        try params.put("handle", .{ .string = handle });
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
+        try params.put(self.allocator, "handle", .{ .string = handle });
 
         var result = try self.send("WebDriver:SwitchToWindow", .{ .object = params });
         defer result.deinit();
@@ -367,9 +387,9 @@ pub const Connection = struct {
 
     /// Open a new tab/window. Returns the new handle.
     pub fn newWindow(self: *Connection, window_type: []const u8) ![]const u8 {
-        var params = json.ObjectMap.init(self.allocator);
-        defer params.deinit();
-        try params.put("type", .{ .string = window_type });
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
+        try params.put(self.allocator, "type", .{ .string = window_type });
 
         var result = try self.send("WebDriver:NewWindow", .{ .object = params });
         defer result.deinit();
@@ -405,7 +425,7 @@ pub const Connection = struct {
         var length: usize = 0;
         var buf: [1]u8 = undefined;
         while (true) {
-            const n = try s.read(&buf);
+            const n = try streamRead(s, &buf);
             if (n == 0) return error.ConnectionClosed;
             const ch = buf[0];
             if (ch == ':') break;
@@ -424,7 +444,7 @@ pub const Connection = struct {
 
         var total: usize = 0;
         while (total < length) {
-            const n = try s.read(payload[total..]);
+            const n = try streamRead(s, payload[total..]);
             if (n == 0) return error.ConnectionClosed;
             total += n;
         }
@@ -450,12 +470,12 @@ fn cloneJsonValue(allocator: mem.Allocator, val: json.Value) !json.Value {
             return .{ .array = new_arr };
         },
         .object => |obj| {
-            var new_obj = json.ObjectMap.init(allocator);
+            var new_obj: json.ObjectMap = .empty;
             var it = obj.iterator();
             while (it.next()) |entry| {
                 const key = try allocator.dupe(u8, entry.key_ptr.*);
                 const value = try cloneJsonValue(allocator, entry.value_ptr.*);
-                try new_obj.put(key, value);
+                try new_obj.put(allocator, key, value);
             }
             return .{ .object = new_obj };
         },
@@ -468,7 +488,9 @@ fn cloneJsonValue(allocator: mem.Allocator, val: json.Value) !json.Value {
 
 test "Connection struct initializes" {
     const allocator = std.testing.allocator;
-    var conn = Connection.init(allocator);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    var conn = Connection.init(allocator, threaded.io());
     defer conn.deinit();
     try std.testing.expect(conn.stream == null);
     try std.testing.expect(conn.session_id == null);

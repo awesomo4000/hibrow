@@ -31,6 +31,41 @@ const pid_filename = "gateway.pid";
 /// Read buffer size for socket I/O.
 const read_buf_size = 8192;
 
+/// The 0.16 network stream type.
+const Stream = std.Io.net.Stream;
+
+/// Wrap an existing (blocking) socket fd as a Stream. The Io backend creates
+/// blocking sockets, so raw posix read/write on the fd is safe and matches the
+/// pre-0.16 `Stream.read/writeAll` semantics.
+fn streamFromFd(fd: posix.fd_t) Stream {
+    return .{ .socket = .{ .handle = fd, .address = .{ .ip4 = .loopback(0) } } };
+}
+
+/// Raw blocking read from the stream's socket fd.
+fn streamRead(stream: Stream, buf: []u8) !usize {
+    return posix.read(stream.socket.handle, buf);
+}
+
+/// Write all bytes to the stream's socket fd, looping over partial writes.
+fn streamWriteAll(stream: Stream, bytes: []const u8) !void {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const rc = std.c.write(stream.socket.handle, bytes[i..].ptr, bytes.len - i);
+        if (rc <= 0) return error.WriteFailed;
+        i += @intCast(rc);
+    }
+}
+
+/// Sleep for the given number of milliseconds. Zig 0.16 removed
+/// `std.Thread.sleep`; use libc `nanosleep` directly (macOS links libc).
+pub fn sleepMs(ms: u64) void {
+    const ts: std.c.timespec = .{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+    };
+    _ = std.c.nanosleep(&ts, null);
+}
+
 // ---------------------------------------------------------------------------
 // Gateway Client
 // ---------------------------------------------------------------------------
@@ -38,42 +73,43 @@ const read_buf_size = 8192;
 /// Client for communicating with the gateway daemon over a Unix socket.
 pub const Client = struct {
     allocator: mem.Allocator,
-    stream: std.net.Stream,
+    io: std.Io,
+    stream: Stream,
     /// Monotonically increasing request ID.
     next_id: u64 = 1,
 
     /// Connect to the gateway daemon. Tries the socket directly, and if
     /// connection fails, attempts to auto-start the daemon and retry.
-    pub fn connect(allocator: mem.Allocator) !Client {
-        return connectImpl(allocator, true);
+    pub fn connect(allocator: mem.Allocator, io: std.Io) !Client {
+        return connectImpl(allocator, io, true);
     }
 
     /// Connect to the gateway daemon without auto-starting it.
     /// Returns error.ConnectionRefused if the daemon is not running.
-    pub fn connectNoAutoStart(allocator: mem.Allocator) !Client {
-        return connectImpl(allocator, false);
+    pub fn connectNoAutoStart(allocator: mem.Allocator, io: std.Io) !Client {
+        return connectImpl(allocator, io, false);
     }
 
-    fn connectImpl(allocator: mem.Allocator, auto_start: bool) !Client {
+    fn connectImpl(allocator: mem.Allocator, io: std.Io, auto_start: bool) !Client {
         const socket_path = try getSocketPath(allocator);
         defer allocator.free(socket_path);
 
         // First attempt
-        if (connectToSocket(socket_path)) |stream| {
-            return .{ .allocator = allocator, .stream = stream };
+        if (connectToSocket(io, socket_path)) |stream| {
+            return .{ .allocator = allocator, .io = io, .stream = stream };
         } else |_| {}
 
         if (!auto_start) return error.ConnectionRefused;
 
         // Auto-start daemon and retry
-        try autoStartDaemon(allocator);
+        try autoStartDaemon(io);
 
         // Poll for the socket to appear (up to 5 seconds)
         var attempts: u32 = 0;
         while (attempts < 50) : (attempts += 1) {
-            std.Thread.sleep(100 * std.time.ns_per_ms);
-            if (connectToSocket(socket_path)) |stream| {
-                return .{ .allocator = allocator, .stream = stream };
+            sleepMs(100);
+            if (connectToSocket(io, socket_path)) |stream| {
+                return .{ .allocator = allocator, .io = io, .stream = stream };
             } else |_| {}
         }
 
@@ -82,7 +118,7 @@ pub const Client = struct {
 
     /// Disconnect from the gateway.
     pub fn disconnect(self: *Client) void {
-        self.stream.close();
+        self.stream.close(self.io);
     }
 
     /// Send a JSON-RPC request and wait for the response.
@@ -102,7 +138,7 @@ pub const Client = struct {
         defer self.allocator.free(req_bytes);
 
         // Send
-        try self.stream.writeAll(req_bytes);
+        try streamWriteAll(self.stream, req_bytes);
 
         // Read response line
         const line = try readLine(self.allocator, self.stream);
@@ -153,15 +189,17 @@ const ProfileConn = struct {
 /// JSON-RPC requests to browser management handlers.
 pub const Server = struct {
     allocator: mem.Allocator,
-    listener: ?std.net.Server = null,
+    io: std.Io,
+    listener: ?std.Io.net.Server = null,
     socket_path: ?[]u8 = null,
     running: bool = false,
     /// Cached CDP connections keyed by profile name (owned strings).
     connections: std.StringHashMap(ProfileConn),
 
-    pub fn init(allocator: mem.Allocator) Server {
+    pub fn init(allocator: mem.Allocator, io: std.Io) Server {
         return .{
             .allocator = allocator,
+            .io = io,
             .connections = std.StringHashMap(ProfileConn).init(allocator),
         };
     }
@@ -175,10 +213,10 @@ pub const Server = struct {
         }
         self.connections.deinit();
 
-        if (self.listener) |*l| l.deinit();
+        if (self.listener) |*l| l.deinit(self.io);
         if (self.socket_path) |p| {
             // Remove socket file on cleanup
-            std.fs.deleteFileAbsolute(p) catch {};
+            std.Io.Dir.deleteFileAbsolute(self.io, p) catch {};
             self.allocator.free(p);
         }
     }
@@ -191,27 +229,26 @@ pub const Server = struct {
         // Ensure socket directory exists
         const sock_dir = try getSocketDir(self.allocator);
         defer self.allocator.free(sock_dir);
-        std.fs.cwd().makePath(sock_dir) catch |err| {
+        std.Io.Dir.cwd().createDirPath(self.io, sock_dir) catch |err| {
             if (err != error.PathAlreadyExists) return err;
         };
 
         // Remove stale socket file if it exists
-        std.fs.deleteFileAbsolute(sock_path) catch {};
+        std.Io.Dir.deleteFileAbsolute(self.io, sock_path) catch {};
 
         // Write PID file
-        try writePidFile(self.allocator, sock_dir);
+        try writePidFile(self.allocator, self.io, sock_dir);
 
         // Bind and listen
-        const addr = try std.net.Address.initUnix(sock_path);
-        self.listener = try addr.listen(.{
+        const addr = try std.Io.net.UnixAddress.init(sock_path);
+        self.listener = try addr.listen(self.io, .{
             .kernel_backlog = 128,
-            .reuse_address = true,
         });
         self.running = true;
 
         // Accept loop
         while (self.running) {
-            const connection = self.listener.?.accept() catch |err| {
+            const stream = self.listener.?.accept(self.io) catch |err| {
                 if (!self.running) break;
                 // Log and continue on transient errors
                 std.debug.print("accept error: {any}\n", .{err});
@@ -219,7 +256,7 @@ pub const Server = struct {
             };
             // Handle each connection synchronously (simple, correct).
             // CDP is not thread-safe per-browser anyway, so serial is fine.
-            self.handleConnection(connection.stream);
+            self.handleConnection(stream);
         }
     }
 
@@ -228,14 +265,14 @@ pub const Server = struct {
         self.running = false;
         // Close the listener to unblock accept()
         if (self.listener) |*l| {
-            l.deinit();
+            l.deinit(self.io);
             self.listener = null;
         }
     }
 
     /// Handle a single client connection: read request, dispatch, write response.
-    fn handleConnection(self: *Server, stream: std.net.Stream) void {
-        defer stream.close();
+    fn handleConnection(self: *Server, stream: Stream) void {
+        defer stream.close(self.io);
 
         const line = readLine(self.allocator, stream) catch return;
         defer self.allocator.free(line);
@@ -261,7 +298,7 @@ pub const Server = struct {
         };
         defer self.allocator.free(response_bytes);
 
-        stream.writeAll(response_bytes) catch {};
+        streamWriteAll(stream, response_bytes) catch {};
     }
 
     /// Dispatch a JSON-RPC request to the appropriate handler.
@@ -333,17 +370,17 @@ pub const Server = struct {
         }
 
         // Not cached — look up port via process scan
-        const resolved_port = browser_mod.lookupPort(self.allocator, profile) catch null orelse
+        const resolved_port = browser_mod.lookupPort(self.allocator, self.io, profile) catch null orelse
             return null;
 
         // Discover targets via HTTP
-        const targets = cdp.discoverTargets(self.allocator, resolved_port) catch return null;
+        const targets = cdp.discoverTargets(self.allocator, self.io, resolved_port) catch return null;
         defer cdp.freeTargets(self.allocator, targets);
 
         const ws_url = findPageTarget(targets) orelse return null;
 
         // Connect WebSocket
-        var conn = cdp.Connection.init(self.allocator);
+        var conn = cdp.Connection.init(self.allocator, self.io);
         conn.connect(ws_url) catch {
             conn.deinit();
             return null;
@@ -378,17 +415,17 @@ pub const Server = struct {
 
     /// Serialize a Browser struct to a JSON object value.
     fn browserToJson(self: *Server, b: browser_mod.Browser) !json.ObjectMap {
-        var obj = json.ObjectMap.init(self.allocator);
-        try obj.put("profile", .{ .string = b.profile });
-        try obj.put("port", .{ .integer = @intCast(b.port) });
+        var obj: json.ObjectMap = .empty;
+        try obj.put(self.allocator, "profile", .{ .string = b.profile });
+        try obj.put(self.allocator, "port", .{ .integer = @intCast(b.port) });
         var pids_arr = json.Array.init(self.allocator);
         for (b.pids) |pid| {
             try pids_arr.append(.{ .integer = @intCast(pid) });
         }
-        try obj.put("pids", .{ .array = pids_arr });
+        try obj.put(self.allocator, "pids", .{ .array = pids_arr });
         const display_dir = try collapseTilde(self.allocator, b.profile_dir);
-        try obj.put("profile_dir", .{ .string = display_dir });
-        try obj.put("browser_type", .{ .string = b.browser_type.toString() });
+        try obj.put(self.allocator, "profile_dir", .{ .string = display_dir });
+        try obj.put(self.allocator, "browser_type", .{ .string = b.browser_type.toString() });
         return obj;
     }
 
@@ -413,14 +450,14 @@ pub const Server = struct {
 
         // Shut down after encoding the response so the client gets the reply.
         self.running = false;
-        if (self.listener) |*l| { l.deinit(); self.listener = null; }
-        if (self.socket_path) |p| std.fs.deleteFileAbsolute(p) catch {};
+        if (self.listener) |*l| { l.deinit(self.io); self.listener = null; }
+        if (self.socket_path) |p| std.Io.Dir.deleteFileAbsolute(self.io, p) catch {};
 
         return encoded;
     }
 
     fn handleBrowserList(self: *Server, id: json.Value) ![]u8 {
-        const browsers = browser_mod.discover(self.allocator) catch
+        const browsers = browser_mod.discover(self.allocator, self.io) catch
             return self.fail(id, .internal_error, "Discovery failed");
         defer browser_mod.freeBrowsers(self.allocator, browsers);
 
@@ -446,20 +483,20 @@ pub const Server = struct {
             browser_mod.BrowserType.chrome;
 
         // Already running? Check via process scan.
-        const existing_info = try findBrowserInfo(self.allocator, profile);
+        const existing_info = try findBrowserInfo(self.allocator, self.io, profile);
 
         if (existing_info) |ei| {
             const ep = ei.port;
-            var obj = json.ObjectMap.init(self.allocator);
-            defer obj.deinit();
-            try obj.put("profile", .{ .string = profile });
-            try obj.put("port", .{ .integer = @intCast(ep) });
-            try obj.put("already_running", .{ .bool = true });
-            try obj.put("browser_type", .{ .string = browser_type.toString() });
+            var obj: json.ObjectMap = .empty;
+            defer obj.deinit(self.allocator);
+            try obj.put(self.allocator, "profile", .{ .string = profile });
+            try obj.put(self.allocator, "port", .{ .integer = @intCast(ep) });
+            try obj.put(self.allocator, "already_running", .{ .bool = true });
+            try obj.put(self.allocator, "browser_type", .{ .string = browser_type.toString() });
             return self.ok(id, .{ .object = obj });
         }
 
-        const b = browser_mod.launch(self.allocator, .{
+        const b = browser_mod.launch(self.allocator, self.io, .{
             .profile = profile,
             .proxy = extractStringParam(params, "proxy"),
             .proxy_dns = extractBoolParam(params, "proxy_dns") orelse false,
@@ -469,7 +506,7 @@ pub const Server = struct {
         defer self.allocator.free(b.profile);
 
         var obj = try self.browserToJson(b);
-        defer obj.deinit();
+        defer obj.deinit(self.allocator);
         return self.ok(id, .{ .object = obj });
     }
 
@@ -479,12 +516,12 @@ pub const Server = struct {
         const expression = extractStringParam(params, "expression") orelse
             return self.fail(id, .invalid_params, "Missing 'expression' parameter");
 
-        const info = try findBrowserInfo(self.allocator, profile) orelse
+        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
         switch (info.browser_type) {
             .firefox => {
-                var conn = marionette_mod.Connection.init(self.allocator);
+                var conn = marionette_mod.Connection.init(self.allocator, self.io);
                 defer conn.deinit();
                 conn.connect(info.port) catch
                     return self.fail(id, .cdp_error, "Marionette connection failed");
@@ -518,12 +555,12 @@ pub const Server = struct {
         const url = extractStringParam(params, "url") orelse
             return self.fail(id, .invalid_params, "Missing 'url' parameter");
 
-        const info = try findBrowserInfo(self.allocator, profile) orelse
+        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
         switch (info.browser_type) {
             .firefox => {
-                var conn = marionette_mod.Connection.init(self.allocator);
+                var conn = marionette_mod.Connection.init(self.allocator, self.io);
                 defer conn.deinit();
                 conn.connect(info.port) catch
                     return self.fail(id, .cdp_error, "Marionette connection failed");
@@ -540,10 +577,10 @@ pub const Server = struct {
             },
         }
 
-        var obj = json.ObjectMap.init(self.allocator);
-        defer obj.deinit();
-        try obj.put("status", .{ .string = "navigated" });
-        try obj.put("url", .{ .string = url });
+        var obj: json.ObjectMap = .empty;
+        defer obj.deinit(self.allocator);
+        try obj.put(self.allocator, "status", .{ .string = "navigated" });
+        try obj.put(self.allocator, "url", .{ .string = url });
         return self.ok(id, .{ .object = obj });
     }
 
@@ -551,14 +588,14 @@ pub const Server = struct {
         const profile = extractStringParam(params, "profile") orelse
             return self.fail(id, .invalid_params, "Missing 'profile' parameter");
 
-        const browsers = browser_mod.discover(self.allocator) catch
+        const browsers = browser_mod.discover(self.allocator, self.io) catch
             return self.fail(id, .internal_error, "Discovery failed");
         defer browser_mod.freeBrowsers(self.allocator, browsers);
 
         for (browsers) |b| {
             if (mem.eql(u8, b.profile, profile)) {
                 var obj = try self.browserToJson(b);
-                defer obj.deinit();
+                defer obj.deinit(self.allocator);
                 return self.ok(id, .{ .object = obj });
             }
         }
@@ -570,12 +607,12 @@ pub const Server = struct {
         const profile = extractStringParam(params, "profile") orelse
             return self.fail(id, .invalid_params, "Missing 'profile' parameter");
 
-        const info = try findBrowserInfo(self.allocator, profile) orelse
+        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
         switch (info.browser_type) {
             .firefox => {
-                var conn = marionette_mod.Connection.init(self.allocator);
+                var conn = marionette_mod.Connection.init(self.allocator, self.io);
                 defer conn.deinit();
                 conn.connect(info.port) catch
                     return self.fail(id, .cdp_error, "Marionette connection failed");
@@ -583,14 +620,14 @@ pub const Server = struct {
             },
             .chrome => {
                 // Get browser-level WebSocket URL from /json/version
-                const version = cdp.getVersion(self.allocator, info.port) catch
+                const version = cdp.getVersion(self.allocator, self.io, info.port) catch
                     return self.fail(id, .cdp_error, "Could not reach browser");
                 defer cdp.freeVersionInfo(self.allocator, version);
 
                 const browser_ws = version.webSocketDebuggerUrl orelse
                     return self.fail(id, .cdp_error, "No browser WebSocket URL");
 
-                var conn = cdp.Connection.init(self.allocator);
+                var conn = cdp.Connection.init(self.allocator, self.io);
                 defer conn.deinit();
                 conn.connect(browser_ws) catch
                     return self.fail(id, .cdp_error, "WebSocket connection failed");
@@ -610,12 +647,12 @@ pub const Server = struct {
         const profile = extractStringParam(params, "profile") orelse
             return self.fail(id, .invalid_params, "Missing 'profile' parameter");
 
-        const info = try findBrowserInfo(self.allocator, profile) orelse
+        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
         switch (info.browser_type) {
             .firefox => {
-                var conn = marionette_mod.Connection.init(self.allocator);
+                var conn = marionette_mod.Connection.init(self.allocator, self.io);
                 defer conn.deinit();
                 conn.connect(info.port) catch
                     return self.fail(id, .cdp_error, "Marionette connection failed");
@@ -649,13 +686,13 @@ pub const Server = struct {
     };
 
     fn getPageTargets(self: *Server, profile: []const u8) !?PageTargetsResult {
-        const port = (try findBrowserInfo(self.allocator, profile) orelse return null).port;
+        const port = (try findBrowserInfo(self.allocator, self.io, profile) orelse return null).port;
 
-        const all_targets = cdp.discoverTargets(self.allocator, port) catch return null;
+        const all_targets = cdp.discoverTargets(self.allocator, self.io, port) catch return null;
         defer cdp.freeTargets(self.allocator, all_targets);
 
         // Filter to page-type targets, duping them into owned memory
-        var pages: std.ArrayList(cdp.Target) = .{};
+        var pages: std.ArrayList(cdp.Target) = .empty;
         errdefer {
             for (pages.items) |t| {
                 self.allocator.free(t.id);
@@ -695,12 +732,12 @@ pub const Server = struct {
         const profile = extractStringParam(params, "profile") orelse
             return self.fail(id, .invalid_params, "Missing 'profile' parameter");
 
-        const info = try findBrowserInfo(self.allocator, profile) orelse
+        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
         switch (info.browser_type) {
             .firefox => {
-                var conn = marionette_mod.Connection.init(self.allocator);
+                var conn = marionette_mod.Connection.init(self.allocator, self.io);
                 defer conn.deinit();
                 conn.connect(info.port) catch
                     return self.fail(id, .cdp_error, "Marionette connection failed");
@@ -720,10 +757,10 @@ pub const Server = struct {
                     const title = conn.getTitle() catch try self.allocator.dupe(u8, "");
                     const url = conn.getCurrentUrl() catch try self.allocator.dupe(u8, "");
 
-                    var obj = json.ObjectMap.init(self.allocator);
-                    try obj.put("index", .{ .integer = @intCast(i) });
-                    try obj.put("title", .{ .string = title });
-                    try obj.put("url", .{ .string = url });
+                    var obj: json.ObjectMap = .empty;
+                    try obj.put(self.allocator, "index", .{ .integer = @intCast(i) });
+                    try obj.put(self.allocator, "title", .{ .string = title });
+                    try obj.put(self.allocator, "url", .{ .string = url });
                     try arr.append(.{ .object = obj });
                 }
                 return self.ok(id, .{ .array = arr });
@@ -736,10 +773,10 @@ pub const Server = struct {
                 var arr = json.Array.init(self.allocator);
                 defer arr.deinit();
                 for (result.targets, 0..) |t, i| {
-                    var obj = json.ObjectMap.init(self.allocator);
-                    try obj.put("index", .{ .integer = @intCast(i) });
-                    try obj.put("title", .{ .string = t.title });
-                    try obj.put("url", .{ .string = t.url });
+                    var obj: json.ObjectMap = .empty;
+                    try obj.put(self.allocator, "index", .{ .integer = @intCast(i) });
+                    try obj.put(self.allocator, "title", .{ .string = t.title });
+                    try obj.put(self.allocator, "url", .{ .string = t.url });
                     try arr.append(.{ .object = obj });
                 }
                 return self.ok(id, .{ .array = arr });
@@ -751,14 +788,14 @@ pub const Server = struct {
         const profile = extractStringParam(params, "profile") orelse
             return self.fail(id, .invalid_params, "Missing 'profile' parameter");
 
-        const info = try findBrowserInfo(self.allocator, profile) orelse
+        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
         const url = extractStringParam(params, "url");
 
         switch (info.browser_type) {
             .firefox => {
-                var conn = marionette_mod.Connection.init(self.allocator);
+                var conn = marionette_mod.Connection.init(self.allocator, self.io);
                 defer conn.deinit();
                 conn.connect(info.port) catch
                     return self.fail(id, .cdp_error, "Marionette connection failed");
@@ -772,14 +809,14 @@ pub const Server = struct {
                 if (url) |u| conn.navigate(u) catch {};
 
                 self.evictConnection(profile);
-                var obj = json.ObjectMap.init(self.allocator);
-                defer obj.deinit();
-                try obj.put("status", .{ .string = "created" });
-                try obj.put("url", .{ .string = url orelse "about:blank" });
+                var obj: json.ObjectMap = .empty;
+                defer obj.deinit(self.allocator);
+                try obj.put(self.allocator, "status", .{ .string = "created" });
+                try obj.put(self.allocator, "url", .{ .string = url orelse "about:blank" });
                 return self.ok(id, .{ .object = obj });
             },
             .chrome => {
-                const new_target = cdp.createTarget(self.allocator, info.port, url) catch
+                const new_target = cdp.createTarget(self.allocator, self.io, info.port, url) catch
                     return self.fail(id, .cdp_error, "Could not create tab");
                 defer {
                     self.allocator.free(new_target.id);
@@ -790,10 +827,10 @@ pub const Server = struct {
                 }
 
                 self.evictConnection(profile);
-                var obj = json.ObjectMap.init(self.allocator);
-                defer obj.deinit();
-                try obj.put("status", .{ .string = "created" });
-                try obj.put("url", .{ .string = new_target.url });
+                var obj: json.ObjectMap = .empty;
+                defer obj.deinit(self.allocator);
+                try obj.put(self.allocator, "status", .{ .string = "created" });
+                try obj.put(self.allocator, "url", .{ .string = new_target.url });
                 return self.ok(id, .{ .object = obj });
             },
         }
@@ -808,12 +845,12 @@ pub const Server = struct {
         if (tab_idx < 0) return self.fail(id, .invalid_params, "Tab index must be non-negative");
         const idx: usize = @intCast(tab_idx);
 
-        const info = try findBrowserInfo(self.allocator, profile) orelse
+        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
         switch (info.browser_type) {
             .firefox => {
-                var conn = marionette_mod.Connection.init(self.allocator);
+                var conn = marionette_mod.Connection.init(self.allocator, self.io);
                 defer conn.deinit();
                 conn.connect(info.port) catch
                     return self.fail(id, .cdp_error, "Marionette connection failed");
@@ -844,7 +881,7 @@ pub const Server = struct {
                 if (idx >= result.targets.len)
                     return self.fail(id, .invalid_params, "Tab index out of bounds");
 
-                cdp.closeTarget(self.allocator, result.port, result.targets[idx].id) catch
+                cdp.closeTarget(self.allocator, self.io, result.port, result.targets[idx].id) catch
                     return self.fail(id, .cdp_error, "Could not close tab");
 
                 self.evictConnection(profile);
@@ -857,12 +894,12 @@ pub const Server = struct {
         const profile = extractStringParam(params, "profile") orelse
             return self.fail(id, .invalid_params, "Missing 'profile' parameter");
 
-        const info = try findBrowserInfo(self.allocator, profile) orelse
+        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
         switch (info.browser_type) {
             .firefox => {
-                var conn = marionette_mod.Connection.init(self.allocator);
+                var conn = marionette_mod.Connection.init(self.allocator, self.io);
                 defer conn.deinit();
                 conn.connect(info.port) catch
                     return self.fail(id, .cdp_error, "Marionette connection failed");
@@ -910,12 +947,12 @@ pub const Server = struct {
         if (tab_idx < 0) return self.fail(id, .invalid_params, "Tab index must be non-negative");
         const idx: usize = @intCast(tab_idx);
 
-        const info = try findBrowserInfo(self.allocator, profile) orelse
+        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
         switch (info.browser_type) {
             .firefox => {
-                var conn = marionette_mod.Connection.init(self.allocator);
+                var conn = marionette_mod.Connection.init(self.allocator, self.io);
                 defer conn.deinit();
                 conn.connect(info.port) catch
                     return self.fail(id, .cdp_error, "Marionette connection failed");
@@ -944,7 +981,7 @@ pub const Server = struct {
                 if (idx >= result.targets.len)
                     return self.fail(id, .invalid_params, "Tab index out of bounds");
 
-                cdp.activateTarget(self.allocator, result.port, result.targets[idx].id) catch
+                cdp.activateTarget(self.allocator, self.io, result.port, result.targets[idx].id) catch
                     return self.fail(id, .cdp_error, "Could not activate tab");
 
                 self.evictConnection(profile);
@@ -960,19 +997,19 @@ pub const Server = struct {
 
 /// Get the socket directory path for the current user.
 pub fn getSocketDir(allocator: mem.Allocator) ![]u8 {
-    const uid = posix.getuid();
+    const uid = std.c.getuid();
     return std.fmt.allocPrint(allocator, "{s}{d}", .{ socket_dir_prefix, uid });
 }
 
 /// Get the full socket path.
 pub fn getSocketPath(allocator: mem.Allocator) ![]u8 {
-    const uid = posix.getuid();
+    const uid = std.c.getuid();
     return std.fmt.allocPrint(allocator, "{s}{d}/{s}", .{ socket_dir_prefix, uid, socket_filename });
 }
 
 /// Get the PID file path.
 pub fn getPidFilePath(allocator: mem.Allocator) ![]u8 {
-    const uid = posix.getuid();
+    const uid = std.c.getuid();
     return std.fmt.allocPrint(allocator, "{s}{d}/{s}", .{ socket_dir_prefix, uid, pid_filename });
 }
 
@@ -982,21 +1019,23 @@ pub fn getPidFilePath(allocator: mem.Allocator) ![]u8 {
 
 /// Try to start the gateway daemon in the background.
 /// Forks, child calls setsid, closes stdio, execs gateway in server mode.
-pub fn autoStartDaemon(allocator: mem.Allocator) !void {
+pub fn autoStartDaemon(io: std.Io) !void {
     // Get path to our own executable
     var self_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const self_path = try std.fs.selfExePath(&self_path_buf);
+    const len = try std.process.executablePath(io, &self_path_buf);
+    const self_path = self_path_buf[0..len];
 
-    // Spawn the daemon process
-    var child = std.process.Child.init(&.{ self_path, "gateway", "serve" }, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    // New process group so it survives our exit
-    child.pgid = 0;
-
-    try child.spawn();
-    // Don't wait — let the daemon run independently
+    // Spawn the daemon process, detached in a new process group so it survives
+    // our exit, with stdio pointed at /dev/null.
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ self_path, "gateway", "serve" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    _ = &child;
+    // Don't wait — let the daemon run independently.
 }
 
 // ---------------------------------------------------------------------------
@@ -1004,19 +1043,20 @@ pub fn autoStartDaemon(allocator: mem.Allocator) !void {
 // ---------------------------------------------------------------------------
 
 /// Connect to an existing Unix domain socket.
-fn connectToSocket(path: []const u8) !std.net.Stream {
-    return std.net.connectUnixSocket(path);
+fn connectToSocket(io: std.Io, path: []const u8) !Stream {
+    const addr = try std.Io.net.UnixAddress.init(path);
+    return addr.connect(io);
 }
 
 /// Read a newline-delimited line from a stream.
 /// Returns allocated slice (caller owns). Does not include the newline.
-fn readLine(allocator: mem.Allocator, stream: std.net.Stream) ![]u8 {
-    var buf: std.ArrayList(u8) = .{};
+fn readLine(allocator: mem.Allocator, stream: Stream) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
 
     var read_buf: [read_buf_size]u8 = undefined;
     while (true) {
-        const n = try stream.read(&read_buf);
+        const n = try streamRead(stream, &read_buf);
         if (n == 0) break; // EOF
 
         // Look for newline in what we just read
@@ -1034,7 +1074,7 @@ fn readLine(allocator: mem.Allocator, stream: std.net.Stream) ![]u8 {
 /// Send a JSON-RPC error response directly to a stream.
 fn sendErrorResponse(
     allocator: mem.Allocator,
-    stream: std.net.Stream,
+    stream: Stream,
     id: json.Value,
     code: protocol.ErrorCode,
     message: []const u8,
@@ -1042,19 +1082,19 @@ fn sendErrorResponse(
     const resp = protocol.makeErrorResponse(id, code, message);
     const bytes = try resp.encode(allocator);
     defer allocator.free(bytes);
-    try stream.writeAll(bytes);
+    try streamWriteAll(stream, bytes);
 }
 
 /// Write a PID file into the socket directory.
-fn writePidFile(allocator: mem.Allocator, sock_dir: []const u8) !void {
+fn writePidFile(allocator: mem.Allocator, io: std.Io, sock_dir: []const u8) !void {
     const pid_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sock_dir, pid_filename });
     defer allocator.free(pid_path);
 
-    const file = try std.fs.cwd().createFile(pid_path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().createFile(io, pid_path, .{});
+    defer file.close(io);
 
     var buf: [64]u8 = undefined;
-    var writer = file.writer(&buf);
+    var writer = file.writer(io, &buf);
     try writer.interface.print("{d}\n", .{std.c.getpid()});
     try writer.interface.flush();
 }
@@ -1099,8 +1139,8 @@ const BrowserInfo = struct {
     browser_type: browser_mod.BrowserType,
 };
 
-fn findBrowserInfo(allocator: mem.Allocator, profile: []const u8) !?BrowserInfo {
-    const browsers = try browser_mod.discover(allocator);
+fn findBrowserInfo(allocator: mem.Allocator, io: std.Io, profile: []const u8) !?BrowserInfo {
+    const browsers = try browser_mod.discover(allocator, io);
     defer browser_mod.freeBrowsers(allocator, browsers);
 
     for (browsers) |b| {
@@ -1114,7 +1154,8 @@ fn findBrowserInfo(allocator: mem.Allocator, profile: []const u8) !?BrowserInfo 
 /// Replace the user's home directory prefix with "~" for display.
 /// Returns an allocated string if replacement was made, or a dupe of the input.
 fn collapseTilde(allocator: mem.Allocator, path: []const u8) ![]const u8 {
-    const home = std.posix.getenv("HOME") orelse return try allocator.dupe(u8, path);
+    const home_z = std.c.getenv("HOME") orelse return try allocator.dupe(u8, path);
+    const home = mem.span(home_z);
     if (mem.startsWith(u8, path, home)) {
         const rest = path[home.len..];
         return try std.fmt.allocPrint(allocator, "~{s}", .{rest});
@@ -1170,10 +1211,10 @@ test "getPidFilePath contains pid filename" {
 
 test "extractStringParam extracts from object" {
     const allocator = std.testing.allocator;
-    var obj = json.ObjectMap.init(allocator);
-    defer obj.deinit();
-    try obj.put("profile", .{ .string = "work" });
-    try obj.put("count", .{ .integer = 5 });
+    var obj: json.ObjectMap = .empty;
+    defer obj.deinit(allocator);
+    try obj.put(allocator, "profile", .{ .string = "work" });
+    try obj.put(allocator, "count", .{ .integer = 5 });
 
     const params: json.Value = .{ .object = obj };
     try std.testing.expectEqualStrings("work", extractStringParam(params, "profile").?);
@@ -1188,10 +1229,10 @@ test "extractStringParam handles null and absent params" {
 
 test "extractBoolParam extracts from object" {
     const allocator = std.testing.allocator;
-    var obj = json.ObjectMap.init(allocator);
-    defer obj.deinit();
-    try obj.put("proxy_dns", .{ .bool = true });
-    try obj.put("name", .{ .string = "test" });
+    var obj: json.ObjectMap = .empty;
+    defer obj.deinit(allocator);
+    try obj.put(allocator, "proxy_dns", .{ .bool = true });
+    try obj.put(allocator, "name", .{ .string = "test" });
 
     const params: json.Value = .{ .object = obj };
     try std.testing.expectEqual(@as(?bool, true), extractBoolParam(params, "proxy_dns"));
@@ -1255,7 +1296,9 @@ test "findPageTarget returns null when no ws urls" {
 
 test "Server initializes and deinitializes cleanly" {
     const allocator = std.testing.allocator;
-    var server = Server.init(allocator);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    var server = Server.init(allocator, threaded.io());
     // Verify connection cache is empty
     try std.testing.expectEqual(@as(u32, 0), server.connections.count());
     server.deinit();
@@ -1263,7 +1306,9 @@ test "Server initializes and deinitializes cleanly" {
 
 test "Server evictConnection on empty cache is safe" {
     const allocator = std.testing.allocator;
-    var server = Server.init(allocator);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    var server = Server.init(allocator, threaded.io());
     defer server.deinit();
     // Should not crash or leak
     server.evictConnection("nonexistent");
@@ -1275,18 +1320,18 @@ test "readLine reads up to newline" {
     const rc = std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
     if (rc != 0) return error.SocketPairFailed;
 
-    const read_stream = std.net.Stream{ .handle = fds[0] };
+    const read_stream = streamFromFd(fds[0]);
     const write_fd = fds[1];
 
     // Write test data with newline
     const test_data = "{\"jsonrpc\":\"2.0\",\"method\":\"test\",\"id\":1}\n";
-    _ = try posix.write(write_fd, test_data);
-    posix.close(write_fd);
+    _ = std.c.write(write_fd, test_data.ptr, test_data.len);
+    _ = std.c.close(write_fd);
 
     const allocator = std.testing.allocator;
     const line = try readLine(allocator, read_stream);
     defer allocator.free(line);
-    defer read_stream.close();
+    defer _ = std.c.close(fds[0]);
 
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"method\":\"test\",\"id\":1}", line);
 }
@@ -1296,17 +1341,17 @@ test "readLine handles EOF without newline" {
     const rc = std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
     if (rc != 0) return error.SocketPairFailed;
 
-    const read_stream = std.net.Stream{ .handle = fds[0] };
+    const read_stream = streamFromFd(fds[0]);
     const write_fd = fds[1];
 
     // Write data without newline, then close
-    _ = try posix.write(write_fd, "partial data");
-    posix.close(write_fd);
+    const partial = "partial data"; _ = std.c.write(write_fd, partial.ptr, partial.len);
+    _ = std.c.close(write_fd);
 
     const allocator = std.testing.allocator;
     const line = try readLine(allocator, read_stream);
     defer allocator.free(line);
-    defer read_stream.close();
+    defer _ = std.c.close(fds[0]);
 
     try std.testing.expectEqualStrings("partial data", line);
 }
@@ -1318,24 +1363,28 @@ test "Unix socket round-trip" {
     var path_buf: [128]u8 = undefined;
     const sock_path = try std.fmt.bufPrint(&path_buf, "/tmp/hibrow-test-{d}.sock", .{std.c.getpid()});
 
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
     // Clean up any stale socket
-    std.fs.deleteFileAbsolute(sock_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, sock_path) catch {};
 
     // Create server
-    const addr = try std.net.Address.initUnix(sock_path);
-    var server = try addr.listen(.{ .reuse_address = true });
+    const addr = try std.Io.net.UnixAddress.init(sock_path);
+    var server = try addr.listen(io, .{});
     defer {
-        server.deinit();
-        std.fs.deleteFileAbsolute(sock_path) catch {};
+        server.deinit(io);
+        std.Io.Dir.deleteFileAbsolute(io, sock_path) catch {};
     }
 
     // Connect client (in same thread since we can use non-blocking approach)
-    var client_stream = try std.net.connectUnixSocket(sock_path);
-    defer client_stream.close();
+    const client_stream = try connectToSocket(io, sock_path);
+    defer client_stream.close(io);
 
     // Accept on server
-    const conn = try server.accept();
-    defer conn.stream.close();
+    const server_stream = try server.accept(io);
+    defer server_stream.close(io);
 
     // Client sends a request
     const req = protocol.Request{
@@ -1344,10 +1393,9 @@ test "Unix socket round-trip" {
     };
     const req_bytes = try req.encode(allocator);
     defer allocator.free(req_bytes);
-    try client_stream.writeAll(req_bytes);
+    try streamWriteAll(client_stream, req_bytes);
 
     // Server reads the request
-    const server_stream = conn.stream;
     const line = try readLine(allocator, server_stream);
     defer allocator.free(line);
 
@@ -1362,7 +1410,7 @@ test "Unix socket round-trip" {
     const resp = protocol.makeResponse(decoded.id, .{ .string = "ok" });
     const resp_bytes = try resp.encode(allocator);
     defer allocator.free(resp_bytes);
-    try conn.stream.writeAll(resp_bytes);
+    try streamWriteAll(server_stream, resp_bytes);
 
     // Client reads the response
     const resp_line = try readLine(allocator, client_stream);
@@ -1376,7 +1424,9 @@ test "Unix socket round-trip" {
 
 test "Server dispatch returns method_not_found for unknown method" {
     const allocator = std.testing.allocator;
-    var server = Server.init(allocator);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    var server = Server.init(allocator, threaded.io());
     defer server.deinit();
 
     const req = protocol.Request{
@@ -1398,7 +1448,9 @@ test "Server dispatch returns method_not_found for unknown method" {
 
 test "Server dispatch handles gateway.status" {
     const allocator = std.testing.allocator;
-    var server = Server.init(allocator);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    var server = Server.init(allocator, threaded.io());
     defer server.deinit();
 
     const req = protocol.Request{
@@ -1417,7 +1469,9 @@ test "Server dispatch handles gateway.status" {
 
 test "Server dispatch handles gateway.shutdown" {
     const allocator = std.testing.allocator;
-    var server = Server.init(allocator);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    var server = Server.init(allocator, threaded.io());
     defer server.deinit();
 
     try std.testing.expect(server.running == false);
@@ -1444,11 +1498,11 @@ test "sendErrorResponse produces valid response" {
     const rc = std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
     if (rc != 0) return error.SocketPairFailed;
 
-    const write_stream = std.net.Stream{ .handle = fds[1] };
+    const write_stream = streamFromFd(fds[1]);
     const read_fd = fds[0];
 
     try sendErrorResponse(allocator, write_stream, .{ .integer = 42 }, .parse_error, "bad json");
-    posix.close(fds[1]);
+    _ = std.c.close(fds[1]);
 
     // Read from the socket
     var read_buf: [4096]u8 = undefined;
@@ -1458,7 +1512,7 @@ test "sendErrorResponse produces valid response" {
         if (n == 0) break;
         total += n;
     }
-    posix.close(read_fd);
+    _ = std.c.close(read_fd);
 
     // Parse and verify
     var parsed = try protocol.parseMessage(allocator, read_buf[0..total]);
@@ -1486,10 +1540,10 @@ test "ParsedResponse struct layout" {
 
 test "extractIntParam extracts from object" {
     const allocator = std.testing.allocator;
-    var obj = json.ObjectMap.init(allocator);
-    defer obj.deinit();
-    try obj.put("tab", .{ .integer = 3 });
-    try obj.put("name", .{ .string = "test" });
+    var obj: json.ObjectMap = .empty;
+    defer obj.deinit(allocator);
+    try obj.put(allocator, "tab", .{ .integer = 3 });
+    try obj.put(allocator, "name", .{ .string = "test" });
 
     const params: json.Value = .{ .object = obj };
     try std.testing.expectEqual(@as(?i64, 3), extractIntParam(params, "tab"));
@@ -1506,14 +1560,16 @@ test "Server dispatch handles new methods without crashing" {
     // Verify the dispatch table includes the new methods (they will fail with
     // browser_not_found since no browser is running, but they should not crash)
     const allocator = std.testing.allocator;
-    var server = Server.init(allocator);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    var server = Server.init(allocator, threaded.io());
     defer server.deinit();
 
     // browser.url — needs profile param
     {
-        var params_obj = json.ObjectMap.init(allocator);
-        defer params_obj.deinit();
-        try params_obj.put("profile", .{ .string = "nonexistent" });
+        var params_obj: json.ObjectMap = .empty;
+        defer params_obj.deinit(allocator);
+        try params_obj.put(allocator, "profile", .{ .string = "nonexistent" });
         const req = protocol.Request{
             .method = "browser.url",
             .params = .{ .object = params_obj },
@@ -1530,9 +1586,9 @@ test "Server dispatch handles new methods without crashing" {
 
     // tab.list — needs profile param
     {
-        var params_obj = json.ObjectMap.init(allocator);
-        defer params_obj.deinit();
-        try params_obj.put("profile", .{ .string = "nonexistent" });
+        var params_obj: json.ObjectMap = .empty;
+        defer params_obj.deinit(allocator);
+        try params_obj.put(allocator, "profile", .{ .string = "nonexistent" });
         const req = protocol.Request{
             .method = "tab.list",
             .params = .{ .object = params_obj },
@@ -1548,9 +1604,9 @@ test "Server dispatch handles new methods without crashing" {
 
     // tab.new — needs profile param
     {
-        var params_obj = json.ObjectMap.init(allocator);
-        defer params_obj.deinit();
-        try params_obj.put("profile", .{ .string = "nonexistent" });
+        var params_obj: json.ObjectMap = .empty;
+        defer params_obj.deinit(allocator);
+        try params_obj.put(allocator, "profile", .{ .string = "nonexistent" });
         const req = protocol.Request{
             .method = "tab.new",
             .params = .{ .object = params_obj },
@@ -1566,10 +1622,10 @@ test "Server dispatch handles new methods without crashing" {
 
     // tab.close — needs profile + tab params
     {
-        var params_obj = json.ObjectMap.init(allocator);
-        defer params_obj.deinit();
-        try params_obj.put("profile", .{ .string = "nonexistent" });
-        try params_obj.put("tab", .{ .integer = 0 });
+        var params_obj: json.ObjectMap = .empty;
+        defer params_obj.deinit(allocator);
+        try params_obj.put(allocator, "profile", .{ .string = "nonexistent" });
+        try params_obj.put(allocator, "tab", .{ .integer = 0 });
         const req = protocol.Request{
             .method = "tab.close",
             .params = .{ .object = params_obj },
@@ -1585,10 +1641,10 @@ test "Server dispatch handles new methods without crashing" {
 
     // tab.switch — needs profile + tab params
     {
-        var params_obj = json.ObjectMap.init(allocator);
-        defer params_obj.deinit();
-        try params_obj.put("profile", .{ .string = "nonexistent" });
-        try params_obj.put("tab", .{ .integer = 0 });
+        var params_obj: json.ObjectMap = .empty;
+        defer params_obj.deinit(allocator);
+        try params_obj.put(allocator, "profile", .{ .string = "nonexistent" });
+        try params_obj.put(allocator, "tab", .{ .integer = 0 });
         const req = protocol.Request{
             .method = "tab.switch",
             .params = .{ .object = params_obj },
@@ -1605,7 +1661,8 @@ test "Server dispatch handles new methods without crashing" {
 
 test "collapseTilde replaces home prefix with ~" {
     const allocator = std.testing.allocator;
-    const home = std.posix.getenv("HOME") orelse return;
+    const home_z = std.c.getenv("HOME") orelse return;
+    const home = mem.span(home_z);
 
     // Path under home
     const input = try std.fmt.allocPrint(allocator, "{s}/.hibrow/profiles/test", .{home});

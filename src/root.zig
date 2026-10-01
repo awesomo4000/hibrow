@@ -33,8 +33,8 @@ pub const Client = struct {
     gw: gateway.Client,
 
     /// Connect to the hibrow gateway (auto-starting it if needed).
-    pub fn connect(allocator: mem.Allocator) !Client {
-        const gw = try gateway.Client.connect(allocator);
+    pub fn connect(allocator: mem.Allocator, io: std.Io) !Client {
+        const gw = try gateway.Client.connect(allocator, io);
         return .{ .allocator = allocator, .gw = gw };
     }
 
@@ -50,107 +50,107 @@ pub const Client = struct {
 
     /// Get info about a specific browser by profile name.
     pub fn get(self: *Client, profile: []const u8) !gateway.ParsedResponse {
-        var params = json.ObjectMap.init(self.allocator);
-        defer params.deinit();
-        try params.put("profile", .{ .string = profile });
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
+        try params.put(self.allocator, "profile", .{ .string = profile });
         return self.gw.call("browser.get", .{ .object = params });
     }
 
     /// Launch a new browser with the given profile name.
     pub fn launch(self: *Client, profile: []const u8, opts: LaunchOpts) !gateway.ParsedResponse {
-        var params = json.ObjectMap.init(self.allocator);
-        defer params.deinit();
-        try params.put("profile", .{ .string = profile });
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
+        try params.put(self.allocator, "profile", .{ .string = profile });
         if (opts.proxy) |proxy| {
-            try params.put("proxy", .{ .string = proxy });
+            try params.put(self.allocator, "proxy", .{ .string = proxy });
         }
         if (opts.proxy_dns) {
-            try params.put("proxy_dns", .{ .bool = true });
+            try params.put(self.allocator, "proxy_dns", .{ .bool = true });
         }
         if (opts.browser_type != .chrome) {
-            try params.put("browser_type", .{ .string = opts.browser_type.toString() });
+            try params.put(self.allocator, "browser_type", .{ .string = opts.browser_type.toString() });
         }
         return self.gw.call("browser.launch", .{ .object = params });
     }
 
     /// Evaluate JavaScript in the named profile's active tab.
     pub fn eval(self: *Client, profile: []const u8, expression: []const u8) !gateway.ParsedResponse {
-        var params = json.ObjectMap.init(self.allocator);
-        defer params.deinit();
-        try params.put("profile", .{ .string = profile });
-        try params.put("expression", .{ .string = expression });
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
+        try params.put(self.allocator, "profile", .{ .string = profile });
+        try params.put(self.allocator, "expression", .{ .string = expression });
         return self.gw.call("browser.eval", .{ .object = params });
     }
 
     /// Navigate the named profile's active tab to a URL.
     pub fn navigate(self: *Client, profile: []const u8, url: []const u8) !gateway.ParsedResponse {
-        var params = json.ObjectMap.init(self.allocator);
-        defer params.deinit();
-        try params.put("profile", .{ .string = profile });
-        try params.put("url", .{ .string = url });
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
+        try params.put(self.allocator, "profile", .{ .string = profile });
+        try params.put(self.allocator, "url", .{ .string = url });
         return self.gw.call("browser.navigate", .{ .object = params });
     }
 
     /// Take a screenshot of the named profile's browser. Returns base64 PNG.
     pub fn screenshot(self: *Client, profile: []const u8, tab_idx: ?i64) !gateway.ParsedResponse {
-        var params = json.ObjectMap.init(self.allocator);
-        defer params.deinit();
-        try params.put("profile", .{ .string = profile });
-        if (tab_idx) |t| try params.put("tab", .{ .integer = t });
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
+        try params.put(self.allocator, "profile", .{ .string = profile });
+        if (tab_idx) |t| try params.put(self.allocator, "tab", .{ .integer = t });
         return self.gw.call("browser.screenshot", .{ .object = params });
     }
 
     /// Kill (gracefully close) the named profile's browser.
     /// The profile directory is preserved for next launch.
     pub fn kill(self: *Client, profile: []const u8) !gateway.ParsedResponse {
-        var params = json.ObjectMap.init(self.allocator);
-        defer params.deinit();
-        try params.put("profile", .{ .string = profile });
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
+        try params.put(self.allocator, "profile", .{ .string = profile });
         return self.gw.call("browser.kill", .{ .object = params });
     }
 
     /// Get the current URL of the named profile's active tab.
     pub fn getUrl(self: *Client, profile: []const u8) !gateway.ParsedResponse {
-        var params = json.ObjectMap.init(self.allocator);
-        defer params.deinit();
-        try params.put("profile", .{ .string = profile });
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
+        try params.put(self.allocator, "profile", .{ .string = profile });
         return self.gw.call("browser.url", .{ .object = params });
     }
 
     /// List tabs for a profile.
     pub fn tabList(self: *Client, profile: []const u8) !gateway.ParsedResponse {
-        var params = json.ObjectMap.init(self.allocator);
-        defer params.deinit();
-        try params.put("profile", .{ .string = profile });
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
+        try params.put(self.allocator, "profile", .{ .string = profile });
         return self.gw.call("tab.list", .{ .object = params });
     }
 
     /// Open a new tab in the named profile's browser.
     pub fn tabNew(self: *Client, profile: []const u8, tab_url: ?[]const u8) !gateway.ParsedResponse {
-        var params = json.ObjectMap.init(self.allocator);
-        defer params.deinit();
-        try params.put("profile", .{ .string = profile });
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
+        try params.put(self.allocator, "profile", .{ .string = profile });
         if (tab_url) |u| {
-            try params.put("url", .{ .string = u });
+            try params.put(self.allocator, "url", .{ .string = u });
         }
         return self.gw.call("tab.new", .{ .object = params });
     }
 
     /// Close a tab by index in the named profile's browser.
     pub fn tabClose(self: *Client, profile: []const u8, tab_index: u32) !gateway.ParsedResponse {
-        var params = json.ObjectMap.init(self.allocator);
-        defer params.deinit();
-        try params.put("profile", .{ .string = profile });
-        try params.put("tab", .{ .integer = @intCast(tab_index) });
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
+        try params.put(self.allocator, "profile", .{ .string = profile });
+        try params.put(self.allocator, "tab", .{ .integer = @intCast(tab_index) });
         return self.gw.call("tab.close", .{ .object = params });
     }
 
     /// Switch to (activate) a tab by index in the named profile's browser.
     pub fn tabSwitch(self: *Client, profile: []const u8, tab_index: u32) !gateway.ParsedResponse {
-        var params = json.ObjectMap.init(self.allocator);
-        defer params.deinit();
-        try params.put("profile", .{ .string = profile });
-        try params.put("tab", .{ .integer = @intCast(tab_index) });
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
+        try params.put(self.allocator, "profile", .{ .string = profile });
+        try params.put(self.allocator, "tab", .{ .integer = @intCast(tab_index) });
         return self.gw.call("tab.switch", .{ .object = params });
     }
 

@@ -11,6 +11,24 @@ const posix = std.posix;
 const builtin = @import("builtin");
 const process = @import("process.zig");
 
+/// Sleep for the given number of milliseconds. Zig 0.16 removed
+/// `std.Thread.sleep`; use libc `nanosleep` directly (macOS links libc).
+fn sleepMs(ms: u64) void {
+    const ts: std.c.timespec = .{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+    };
+    _ = std.c.nanosleep(&ts, null);
+}
+
+/// Read an environment variable and dupe its value. Zig 0.16 removed
+/// `std.process.getEnvVarOwned` (env access now goes through `Environ`); use
+/// libc `getenv` directly. Returns null if the variable is unset.
+fn getEnvOwned(allocator: mem.Allocator, name: [*:0]const u8) !?[]u8 {
+    const val = std.c.getenv(name) orelse return null;
+    return try allocator.dupe(u8, mem.span(val));
+}
+
 /// Browser engine type.
 pub const BrowserType = enum {
     chrome,
@@ -75,35 +93,35 @@ const chromium_search_names_linux = [_][]const u8{
 /// Find the chromium binary path.
 /// Priority: HIBROW_BROWSER env var > platform-specific search.
 /// Caller owns the returned string.
-pub fn findChromium(allocator: mem.Allocator) ![]const u8 {
+pub fn findChromium(allocator: mem.Allocator, io: std.Io) ![]const u8 {
     // 1. Check HIBROW_BROWSER env var
-    if (std.process.getEnvVarOwned(allocator, "HIBROW_BROWSER")) |path| {
+    if (try getEnvOwned(allocator, "HIBROW_BROWSER")) |path| {
         return path;
-    } else |_| {}
+    }
 
     // 2. Platform-specific search
     if (builtin.os.tag == .macos) {
         for (chromium_search_paths_macos) |path| {
-            if (fs.accessAbsolute(path, .{})) |_| {
+            if (std.Io.Dir.accessAbsolute(io, path, .{})) |_| {
                 return try allocator.dupe(u8, path);
             } else |_| {}
         }
     } else if (builtin.os.tag == .linux) {
         // Search PATH for known chromium binary names
-        if (std.process.getEnvVarOwned(allocator, "PATH")) |path_env| {
+        if (try getEnvOwned(allocator, "PATH")) |path_env| {
             defer allocator.free(path_env);
             for (chromium_search_names_linux) |name| {
                 var it = mem.splitScalar(u8, path_env, ':');
                 while (it.next()) |dir| {
                     const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, name });
-                    if (fs.accessAbsolute(full_path, .{})) |_| {
+                    if (std.Io.Dir.accessAbsolute(io, full_path, .{})) |_| {
                         return full_path;
                     } else |_| {
                         allocator.free(full_path);
                     }
                 }
             }
-        } else |_| {}
+        }
     }
 
     return error.ChromiumNotFound;
@@ -125,35 +143,35 @@ const firefox_search_names_linux = [_][]const u8{
 /// Find the Firefox binary path.
 /// Priority: HIBROW_FIREFOX env var > platform-specific search.
 /// Caller owns the returned string.
-pub fn findFirefox(allocator: mem.Allocator) ![]const u8 {
+pub fn findFirefox(allocator: mem.Allocator, io: std.Io) ![]const u8 {
     // 1. Check HIBROW_FIREFOX env var
-    if (std.process.getEnvVarOwned(allocator, "HIBROW_FIREFOX")) |path| {
+    if (try getEnvOwned(allocator, "HIBROW_FIREFOX")) |path| {
         return path;
-    } else |_| {}
+    }
 
     // 2. Platform-specific search
     if (builtin.os.tag == .macos) {
         for (firefox_search_paths_macos) |path| {
-            if (fs.accessAbsolute(path, .{})) |_| {
+            if (std.Io.Dir.accessAbsolute(io, path, .{})) |_| {
                 return try allocator.dupe(u8, path);
             } else |_| {}
         }
     } else if (builtin.os.tag == .linux) {
         // Search PATH for known Firefox binary names
-        if (std.process.getEnvVarOwned(allocator, "PATH")) |path_env| {
+        if (try getEnvOwned(allocator, "PATH")) |path_env| {
             defer allocator.free(path_env);
             for (firefox_search_names_linux) |name| {
                 var it = mem.splitScalar(u8, path_env, ':');
                 while (it.next()) |dir| {
                     const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, name });
-                    if (fs.accessAbsolute(full_path, .{})) |_| {
+                    if (std.Io.Dir.accessAbsolute(io, full_path, .{})) |_| {
                         return full_path;
                     } else |_| {
                         allocator.free(full_path);
                     }
                 }
             }
-        } else |_| {}
+        }
     }
 
     return error.FirefoxNotFound;
@@ -165,30 +183,30 @@ pub fn findFirefox(allocator: mem.Allocator) ![]const u8 {
 
 /// Launch a new browser instance with the given options.
 /// Returns the Browser info once the instance is responsive.
-pub fn launch(allocator: mem.Allocator, options: LaunchOptions) !Browser {
+pub fn launch(allocator: mem.Allocator, io: std.Io, options: LaunchOptions) !Browser {
     return switch (options.browser_type) {
-        .chrome => launchChrome(allocator, options),
-        .firefox => launchFirefox(allocator, options),
+        .chrome => launchChrome(allocator, io, options),
+        .firefox => launchFirefox(allocator, io, options),
     };
 }
 
 /// Launch a Chrome instance.
-fn launchChrome(allocator: mem.Allocator, options: LaunchOptions) !Browser {
-    const chrome = try findChromium(allocator);
+fn launchChrome(allocator: mem.Allocator, io: std.Io, options: LaunchOptions) !Browser {
+    const chrome = try findChromium(allocator, io);
     defer allocator.free(chrome);
 
     // Resolve port from our dedicated range
-    const port: u16 = if (options.port == 0) try findFreePortInRangeFor(.chrome) else options.port;
+    const port: u16 = if (options.port == 0) try findFreePortInRangeFor(io, .chrome) else options.port;
 
     // Resolve profile directory
     const profile_dir = try getProfileDir(allocator, options.profile);
     defer allocator.free(profile_dir);
 
     // Create profile dir if it does not exist
-    ensureDirExists(profile_dir) catch {};
+    ensureDirExists(io, profile_dir) catch {};
 
     // Build argv
-    var argv_list: std.ArrayList([]const u8) = .{};
+    var argv_list: std.ArrayList([]const u8) = .empty;
     defer argv_list.deinit(allocator);
 
     try argv_list.append(allocator, chrome);
@@ -220,23 +238,23 @@ fn launchChrome(allocator: mem.Allocator, options: LaunchOptions) !Browser {
     try argv_list.append(allocator, "about:blank");
 
     // Spawn the browser process
-    var child = std.process.Child.init(argv_list.items, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    // pgid = 0 → create new process group (setsid equivalent)
-    child.pgid = 0;
-
-    try child.spawn();
-    const pid = child.id;
+    // pgid = 0 → new process group (setsid equivalent); stdio to /dev/null.
+    const child = try std.process.spawn(io, .{
+        .argv = argv_list.items,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    const pid = child.id.?;
 
     // Wait for CDP to become responsive (poll with TCP connect, then verify HTTP)
     var attempts: u32 = 0;
     while (attempts < 100) : (attempts += 1) {
         // Quick TCP probe first (cheap)
-        if (tcpProbe(port)) {
+        if (tcpProbe(io, port)) {
             // TCP is open — now verify CDP responds over HTTP
-            if (verify(allocator, port) catch false) {
+            if (verify(allocator, io, port) catch false) {
                 const pid_slice = try allocator.alloc(posix.pid_t, 1);
                 pid_slice[0] = pid;
                 return .{
@@ -248,32 +266,32 @@ fn launchChrome(allocator: mem.Allocator, options: LaunchOptions) !Browser {
                 };
             }
         }
-        std.Thread.sleep(100 * std.time.ns_per_ms); // 100ms between attempts
+        sleepMs(100); // 100ms between attempts
     }
 
     return error.BrowserStartupTimeout;
 }
 
 /// Launch a Firefox instance.
-fn launchFirefox(allocator: mem.Allocator, options: LaunchOptions) !Browser {
-    const firefox = try findFirefox(allocator);
+fn launchFirefox(allocator: mem.Allocator, io: std.Io, options: LaunchOptions) !Browser {
+    const firefox = try findFirefox(allocator, io);
     defer allocator.free(firefox);
 
     // Resolve port from Firefox-dedicated range
-    const port: u16 = if (options.port == 0) try findFreePortInRangeFor(.firefox) else options.port;
+    const port: u16 = if (options.port == 0) try findFreePortInRangeFor(io, .firefox) else options.port;
 
     // Resolve profile directory (same structure as Chrome)
     const profile_dir = try getProfileDir(allocator, options.profile);
     defer allocator.free(profile_dir);
 
     // Create profile dir if it does not exist
-    ensureDirExists(profile_dir) catch {};
+    ensureDirExists(io, profile_dir) catch {};
 
     // Write user.js with Marionette prefs before launch
-    try writeFirefoxPrefs(allocator, profile_dir, port);
+    try writeFirefoxPrefs(allocator, io, profile_dir, port);
 
     // Build argv
-    var argv_list: std.ArrayList([]const u8) = .{};
+    var argv_list: std.ArrayList([]const u8) = .empty;
     defer argv_list.deinit(allocator);
 
     try argv_list.append(allocator, firefox);
@@ -284,21 +302,21 @@ fn launchFirefox(allocator: mem.Allocator, options: LaunchOptions) !Browser {
     try argv_list.append(allocator, profile_dir);
 
     // Spawn the browser process
-    var child = std.process.Child.init(argv_list.items, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.pgid = 0;
-
-    try child.spawn();
-    const pid = child.id;
+    const child = try std.process.spawn(io, .{
+        .argv = argv_list.items,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    const pid = child.id.?;
 
     // Wait for Marionette TCP port to accept connections.
     // Unlike Chrome (which needs HTTP verify), Marionette sends a handshake
     // on connect — so TCP open means ready.
     var attempts: u32 = 0;
     while (attempts < 100) : (attempts += 1) {
-        if (tcpProbe(port)) {
+        if (tcpProbe(io, port)) {
             const pid_slice = try allocator.alloc(posix.pid_t, 1);
             pid_slice[0] = pid;
             return .{
@@ -309,14 +327,14 @@ fn launchFirefox(allocator: mem.Allocator, options: LaunchOptions) !Browser {
                 .browser_type = .firefox,
             };
         }
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        sleepMs(100);
     }
 
     return error.BrowserStartupTimeout;
 }
 
 /// Write Firefox user.js with Marionette port and essential prefs.
-fn writeFirefoxPrefs(allocator: mem.Allocator, profile_dir: []const u8, port: u16) !void {
+fn writeFirefoxPrefs(allocator: mem.Allocator, io: std.Io, profile_dir: []const u8, port: u16) !void {
     const prefs_path = try std.fmt.allocPrint(allocator, "{s}/user.js", .{profile_dir});
     defer allocator.free(prefs_path);
 
@@ -346,9 +364,9 @@ fn writeFirefoxPrefs(allocator: mem.Allocator, profile_dir: []const u8, port: u1
     , .{port});
     defer allocator.free(prefs_content);
 
-    const file = try fs.cwd().createFile(prefs_path, .{});
-    defer file.close();
-    try file.writeAll(prefs_content);
+    const file = try std.Io.Dir.cwd().createFile(io, prefs_path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, prefs_content);
 }
 
 // ---------------------------------------------------------------------------
@@ -366,12 +384,12 @@ pub const firefox_port_range_start: u16 = 9800;
 pub const firefox_port_range_end: u16 = 9900;
 
 /// Find the next free port in the CDP range by probing each one.
-pub fn findFreePortInRange() !u16 {
-    return findFreePortInRangeFor(.chrome);
+pub fn findFreePortInRange(io: std.Io) !u16 {
+    return findFreePortInRangeFor(io, .chrome);
 }
 
 /// Find the next free port in the appropriate range for the given browser type.
-pub fn findFreePortInRangeFor(browser_type: BrowserType) !u16 {
+pub fn findFreePortInRangeFor(io: std.Io, browser_type: BrowserType) !u16 {
     const start = switch (browser_type) {
         .chrome => port_range_start,
         .firefox => firefox_port_range_start,
@@ -382,7 +400,7 @@ pub fn findFreePortInRangeFor(browser_type: BrowserType) !u16 {
     };
     var port: u16 = start;
     while (port < end) : (port += 1) {
-        if (!tcpProbe(port)) return port;
+        if (!tcpProbe(io, port)) return port;
     }
     return error.NoFreePorts;
 }
@@ -394,12 +412,12 @@ pub fn findFreePortInRangeFor(browser_type: BrowserType) !u16 {
 /// Discover running browsers (Chrome and Firefox) by scanning process args.
 /// Groups multiple processes with the same port into a single Browser entry.
 /// Caller owns the returned slice. Free with freeBrowsers().
-pub fn discover(allocator: mem.Allocator) ![]Browser {
-    const procs = try process.findChromeBrowsers(allocator);
+pub fn discover(allocator: mem.Allocator, io: std.Io) ![]Browser {
+    const procs = try process.findChromeBrowsers(allocator, io);
     defer process.freeDiscovered(allocator, procs);
 
     // Group by port — multiple Chrome processes share the same port
-    var browsers: std.ArrayList(Browser) = .{};
+    var browsers: std.ArrayList(Browser) = .empty;
     errdefer {
         for (browsers.items) |b| {
             allocator.free(b.profile);
@@ -453,8 +471,8 @@ pub fn freeBrowsers(allocator: mem.Allocator, browsers: []Browser) void {
 
 /// Look up a browser's CDP port by scanning processes for the given profile.
 /// Returns null if no process found with that profile name.
-pub fn lookupPort(allocator: mem.Allocator, profile: []const u8) !?u16 {
-    const procs = process.findChromeBrowsers(allocator) catch return null;
+pub fn lookupPort(allocator: mem.Allocator, io: std.Io, profile: []const u8) !?u16 {
+    const procs = process.findChromeBrowsers(allocator, io) catch return null;
     defer process.freeDiscovered(allocator, procs);
 
     for (procs) |p| {
@@ -471,19 +489,19 @@ pub fn lookupPort(allocator: mem.Allocator, profile: []const u8) !?u16 {
 
 /// Quick TCP connect probe — returns true if the port is accepting connections.
 /// Much cheaper than a full HTTP request for polling.
-pub fn tcpProbe(port: u16) bool {
-    const addr = std.net.Address.resolveIp("127.0.0.1", port) catch return false;
-    const stream = std.net.tcpConnectToAddress(addr) catch return false;
-    stream.close();
+pub fn tcpProbe(io: std.Io, port: u16) bool {
+    var addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+    const stream = addr.connect(io, .{ .mode = .stream }) catch return false;
+    stream.close(io);
     return true;
 }
 
-pub fn verify(allocator: mem.Allocator, port: u16) !bool {
+pub fn verify(allocator: mem.Allocator, io: std.Io, port: u16) !bool {
     var url_buf: [64]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/json/version", .{port});
     const uri = std.Uri.parse(url) catch return false;
 
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();
 
     const result = client.fetch(.{
@@ -510,12 +528,12 @@ pub fn getProfileDir(allocator: mem.Allocator, profile: []const u8) ![]u8 {
 // ---------------------------------------------------------------------------
 
 fn getHomeDir(allocator: mem.Allocator) ![]u8 {
-    return std.process.getEnvVarOwned(allocator, "HOME") catch error.NoHomeDir;
+    return (try getEnvOwned(allocator, "HOME")) orelse error.NoHomeDir;
 }
 
-fn ensureDirExists(path: []const u8) !void {
+fn ensureDirExists(io: std.Io, path: []const u8) !void {
     // Try to create the full directory tree
-    fs.cwd().makePath(path) catch |err| {
+    std.Io.Dir.cwd().createDirPath(io, path) catch |err| {
         if (err == error.PathAlreadyExists) return;
         return err;
     };
@@ -552,14 +570,20 @@ test "LaunchOptions defaults" {
 }
 
 test "findFreePortInRange returns port in range" {
-    const port = try findFreePortInRange();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const port = try findFreePortInRange(io);
     try std.testing.expect(port >= port_range_start);
     try std.testing.expect(port < port_range_end);
 }
 
 test "tcpProbe returns false for unused port" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     // Port 9421 is very unlikely to be in use
-    try std.testing.expect(!tcpProbe(9421));
+    try std.testing.expect(!tcpProbe(io, 9421));
 }
 
 test "BrowserType toString and fromString" {
@@ -593,11 +617,14 @@ test "Firefox port range constants" {
 }
 
 test "findFreePortInRangeFor returns port in correct range" {
-    const chrome_port = try findFreePortInRangeFor(.chrome);
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const chrome_port = try findFreePortInRangeFor(io, .chrome);
     try std.testing.expect(chrome_port >= port_range_start);
     try std.testing.expect(chrome_port < port_range_end);
 
-    const ff_port = try findFreePortInRangeFor(.firefox);
+    const ff_port = try findFreePortInRangeFor(io, .firefox);
     try std.testing.expect(ff_port >= firefox_port_range_start);
     try std.testing.expect(ff_port < firefox_port_range_end);
 }
@@ -614,13 +641,17 @@ test "getProfileDir contains profile name" {
 
 test "lookupPort returns null for nonexistent profile" {
     const allocator = std.testing.allocator;
-    const result = try lookupPort(allocator, "nonexistent-profile-xyz");
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const result = try lookupPort(allocator, threaded.io(), "nonexistent-profile-xyz");
     try std.testing.expect(result == null);
 }
 
 test "discover returns a slice" {
     const allocator = std.testing.allocator;
-    const browsers = try discover(allocator);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const browsers = try discover(allocator, threaded.io());
     defer freeBrowsers(allocator, browsers);
     // Just verify it does not crash — may return 0 if no Chrome running
     _ = browsers.len;

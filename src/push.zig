@@ -20,15 +20,15 @@ pub const PushError = error{
 };
 
 /// Helper: connect, eval, disconnect. Each call is a fresh connection.
-fn evalOnce(allocator: mem.Allocator, profile: []const u8, expression: []const u8) !gateway.ParsedResponse {
-    var client = try hibrow.Client.connect(allocator);
+fn evalOnce(allocator: mem.Allocator, io: std.Io, profile: []const u8, expression: []const u8) !gateway.ParsedResponse {
+    var client = try hibrow.Client.connect(allocator, io);
     defer client.disconnect();
     return client.eval(profile, expression);
 }
 
 /// Push content into the browser at the given target.
 /// Target is either a "window.*" variable name or a CSS selector.
-pub fn push(allocator: mem.Allocator, profile: []const u8, target: []const u8, content: []const u8) !void {
+pub fn push(allocator: mem.Allocator, io: std.Io, profile: []const u8, target: []const u8, content: []const u8) !void {
     const is_variable = mem.startsWith(u8, target, "window.");
 
     if (content.len <= CHUNK_SIZE) {
@@ -42,7 +42,7 @@ pub fn push(allocator: mem.Allocator, profile: []const u8, target: []const u8, c
             try buildSelectorJs(allocator, target, content_json);
         defer allocator.free(js);
 
-        var resp = try evalOnce(allocator, profile, js);
+        var resp = try evalOnce(allocator, io, profile, js);
         defer resp.deinit();
         if (resp.is_error) return PushError.EvalFailed;
     } else {
@@ -51,7 +51,7 @@ pub fn push(allocator: mem.Allocator, profile: []const u8, target: []const u8, c
 
         // Initialize the buffer array
         {
-            var resp = try evalOnce(allocator, profile, "window.__hibrowPushBuf = []; 'ok'");
+            var resp = try evalOnce(allocator, io, profile, "window.__hibrowPushBuf = []; 'ok'");
             defer resp.deinit();
             if (resp.is_error) return PushError.EvalFailed;
         }
@@ -68,7 +68,7 @@ pub fn push(allocator: mem.Allocator, profile: []const u8, target: []const u8, c
             const chunk_js = try std.fmt.allocPrint(allocator, "window.__hibrowPushBuf.push({s}); 'ok'", .{chunk_json});
             defer allocator.free(chunk_js);
 
-            var resp = try evalOnce(allocator, profile, chunk_js);
+            var resp = try evalOnce(allocator, io, profile, chunk_js);
             defer resp.deinit();
             if (resp.is_error) return PushError.EvalFailed;
         }
@@ -81,12 +81,12 @@ pub fn push(allocator: mem.Allocator, profile: []const u8, target: []const u8, c
             try buildSelectorJs(allocator, target, concat_expr);
         defer allocator.free(final_js);
 
-        var resp = try evalOnce(allocator, profile, final_js);
+        var resp = try evalOnce(allocator, io, profile, final_js);
         defer resp.deinit();
         if (resp.is_error) return PushError.EvalFailed;
 
         // Clean up temp
-        var cleanup = try evalOnce(allocator, profile, "delete window.__hibrowPushBuf; 'ok'");
+        var cleanup = try evalOnce(allocator, io, profile, "delete window.__hibrowPushBuf; 'ok'");
         defer cleanup.deinit();
     }
 }

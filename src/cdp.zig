@@ -79,10 +79,10 @@ pub fn parseWsUrl(url: []const u8) !WsUrl {
 
 /// Discover targets by hitting http://127.0.0.1:{port}/json.
 /// Caller owns the returned slice and all strings within. Free with freeTargets().
-pub fn discoverTargets(allocator: mem.Allocator, port: u16) ![]Target {
+pub fn discoverTargets(allocator: mem.Allocator, io: std.Io, port: u16) ![]Target {
     var url_buf: [64]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/json", .{port});
-    const body = try httpGet(allocator, url);
+    const body = try httpGet(allocator, io, url);
     defer allocator.free(body);
 
     // Parse JSON array
@@ -92,7 +92,7 @@ pub fn discoverTargets(allocator: mem.Allocator, port: u16) ![]Target {
     if (parsed.value != .array) return error.InvalidResponse;
     const arr = parsed.value.array;
 
-    var targets: std.ArrayList(Target) = .{};
+    var targets: std.ArrayList(Target) = .empty;
     defer targets.deinit(allocator);
 
     for (arr.items) |item| {
@@ -140,10 +140,10 @@ pub fn freeTargets(allocator: mem.Allocator, targets: []Target) void {
 
 /// Get browser version info from http://127.0.0.1:{port}/json/version.
 /// Caller owns all strings in the returned struct. Free with freeVersionInfo().
-pub fn getVersion(allocator: mem.Allocator, port: u16) !VersionInfo {
+pub fn getVersion(allocator: mem.Allocator, io: std.Io, port: u16) !VersionInfo {
     var url_buf: [64]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/json/version", .{port});
-    const body = try httpGet(allocator, url);
+    const body = try httpGet(allocator, io, url);
     defer allocator.free(body);
 
     const parsed = try json.parseFromSlice(json.Value, allocator, body, .{});
@@ -186,10 +186,10 @@ pub const Connection = struct {
     /// Next message ID (CDP uses incrementing integers).
     next_id: u64 = 1,
 
-    pub fn init(allocator: mem.Allocator) Connection {
+    pub fn init(allocator: mem.Allocator, io: std.Io) Connection {
         return .{
             .allocator = allocator,
-            .ws = websocket.WebSocket.init(allocator),
+            .ws = websocket.WebSocket.init(allocator, io),
         };
     }
 
@@ -259,10 +259,10 @@ pub const Connection = struct {
     /// Evaluate JavaScript in the connected target.
     pub fn eval(self: *Connection, expression: []const u8) !EvalResult {
         // Build params: {"expression": ..., "returnByValue": true}
-        var params_obj = json.ObjectMap.init(self.allocator);
-        defer params_obj.deinit();
-        try params_obj.put("expression", .{ .string = expression });
-        try params_obj.put("returnByValue", .{ .bool = true });
+        var params_obj: json.ObjectMap = .empty;
+        defer params_obj.deinit(self.allocator);
+        try params_obj.put(self.allocator, "expression", .{ .string = expression });
+        try params_obj.put(self.allocator, "returnByValue", .{ .bool = true });
 
         var cdp_result = try self.send("Runtime.evaluate", .{ .object = params_obj });
         defer cdp_result.deinit();
@@ -301,9 +301,9 @@ pub const Connection = struct {
 
     /// Navigate the connected target to a URL.
     pub fn navigate(self: *Connection, url: []const u8) !void {
-        var params_obj = json.ObjectMap.init(self.allocator);
-        defer params_obj.deinit();
-        try params_obj.put("url", .{ .string = url });
+        var params_obj: json.ObjectMap = .empty;
+        defer params_obj.deinit(self.allocator);
+        try params_obj.put(self.allocator, "url", .{ .string = url });
 
         var cdp_result = try self.send("Page.navigate", .{ .object = params_obj });
         defer cdp_result.deinit();
@@ -320,9 +320,9 @@ pub const Connection = struct {
     /// Get the current URL of the connected target.
     pub fn getUrl(self: *Connection) ![]u8 {
         var cdp_result = try self.send("Runtime.evaluate", blk: {
-            var params_obj = json.ObjectMap.init(self.allocator);
-            try params_obj.put("expression", .{ .string = "window.location.href" });
-            try params_obj.put("returnByValue", .{ .bool = true });
+            var params_obj: json.ObjectMap = .empty;
+            try params_obj.put(self.allocator, "expression", .{ .string = "window.location.href" });
+            try params_obj.put(self.allocator, "returnByValue", .{ .bool = true });
             break :blk .{ .object = params_obj };
         });
         defer cdp_result.deinit();
@@ -371,18 +371,18 @@ pub const Connection = struct {
         }
 
         // Capture with clip covering full content
-        var clip = json.ObjectMap.init(self.allocator);
-        defer clip.deinit();
-        try clip.put("x", .{ .integer = 0 });
-        try clip.put("y", .{ .integer = 0 });
-        try clip.put("width", .{ .float = width });
-        try clip.put("height", .{ .float = height });
-        try clip.put("scale", .{ .integer = 1 });
+        var clip: json.ObjectMap = .empty;
+        defer clip.deinit(self.allocator);
+        try clip.put(self.allocator, "x", .{ .integer = 0 });
+        try clip.put(self.allocator, "y", .{ .integer = 0 });
+        try clip.put(self.allocator, "width", .{ .float = width });
+        try clip.put(self.allocator, "height", .{ .float = height });
+        try clip.put(self.allocator, "scale", .{ .integer = 1 });
 
-        var params = json.ObjectMap.init(self.allocator);
-        defer params.deinit();
-        try params.put("clip", .{ .object = clip });
-        try params.put("captureBeyondViewport", .{ .bool = true });
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
+        try params.put(self.allocator, "clip", .{ .object = clip });
+        try params.put(self.allocator, "captureBeyondViewport", .{ .bool = true });
 
         var cdp_result = try self.send("Page.captureScreenshot", .{ .object = params });
         defer cdp_result.deinit();
@@ -406,14 +406,14 @@ pub const Connection = struct {
 /// Create a new tab/target via PUT /json/new?{url}.
 /// Returns the new target info. Caller owns the Target; free with freeTargets() on a one-element slice
 /// or manually free each string.
-pub fn createTarget(allocator: mem.Allocator, port: u16, url: ?[]const u8) !Target {
+pub fn createTarget(allocator: mem.Allocator, io: std.Io, port: u16, url: ?[]const u8) !Target {
     var url_buf: [2048]u8 = undefined;
     const request_url = if (url) |u|
         try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/json/new?{s}", .{ port, u })
     else
         try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/json/new", .{port});
 
-    const body = try httpPut(allocator, request_url);
+    const body = try httpPut(allocator, io, request_url);
     defer allocator.free(body);
 
     const parsed = try json.parseFromSlice(json.Value, allocator, body, .{});
@@ -447,21 +447,21 @@ pub fn createTarget(allocator: mem.Allocator, port: u16, url: ?[]const u8) !Targ
 }
 
 /// Close a target/tab via GET /json/close/{targetId}.
-pub fn closeTarget(allocator: mem.Allocator, port: u16, target_id: []const u8) !void {
+pub fn closeTarget(allocator: mem.Allocator, io: std.Io, port: u16, target_id: []const u8) !void {
     var url_buf: [256]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/json/close/{s}", .{ port, target_id });
 
-    const body = try httpGet(allocator, url);
+    const body = try httpGet(allocator, io, url);
     defer allocator.free(body);
     // Chrome returns "Target is closing" on success
 }
 
 /// Activate (focus) a target/tab via GET /json/activate/{targetId}.
-pub fn activateTarget(allocator: mem.Allocator, port: u16, target_id: []const u8) !void {
+pub fn activateTarget(allocator: mem.Allocator, io: std.Io, port: u16, target_id: []const u8) !void {
     var url_buf: [256]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/json/activate/{s}", .{ port, target_id });
 
-    const body = try httpGet(allocator, url);
+    const body = try httpGet(allocator, io, url);
     defer allocator.free(body);
     // Chrome returns "Target activated" on success
 }
@@ -473,12 +473,12 @@ pub fn activateTarget(allocator: mem.Allocator, port: u16, target_id: []const u8
 /// Build a CDP JSON message string.
 fn buildCdpMessage(allocator: mem.Allocator, id: u64, method: []const u8, params: ?json.Value) ![]u8 {
     // Build as json.Value manually for correct serialization
-    var msg_obj = json.ObjectMap.init(allocator);
-    defer msg_obj.deinit();
-    try msg_obj.put("id", .{ .integer = @intCast(id) });
-    try msg_obj.put("method", .{ .string = method });
+    var msg_obj: json.ObjectMap = .empty;
+    defer msg_obj.deinit(allocator);
+    try msg_obj.put(allocator, "id", .{ .integer = @intCast(id) });
+    try msg_obj.put(allocator, "method", .{ .string = method });
     if (params) |p| {
-        try msg_obj.put("params", p);
+        try msg_obj.put(allocator, "params", p);
     }
 
     return try json.Stringify.valueAlloc(allocator, json.Value{ .object = msg_obj }, .{});
@@ -502,10 +502,10 @@ fn cloneJsonValue(allocator: mem.Allocator, value: json.Value) !json.Value {
             break :blk .{ .array = new_arr };
         },
         .object => |obj| blk: {
-            var new_obj = json.ObjectMap.init(allocator);
+            var new_obj: json.ObjectMap = .empty;
             var it = obj.iterator();
             while (it.next()) |entry| {
-                try new_obj.put(try allocator.dupe(u8, entry.key_ptr.*), try cloneJsonValue(allocator, entry.value_ptr.*));
+                try new_obj.put(allocator, try allocator.dupe(u8, entry.key_ptr.*), try cloneJsonValue(allocator, entry.value_ptr.*));
             }
             break :blk .{ .object = new_obj };
         },
@@ -513,10 +513,10 @@ fn cloneJsonValue(allocator: mem.Allocator, value: json.Value) !json.Value {
 }
 
 /// HTTP GET a URL and return the body as an allocated string.
-fn httpGet(allocator: mem.Allocator, url: []const u8) ![]u8 {
+fn httpGet(allocator: mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
     const uri = try std.Uri.parse(url);
 
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();
 
     var body_writer = std.Io.Writer.Allocating.init(allocator);
@@ -533,10 +533,10 @@ fn httpGet(allocator: mem.Allocator, url: []const u8) ![]u8 {
 
 /// HTTP PUT a URL and return the body as an allocated string.
 /// Chrome requires PUT for /json/new (GET returns 404 on modern versions).
-fn httpPut(allocator: mem.Allocator, url: []const u8) ![]u8 {
+fn httpPut(allocator: mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
     const uri = try std.Uri.parse(url);
 
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();
 
     var body_writer = std.Io.Writer.Allocating.init(allocator);
@@ -581,7 +581,9 @@ test "Target struct has expected fields" {
 
 test "Connection initializes with id 1" {
     const allocator = std.testing.allocator;
-    var conn = Connection.init(allocator);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    var conn = Connection.init(allocator, threaded.io());
     defer conn.deinit();
     try std.testing.expectEqual(@as(u64, 1), conn.next_id);
 }
@@ -637,9 +639,9 @@ test "buildCdpMessage produces valid JSON" {
 test "buildCdpMessage with params" {
     const allocator = std.testing.allocator;
 
-    var params = json.ObjectMap.init(allocator);
-    defer params.deinit();
-    try params.put("expression", .{ .string = "1+1" });
+    var params: json.ObjectMap = .empty;
+    defer params.deinit(allocator);
+    try params.put(allocator, "expression", .{ .string = "1+1" });
 
     const msg = try buildCdpMessage(allocator, 5, "Runtime.evaluate", .{ .object = params });
     defer allocator.free(msg);

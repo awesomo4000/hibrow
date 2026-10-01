@@ -8,8 +8,39 @@
 ///! The WebSocket struct wraps them with stream I/O for real connections.
 const std = @import("std");
 const mem = std.mem;
-const net = std.net;
+const posix = std.posix;
 const crypto = std.crypto;
+
+/// The 0.16 network stream type.
+const Stream = std.Io.net.Stream;
+
+/// Raw blocking read from the stream's socket fd (fds from the Io backend are
+/// blocking, so raw posix I/O matches the pre-0.16 Stream.read semantics).
+fn streamRead(stream: Stream, buf: []u8) !usize {
+    return posix.read(stream.socket.handle, buf);
+}
+
+/// Write all bytes to the stream's socket fd, looping over partial writes.
+fn streamWriteAll(stream: Stream, bytes: []const u8) !void {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const rc = std.c.write(stream.socket.handle, bytes[i..].ptr, bytes.len - i);
+        if (rc <= 0) return error.WriteFailed;
+        i += @intCast(rc);
+    }
+}
+
+/// Resolve a host + port and open a blocking TCP stream. Handles the local
+/// CDP cases: a numeric IP, or "localhost" mapped to the loopback address.
+fn tcpConnect(io: std.Io, host: []const u8, port: u16) !Stream {
+    var addr = std.Io.net.IpAddress.parse(host, port) catch blk: {
+        if (mem.eql(u8, host, "localhost")) {
+            break :blk std.Io.net.IpAddress{ .ip4 = .loopback(port) };
+        }
+        return error.UnknownHostName;
+    };
+    return addr.connect(io, .{ .mode = .stream });
+}
 
 /// WebSocket opcodes (RFC 6455 §5.2).
 pub const Opcode = enum(u4) {
@@ -50,7 +81,7 @@ const ws_magic_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 /// Generate a random 4-byte masking key.
 pub fn generateMaskingKey() [4]u8 {
     var key: [4]u8 = undefined;
-    crypto.random.bytes(&key);
+    std.c.arc4random_buf(&key, key.len);
     return key;
 }
 
@@ -81,7 +112,7 @@ pub fn computeAcceptKey(client_key: []const u8) [28]u8 {
 /// Used as Sec-WebSocket-Key in the upgrade handshake.
 pub fn generateClientKey() [24]u8 {
     var nonce: [16]u8 = undefined;
-    crypto.random.bytes(&nonce);
+    std.c.arc4random_buf(&nonce, nonce.len);
     var result: [24]u8 = undefined;
     _ = std.base64.standard.Encoder.encode(&result, &nonce);
     return result;
@@ -268,11 +299,12 @@ pub fn decodeFrameAlloc(allocator: mem.Allocator, data: []const u8) !struct { fr
 /// WebSocket connection state.
 pub const WebSocket = struct {
     allocator: mem.Allocator,
-    stream: ?net.Stream = null,
+    io: std.Io,
+    stream: ?Stream = null,
     connected: bool = false,
 
-    pub fn init(allocator: mem.Allocator) WebSocket {
-        return .{ .allocator = allocator };
+    pub fn init(allocator: mem.Allocator, io: std.Io) WebSocket {
+        return .{ .allocator = allocator, .io = io };
     }
 
     pub fn deinit(self: *WebSocket) void {
@@ -282,9 +314,9 @@ pub const WebSocket = struct {
     /// Perform HTTP upgrade handshake and establish WebSocket connection.
     pub fn connect(self: *WebSocket, host: []const u8, port: u16, path: []const u8) !void {
         // TCP connect
-        self.stream = try net.tcpConnectToHost(self.allocator, host, port);
+        self.stream = try tcpConnect(self.io, host, port);
         errdefer {
-            if (self.stream) |s| s.close();
+            if (self.stream) |s| s.close(self.io);
             self.stream = null;
         }
 
@@ -305,13 +337,13 @@ pub const WebSocket = struct {
             "\r\n",
             .{ path, host, port, &client_key },
         );
-        try stream.writeAll(request);
+        try streamWriteAll(stream, request);
 
         // Read HTTP response headers
         var resp_buf: [4096]u8 = undefined;
         var resp_len: usize = 0;
         while (resp_len < resp_buf.len) {
-            const n = try stream.read(resp_buf[resp_len..]);
+            const n = try streamRead(stream, resp_buf[resp_len..]);
             if (n == 0) return error.ConnectionClosed;
             resp_len += n;
             // Check for end of headers
@@ -348,12 +380,12 @@ pub const WebSocket = struct {
 
         // Read into a dynamic buffer that grows as needed (no fixed size limit).
         // Previous fixed 64KB buffer silently truncated large CDP responses.
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(self.allocator);
 
         var read_buf: [8192]u8 = undefined;
         while (true) {
-            const n = try stream.read(&read_buf);
+            const n = try streamRead(stream, &read_buf);
             if (n == 0) {
                 buf.deinit(self.allocator);
                 return error.ConnectionClosed;
@@ -418,10 +450,10 @@ pub const WebSocket = struct {
                 var close_buf: [14]u8 = undefined; // 2 header + 4 mask + up to 8 payload
                 const close_frame = encodeFrame(&close_buf, .close, &.{}, true) catch null;
                 if (close_frame) |frame| {
-                    stream.writeAll(frame) catch {};
+                    streamWriteAll(stream, frame) catch {};
                 }
             }
-            stream.close();
+            stream.close(self.io);
             self.stream = null;
         }
         self.connected = false;
@@ -438,7 +470,7 @@ pub const WebSocket = struct {
         defer self.allocator.free(buf);
 
         const frame_bytes = try encodeFrame(buf, opcode, payload, true);
-        try stream.writeAll(frame_bytes);
+        try streamWriteAll(stream, frame_bytes);
     }
 };
 
@@ -470,7 +502,9 @@ test "applyMask is its own inverse" {
 
 test "WebSocket init and deinit" {
     const allocator = std.testing.allocator;
-    var ws = WebSocket.init(allocator);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    var ws = WebSocket.init(allocator, threaded.io());
     defer ws.deinit();
     try std.testing.expect(!ws.connected);
     try std.testing.expect(ws.stream == null);

@@ -26,9 +26,9 @@ pub const DiscoveredProcess = struct {
 /// Find all Chrome processes with --remote-debugging-port in their args.
 /// Caller owns the returned slice and all strings within it.
 /// Free with freeDiscovered().
-pub fn findChromeBrowsers(allocator: mem.Allocator) ![]DiscoveredProcess {
+pub fn findChromeBrowsers(allocator: mem.Allocator, io: std.Io) ![]DiscoveredProcess {
     if (comptime builtin.os.tag == .macos) {
-        return findBrowsersMacOS(allocator);
+        return findBrowsersMacOS(allocator, io);
     } else {
         // Linux: TODO — use /proc/PID/cmdline
         return &[_]DiscoveredProcess{};
@@ -69,12 +69,12 @@ extern "c" fn proc_listpids(
 const CTL_KERN: c_int = 1;
 const KERN_PROCARGS2: c_int = 49;
 
-fn findBrowsersMacOS(allocator: mem.Allocator) ![]DiscoveredProcess {
+fn findBrowsersMacOS(allocator: mem.Allocator, io: std.Io) ![]DiscoveredProcess {
     // Step 1: Get list of all PIDs
     const pids = try listAllPids(allocator);
     defer allocator.free(pids);
 
-    var results: std.ArrayList(DiscoveredProcess) = .{};
+    var results: std.ArrayList(DiscoveredProcess) = .empty;
     errdefer {
         for (results.items) |p| allocator.free(p.user_data_dir);
         results.deinit(allocator);
@@ -138,7 +138,7 @@ fn findBrowsersMacOS(allocator: mem.Allocator) ![]DiscoveredProcess {
                 const profile = std.fs.path.basename(pdir_owned);
 
                 // Read marionette port from user.js in profile dir
-                const m_port = readMarionettePort(allocator, pdir_owned) catch null;
+                const m_port = readMarionettePort(allocator, io, pdir_owned) catch null;
                 if (m_port) |port| {
                     try results.append(allocator, .{
                         .pid = pid,
@@ -159,11 +159,11 @@ fn findBrowsersMacOS(allocator: mem.Allocator) ![]DiscoveredProcess {
 
 /// Read the marionette.port value from a Firefox profile's user.js.
 /// Parses the line: user_pref("marionette.port", NNNN);
-fn readMarionettePort(allocator: mem.Allocator, profile_dir: []const u8) !?u16 {
+fn readMarionettePort(allocator: mem.Allocator, io: std.Io, profile_dir: []const u8) !?u16 {
     const prefs_path = try std.fmt.allocPrint(allocator, "{s}/user.js", .{profile_dir});
     defer allocator.free(prefs_path);
 
-    const content = std.fs.cwd().readFileAlloc(allocator, prefs_path, 1 << 16) catch return null;
+    const content = std.Io.Dir.cwd().readFileAlloc(io, prefs_path, allocator, .limited(1 << 16)) catch return null;
     defer allocator.free(content);
 
     // Look for: user_pref("marionette.port", NNNN);
@@ -260,7 +260,7 @@ fn getProcArgs(allocator: mem.Allocator, pid: posix.pid_t) !ProcArgs {
     while (pos < data.len and data[pos] == 0) : (pos += 1) {}
 
     // Now parse argc null-terminated strings
-    var argv_list: std.ArrayList([]const u8) = .{};
+    var argv_list: std.ArrayList([]const u8) = .empty;
     defer argv_list.deinit(allocator);
 
     var found: u32 = 0;
@@ -300,7 +300,9 @@ test "DiscoveredProcess struct has expected fields" {
 
 test "findChromeBrowsers returns a slice" {
     const allocator = std.testing.allocator;
-    const procs = try findChromeBrowsers(allocator);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const procs = try findChromeBrowsers(allocator, threaded.io());
     defer freeDiscovered(allocator, procs);
     // We just verify it does not crash — may return 0 if no Chrome running
     _ = procs.len;

@@ -34,8 +34,8 @@ pub const GrabResult = struct {
 };
 
 /// Helper: connect, eval, disconnect. Each call is a fresh connection.
-fn evalOnce(allocator: mem.Allocator, profile: []const u8, expression: []const u8) !gateway.ParsedResponse {
-    var client = try hibrow.Client.connect(allocator);
+fn evalOnce(allocator: mem.Allocator, io: std.Io, profile: []const u8, expression: []const u8) !gateway.ParsedResponse {
+    var client = try hibrow.Client.connect(allocator, io);
     defer client.disconnect();
     return client.eval(profile, expression);
 }
@@ -43,14 +43,14 @@ fn evalOnce(allocator: mem.Allocator, profile: []const u8, expression: []const u
 /// Grab binary data from the browser.
 /// `source` is either a URL (http/https) or a JS expression returning base64.
 /// Returns decoded binary data. Caller owns the result.
-pub fn grab(allocator: mem.Allocator, profile: []const u8, source: []const u8) !GrabResult {
+pub fn grab(allocator: mem.Allocator, io: std.Io, profile: []const u8, source: []const u8) !GrabResult {
     // Generate the injection JS based on mode
     const inject_js = try buildInjectionJs(allocator, source);
     defer allocator.free(inject_js);
 
     // Step 1: Inject the fetch/eval + chunking script
     {
-        var resp = try evalOnce(allocator, profile, inject_js);
+        var resp = try evalOnce(allocator, io, profile, inject_js);
         defer resp.deinit();
         if (resp.is_error) return GrabError.EvalFailed;
         if (resp.result != .string) return GrabError.EvalFailed;
@@ -63,10 +63,10 @@ pub fn grab(allocator: mem.Allocator, profile: []const u8, source: []const u8) !
     var elapsed: u64 = 0;
 
     while (elapsed < poll_timeout_ms) {
-        std.Thread.sleep(poll_interval_ms * std.time.ns_per_ms);
+        gateway.sleepMs(poll_interval_ms);
         elapsed += poll_interval_ms;
 
-        var resp = try evalOnce(allocator, profile, "window.__hibrowGrabStatus");
+        var resp = try evalOnce(allocator, io, profile, "window.__hibrowGrabStatus");
         defer resp.deinit();
         if (resp.is_error) continue;
         if (resp.result != .string) continue;
@@ -80,7 +80,7 @@ pub fn grab(allocator: mem.Allocator, profile: []const u8, source: []const u8) !
 
     // Step 3: Get chunk count
     const num_chunks: usize = blk: {
-        var resp = try evalOnce(allocator, profile, "window.__hibrowGrabChunks.length");
+        var resp = try evalOnce(allocator, io, profile, "window.__hibrowGrabChunks.length");
         defer resp.deinit();
         if (resp.is_error) return GrabError.EvalFailed;
         if (resp.result == .integer) break :blk @intCast(resp.result.integer);
@@ -90,7 +90,7 @@ pub fn grab(allocator: mem.Allocator, profile: []const u8, source: []const u8) !
     if (num_chunks == 0) return GrabError.NoData;
 
     // Step 4: Pull chunks
-    var b64_parts: std.ArrayList([]const u8) = .{};
+    var b64_parts: std.ArrayList([]const u8) = .empty;
     defer {
         for (b64_parts.items) |part| allocator.free(part);
         b64_parts.deinit(allocator);
@@ -100,7 +100,7 @@ pub fn grab(allocator: mem.Allocator, profile: []const u8, source: []const u8) !
         const chunk_js = try std.fmt.allocPrint(allocator, "window.__hibrowGrabChunks[{d}]", .{i});
         defer allocator.free(chunk_js);
 
-        var resp = try evalOnce(allocator, profile, chunk_js);
+        var resp = try evalOnce(allocator, io, profile, chunk_js);
         defer resp.deinit();
         if (resp.is_error) return GrabError.EvalFailed;
         if (resp.result != .string) return GrabError.EvalFailed;

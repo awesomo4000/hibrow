@@ -66,16 +66,20 @@ const usage =
 
 const version = "0.1.0";
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+/// Process-wide Io backend, set once in main(). Zig 0.16 routes all socket and
+/// file operations through an `Io` instance; the output helpers below use this,
+/// and it is passed explicitly into the hibrow library constructors.
+var g_io: std.Io = undefined;
 
-    var args = try std.process.argsWithAllocator(allocator);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    g_io = init.io;
+
+    var args = try init.minimal.args.iterateAllocator(allocator);
     defer args.deinit();
 
     // Skip argv[0] (program name)
-    _ = args.next();
+    _ = args.skip();
 
     const command = args.next() orelse {
         printUsage();
@@ -93,7 +97,7 @@ pub fn main() !void {
     }
 
     // Dispatch to command handlers
-    const Handler = *const fn (mem.Allocator, *std.process.ArgIterator) void;
+    const Handler = *const fn (mem.Allocator, *std.process.Args.Iterator) void;
     const commands = std.StaticStringMap(Handler).initComptime(.{
         .{ "launch", cmdLaunch },
         .{ "ls", cmdList },
@@ -128,7 +132,7 @@ fn writeStdout(comptime fmt: []const u8, fmt_args: anytype) void {
     // pos=0), which overwrite from the start of the file when stdout is
     // redirected to a regular file. Streaming uses write()/writev(), which
     // respects the kernel file offset and O_APPEND so output appends correctly.
-    var stdout_writer = std.fs.File.stdout().writerStreaming(&buf);
+    var stdout_writer = std.Io.File.stdout().writerStreaming(g_io, &buf);
     const stdout = &stdout_writer.interface;
     stdout.print(fmt, fmt_args) catch {};
     stdout.flush() catch {};
@@ -138,7 +142,7 @@ fn writeStderr(comptime fmt: []const u8, fmt_args: anytype) void {
     var buf: [4096]u8 = undefined;
     // Streaming mode for the same reason as writeStdout: avoid positional
     // pwrite-at-pos=0 clobbering when stderr is redirected to a file.
-    var stderr_writer = std.fs.File.stderr().writerStreaming(&buf);
+    var stderr_writer = std.Io.File.stderr().writerStreaming(g_io, &buf);
     const stderr = &stderr_writer.interface;
     stderr.print(fmt, fmt_args) catch {};
     stderr.flush() catch {};
@@ -158,7 +162,7 @@ fn printJsonValue(allocator: mem.Allocator, value: json.Value) void {
 // Command implementations
 // ---------------------------------------------------------------------------
 
-fn cmdLaunch(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
+fn cmdLaunch(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
     const profile = args.next() orelse {
         writeStderr("Error: launch requires a profile name\n", .{});
         std.process.exit(1);
@@ -191,7 +195,7 @@ fn cmdLaunch(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
         }
     }
 
-    var client = hibrow.Client.connect(allocator) catch |err| {
+    var client = hibrow.Client.connect(allocator, g_io) catch |err| {
         writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -215,10 +219,10 @@ fn cmdLaunch(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     printJsonValue(allocator, resp.result);
 }
 
-fn cmdList(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
+fn cmdList(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
     const profile = args.next();
 
-    var client = hibrow.Client.connect(allocator) catch |err| {
+    var client = hibrow.Client.connect(allocator, g_io) catch |err| {
         writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -253,7 +257,7 @@ fn cmdList(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     }
 }
 
-fn cmdNavigate(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
+fn cmdNavigate(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
     const target = args.next() orelse {
         writeStderr("Error: nav requires a profile[:tab] and URL\n", .{});
         std.process.exit(1);
@@ -266,7 +270,7 @@ fn cmdNavigate(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     // Parse profile from target (ignore :tab for now)
     const profile = parseProfile(target);
 
-    var client = hibrow.Client.connect(allocator) catch |err| {
+    var client = hibrow.Client.connect(allocator, g_io) catch |err| {
         writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -285,7 +289,7 @@ fn cmdNavigate(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     printJsonValue(allocator, resp.result);
 }
 
-fn cmdEval(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
+fn cmdEval(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
     const target = args.next() orelse {
         writeStderr("Error: eval requires a profile[:tab] and expression\n", .{});
         std.process.exit(1);
@@ -307,14 +311,16 @@ fn cmdEval(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
             writeStderr("Error: -f requires a filename\n", .{});
             std.process.exit(1);
         };
-        owned_expr = std.fs.cwd().readFileAlloc(allocator, filename, 1 << 20) catch |err| {
+        owned_expr = std.Io.Dir.cwd().readFileAlloc(g_io, filename, allocator, .limited(1 << 20)) catch |err| {
             writeStderr("Error: could not read file: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
         expression = owned_expr.?;
     } else if (mem.eql(u8, next_arg, "-f-")) {
         // Read from stdin
-        owned_expr = std.fs.File.stdin().readToEndAlloc(allocator, 1 << 20) catch |err| {
+        var stdin_buf: [4096]u8 = undefined;
+        var stdin_reader = std.Io.File.stdin().readerStreaming(g_io, &stdin_buf);
+        owned_expr = stdin_reader.interface.allocRemaining(allocator, .limited(1 << 20)) catch |err| {
             writeStderr("Error: could not read stdin: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
@@ -324,7 +330,7 @@ fn cmdEval(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     }
     defer if (owned_expr) |e| allocator.free(e);
 
-    var client = hibrow.Client.connect(allocator) catch |err| {
+    var client = hibrow.Client.connect(allocator, g_io) catch |err| {
         writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -343,13 +349,13 @@ fn cmdEval(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     printJsonValue(allocator, resp.result);
 }
 
-fn cmdKill(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
+fn cmdKill(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
     const profile = args.next() orelse {
         writeStderr("Error: kill requires a profile name\n", .{});
         std.process.exit(1);
     };
 
-    var client = hibrow.Client.connect(allocator) catch |err| {
+    var client = hibrow.Client.connect(allocator, g_io) catch |err| {
         writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -368,7 +374,7 @@ fn cmdKill(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     printJsonValue(allocator, resp.result);
 }
 
-fn cmdUrl(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
+fn cmdUrl(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
     const target = args.next() orelse {
         writeStderr("Error: url requires a profile[:tab]\n", .{});
         std.process.exit(1);
@@ -376,7 +382,7 @@ fn cmdUrl(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
 
     const profile = parseProfile(target);
 
-    var client = hibrow.Client.connect(allocator) catch |err| {
+    var client = hibrow.Client.connect(allocator, g_io) catch |err| {
         writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -401,7 +407,7 @@ fn cmdUrl(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     }
 }
 
-fn cmdConsole(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
+fn cmdConsole(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
     const target = args.next() orelse {
         writeStderr("Error: console requires a profile[:tab]\n", .{});
         std.process.exit(1);
@@ -410,7 +416,7 @@ fn cmdConsole(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     writeStdout("TODO: stream console for {s}\n", .{target});
 }
 
-fn cmdTab(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
+fn cmdTab(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
     const action = args.next() orelse {
         writeStderr("Error: tab requires an action (list|new|close|switch)\n", .{});
         std.process.exit(1);
@@ -422,7 +428,7 @@ fn cmdTab(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
             std.process.exit(1);
         };
 
-        var client = hibrow.Client.connect(allocator) catch |err| {
+        var client = hibrow.Client.connect(allocator, g_io) catch |err| {
             writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
@@ -448,7 +454,7 @@ fn cmdTab(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
         const profile = parseProfile(target);
         const url = args.next(); // optional URL
 
-        var client = hibrow.Client.connect(allocator) catch |err| {
+        var client = hibrow.Client.connect(allocator, g_io) catch |err| {
             writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
@@ -480,7 +486,7 @@ fn cmdTab(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
             std.process.exit(1);
         };
 
-        var client = hibrow.Client.connect(allocator) catch |err| {
+        var client = hibrow.Client.connect(allocator, g_io) catch |err| {
             writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
@@ -512,7 +518,7 @@ fn cmdTab(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
             std.process.exit(1);
         };
 
-        var client = hibrow.Client.connect(allocator) catch |err| {
+        var client = hibrow.Client.connect(allocator, g_io) catch |err| {
             writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
@@ -536,7 +542,7 @@ fn cmdTab(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     }
 }
 
-fn cmdGrab(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
+fn cmdGrab(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
     const profile_arg = args.next() orelse {
         writeStderr("Error: grab requires a profile and source (URL or JS expression)\n", .{});
         std.process.exit(1);
@@ -571,20 +577,20 @@ fn cmdGrab(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     };
 
     const grab_mod = hibrow.grab;
-    var result = grab_mod.grab(allocator, profile, src) catch |err| {
+    var result = grab_mod.grab(allocator, g_io, profile, src) catch |err| {
         writeStderr("Error: grab failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
     defer result.deinit(allocator);
 
     // Write to file
-    const file = std.fs.cwd().createFile(out_path, .{}) catch |err| {
+    const file = std.Io.Dir.cwd().createFile(g_io, out_path, .{}) catch |err| {
         writeStderr("Error: could not create file: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
-    defer file.close();
+    defer file.close(g_io);
 
-    file.writeAll(result.data) catch |err| {
+    file.writeStreamingAll(g_io, result.data) catch |err| {
         writeStderr("Error: could not write file: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -595,7 +601,7 @@ fn cmdGrab(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     writeStderr("{s}", .{msg});
 }
 
-fn cmdPush(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
+fn cmdPush(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
     const target_arg = args.next() orelse {
         writeStderr("Error: push requires a profile[:tab] and target\n", .{});
         std.process.exit(1);
@@ -621,13 +627,15 @@ fn cmdPush(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
             writeStderr("Error: -f requires a filename\n", .{});
             std.process.exit(1);
         };
-        owned_content = std.fs.cwd().readFileAlloc(allocator, filename, 10 << 20) catch |err| {
+        owned_content = std.Io.Dir.cwd().readFileAlloc(g_io, filename, allocator, .limited(10 << 20)) catch |err| {
             writeStderr("Error: could not read file: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
         content = owned_content.?;
     } else if (mem.eql(u8, next_arg, "-f-")) {
-        owned_content = std.fs.File.stdin().readToEndAlloc(allocator, 10 << 20) catch |err| {
+        var stdin_buf: [4096]u8 = undefined;
+        var stdin_reader = std.Io.File.stdin().readerStreaming(g_io, &stdin_buf);
+        owned_content = stdin_reader.interface.allocRemaining(allocator, .limited(10 << 20)) catch |err| {
             writeStderr("Error: could not read stdin: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
@@ -638,7 +646,7 @@ fn cmdPush(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     defer if (owned_content) |c| allocator.free(c);
 
     const push_mod = hibrow.push;
-    push_mod.push(allocator, profile, target, content) catch |err| {
+    push_mod.push(allocator, g_io, profile, target, content) catch |err| {
         writeStderr("Error: push failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -646,7 +654,7 @@ fn cmdPush(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     writeStderr("ok\n", .{});
 }
 
-fn cmdScreenshot(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
+fn cmdScreenshot(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
     const target = args.next() orelse {
         writeStderr("Error: screenshot requires a profile[:tab]\n", .{});
         std.process.exit(1);
@@ -681,7 +689,7 @@ fn cmdScreenshot(allocator: mem.Allocator, args: *std.process.ArgIterator) void 
         break :blk null;
     };
 
-    var client = hibrow.Client.connect(allocator) catch |err| {
+    var client = hibrow.Client.connect(allocator, g_io) catch |err| {
         writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -722,13 +730,13 @@ fn cmdScreenshot(allocator: mem.Allocator, args: *std.process.ArgIterator) void 
     };
 
     // Write to file
-    const file = std.fs.cwd().createFile(out_path, .{}) catch |err| {
+    const file = std.Io.Dir.cwd().createFile(g_io, out_path, .{}) catch |err| {
         writeStderr("Error: could not create file: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
-    defer file.close();
+    defer file.close(g_io);
 
-    file.writeAll(decoded) catch |err| {
+    file.writeStreamingAll(g_io, decoded) catch |err| {
         writeStderr("Error: could not write file: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -738,7 +746,7 @@ fn cmdScreenshot(allocator: mem.Allocator, args: *std.process.ArgIterator) void 
     writeStderr("{s}", .{msg});
 }
 
-fn cmdGateway(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
+fn cmdGateway(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
     const action = args.next() orelse {
         writeStderr("Error: gateway requires an action (status|stop|serve)\n", .{});
         std.process.exit(1);
@@ -746,7 +754,7 @@ fn cmdGateway(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
 
     if (mem.eql(u8, action, "serve")) {
         // Run the gateway daemon (this is the entry point for auto-start)
-        var server = hibrow.gateway.Server.init(allocator);
+        var server = hibrow.gateway.Server.init(allocator, g_io);
         defer server.deinit();
         server.serve() catch |err| {
             writeStderr("Error: gateway serve failed: {s}\n", .{@errorName(err)});
@@ -756,7 +764,7 @@ fn cmdGateway(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
     }
 
     if (mem.eql(u8, action, "status")) {
-        var client = hibrow.gateway.Client.connectNoAutoStart(allocator) catch {
+        var client = hibrow.gateway.Client.connectNoAutoStart(allocator, g_io) catch {
             writeStdout("{s}\n", .{"{\"status\": \"not running\"}"});
             return;
         };
@@ -769,7 +777,7 @@ fn cmdGateway(allocator: mem.Allocator, args: *std.process.ArgIterator) void {
         defer resp.deinit();
         printJsonValue(allocator, resp.result);
     } else if (mem.eql(u8, action, "stop")) {
-        var client = hibrow.gateway.Client.connectNoAutoStart(allocator) catch {
+        var client = hibrow.gateway.Client.connectNoAutoStart(allocator, g_io) catch {
             writeStderr("Gateway is not running.\n", .{});
             return;
         };
