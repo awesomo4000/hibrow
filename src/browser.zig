@@ -71,6 +71,10 @@ pub const LaunchOptions = struct {
     proxy: ?[]const u8 = null,
     /// Route DNS through the proxy (requires SOCKS5).
     proxy_dns: bool = false,
+    /// Launch without a visible window (Chrome: --headless=new, Firefox: -headless).
+    /// Per-launch: applies to this browser instance only, and only when it is
+    /// actually spawned (discovery of an already-running instance ignores it).
+    headless: bool = false,
     /// Browser engine to launch.
     browser_type: BrowserType = .chrome,
 };
@@ -235,6 +239,10 @@ fn launchChrome(allocator: mem.Allocator, io: std.Io, options: LaunchOptions) !B
         }
     }
 
+    if (options.headless) {
+        try argv_list.append(allocator, "--headless=new");
+    }
+
     try argv_list.append(allocator, "about:blank");
 
     // Spawn the browser process
@@ -297,6 +305,9 @@ fn launchFirefox(allocator: mem.Allocator, io: std.Io, options: LaunchOptions) !
     try argv_list.append(allocator, firefox);
     try argv_list.append(allocator, "--marionette");
     try argv_list.append(allocator, "--no-remote");
+    if (options.headless) {
+        try argv_list.append(allocator, "-headless");
+    }
 
     try argv_list.append(allocator, "--profile");
     try argv_list.append(allocator, profile_dir);

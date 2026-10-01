@@ -67,6 +67,9 @@ pub const Client = struct {
         if (opts.proxy_dns) {
             try params.put(self.allocator, "proxy_dns", .{ .bool = true });
         }
+        if (opts.headless) {
+            try params.put(self.allocator, "headless", .{ .bool = true });
+        }
         if (opts.browser_type != .chrome) {
             try params.put(self.allocator, "browser_type", .{ .string = opts.browser_type.toString() });
         }
@@ -169,6 +172,7 @@ pub const Client = struct {
 pub const LaunchOpts = struct {
     proxy: ?[]const u8 = null,
     proxy_dns: bool = false,
+    headless: bool = false,
     browser_type: browser.BrowserType = .chrome,
 };
 

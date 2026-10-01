@@ -32,7 +32,7 @@ first command — you never manage it.
 ## Core commands
 
 ```bash
-hibrow launch <profile> [--browser chrome|firefox]   # start a named session
+hibrow launch <profile> [--browser chrome|firefox] [--headless]  # start a session
 hibrow ls [profile]                                  # list sessions / details (JSON)
 hibrow nav <profile[:tab]> <url>                     # navigate
 hibrow url <profile[:tab]>                            # print current URL
@@ -103,9 +103,9 @@ wait_for work "#results" && hibrow eval work "document.querySelector('#results')
 ```
 
 **Wait for the USER to log in** (very common — we do NOT store credentials).
-This needs a **visible** browser so the human can type, so launch normally (do
-NOT use a headless setup for login). Navigate to the login page, ask the user to
-sign in (including any MFA), and poll for a logged-in signal:
+This needs a **visible** browser so the human can type, so launch WITHOUT
+`--headless`. Navigate to the login page, ask the user to sign in (including any
+MFA), and poll for a logged-in signal:
 
 ```bash
 hibrow launch work                      # visible window so the user can log in
@@ -378,6 +378,26 @@ hibrow tab new work
 hibrow nav work:2 "https://..."   # act on tab index 2
 hibrow tab close work:2
 ```
+
+## Headless (unattended)
+
+By default the browser opens a visible window. For unattended automation (no
+window, no focus stealing — e.g. scraping, CI, an agent working in the
+background), add `--headless` at launch:
+
+```bash
+hibrow launch work --headless
+```
+
+Notes:
+- **Per-launch, set once.** It applies to that browser instance and only when it
+  is actually spawned. You cannot toggle a running browser between headless and
+  windowed — `kill` and relaunch to switch. If the profile is already running,
+  `launch --headless` just finds the existing instance and the flag is a no-op.
+- **Incompatible with manual login** (there is no window to type in). But the
+  profile's data dir is shared across modes, so the pattern is: launch
+  **visible**, log in once, `kill`, then relaunch the **same profile
+  `--headless`** — you are still logged in, now automating with no window.
 
 ## Chrome vs Firefox
 
