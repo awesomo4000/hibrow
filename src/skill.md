@@ -221,8 +221,27 @@ done
 
 ## Capturing network traffic (all fetch + XHR)
 
-A very common need: see every request a site makes (and the responses). Install
-capture, then do the action, then read `window.__net` (`capture-net.js`, `-f`):
+**Simplest — capture one triggered request in a single `eval`.** When you know
+which action fires the request (a click, etc.), do install + trigger + read in
+ONE eval. The fetch wrapper records the URL *synchronously* before the request
+even starts, so it is already there when you read it — no ordering or timing to
+get wrong:
+
+```bash
+hibrow eval work '(function(){
+  var seen=[]; var of=window.fetch;
+  window.fetch=function(u){ seen.push(typeof u==="string"?u:u.url); return of.apply(this,arguments); };
+  document.querySelector("#load").click();      // the action that triggers the fetch
+  window.__answer = seen[0] || null;            // the captured URL, read immediately
+  return window.__answer;
+})()'
+```
+
+Do it this way unless you need to capture many requests, responses, or XHR too —
+then use the fuller recipe below.
+
+**Full capture (all fetch + XHR, with responses).** Install, do the action, then
+read `window.__net` (`capture-net.js`, `-f`):
 
 ```js
 (function () {
