@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**hibrow** is a simplified Zig reimplementation of [bromux](x/bromux/) — a browser multiplexer ("tmux for browsers"). The original Python project lives in `x/bromux/` as a reference (gitignored). hibrow targets Zig 0.15.2.
+**hibrow** is a simplified Zig reimplementation of [bromux](x/bromux/) — a browser multiplexer ("tmux for browsers"). The original Python project lives in `x/bromux/` as a reference (gitignored). hibrow requires Zig 0.16.0 (exactly).
 
 The core idea: a daemon manages persistent browser instances via Chrome DevTools Protocol (CDP), and multiple CLI clients connect to the daemon over Unix sockets using JSON-RPC 2.0. Browsers survive client disconnects and daemon restarts, just like tmux sessions survive terminal closes.
 
@@ -86,32 +86,57 @@ zig build run -- --help                # Run the CLI
 zig build -Doptimize=.ReleaseSafe      # Build with optimizations
 ```
 
-## Zig 0.15.2 Conventions
+## Zig 0.16.0 Conventions
 
-**I/O (Writergate)**: Zig 0.15.2 overhauled I/O. Key patterns:
-- `var buf: [4096]u8 = undefined; var w = std.fs.File.stdout().writer(&buf); const stdout = &w.interface;`
-- Functions take `*std.Io.Writer` not `anytype`
-- Always call `flush()` after writing
-- Never copy `.interface` — always use references (`&writer.interface`)
+0.16 landed the async-I/O rework ("Io as an interface"): `std.net` is gone,
+`std.fs.File`/`Dir` moved to `std.Io.File`/`std.Io.Dir`, and every socket/file
+op takes an `Io`. See `docs/zig-0.16-migration.md` for the full port notes.
 
-**Containers**: Unmanaged by default:
-- `var list: std.ArrayList(T) = .{};` then `list.deinit(allocator);`
-- `list.append(allocator, item)` — allocator passed to mutating methods
-- `std.AutoHashMap` similarly takes allocator per-call
+**Entry point / Io**: `pub fn main(init: std.process.Init) !void`. The runtime
+provides `init.gpa` (GP allocator w/ leak checking), `init.io` (an `std.Io`),
+`init.arena`, and `init.minimal.args`. Thread `io` into anything that touches a
+socket or file; hibrow stores it in the structs that own a stream and keeps a
+process-wide `g_io` in main.zig for the output helpers.
 
-**Build system**: Use `b.createModule()` + `b.addExecutable(.{ .root_module = mod })` pattern.
+**Args**: `var it = try init.minimal.args.iterateAllocator(gpa);` then
+`it.skip()` / `it.next()`. (`std.process.argsWithAllocator` was removed.)
 
-**JSON**: Use `std.json.Stringify.valueAlloc(allocator, value, .{})` for serialization. Use `std.json.ArrayHashMap` for ordered JSON objects.
+**I/O**: `var w = std.Io.File.stdout().writerStreaming(io, &buf); const out = &w.interface;`
+— functions take `*std.Io.Writer`; always `flush()`; never copy `.interface`.
+Prefer `writerStreaming`/`readerStreaming` over `writer`/`reader` for stdio and
+pipes (the positional default `pwrite`s at offset 0 — see BUG-002). File reads:
+`std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(n))`; whole-file write:
+`file.writeStreamingAll(io, bytes)`; `file.close(io)`.
 
-**Sleeping**: Use `std.Thread.sleep(nanoseconds)` — there is no `std.time.sleep` in 0.15.2. Use `std.time.ns_per_ms` etc. for unit conversion.
+**Net**: `std.Io.net.UnixAddress.init(path)` -> `.connect(io)` / `.listen(io, opts)`;
+`std.Io.net.Server.accept(io)` -> `Stream`; `Stream.close(io)`. Wrap an existing
+fd with `std.Io.net.Stream{ .socket = .{ .handle = fd } }`. Wire-protocol data
+transfer uses raw `std.posix.read` + `std.c.write` on `stream.socket.handle`
+(the Threaded backend uses blocking sockets; `std.posix.write` was removed) —
+this preserves the growable, no-over-read `readLine` needed for multi-MB
+responses. HTTP: `std.http.Client{ .allocator = a, .io = io }`.
 
-**Process APIs**: `std.posix.getuid()` exists but `std.posix.getpid()` does not — use `std.c.getpid()`. For stdin: `std.fs.File.stdin()` (not `std.io.getStdIn()`).
+**Process**: `std.process.spawn(io, .{ .argv = ..., .stdin/out/err = .ignore, .pgid = 0 })`,
+then `child.id.?`. Use `std.c.getpid()` / `std.c.getuid()` / `std.c.getenv()`.
+Sleeping: `std.Thread.sleep(ns)` (use `std.time.ns_per_ms`).
 
-**Sockets**: `std.net.Stream` is a thin fd wrapper; all methods take `self` by value (not pointer). `Stream.writeAll()` uses `sendmsg` internally — only works with socket fds, not pipes.
+**Allocator**: `std.heap.DebugAllocator(.{})` (`GeneralPurposeAllocator` was
+removed). `std.heap.ArenaAllocator` for request-scoped work.
 
-**MANAGED containers**: `json.ObjectMap` and `json.Array` are managed (allocator stored at init, not passed per-call). Most other containers (ArrayList, HashMap) are unmanaged.
+**Containers**: unmanaged. `var list: std.ArrayList(T) = .empty;` then
+`list.append(allocator, item)` / `list.deinit(allocator)`. NOTE the JSON
+asymmetry: `json.ObjectMap` is now UNMANAGED (pass allocator per-call) while
+`json.Array` is still MANAGED (allocator stored at init).
 
-**General**: Error unions (`!`), allocator-passing pattern, `std.heap.ArenaAllocator` for request-scoped work, strings are `[]const u8`.
+**Build**: `b.createModule()` + `b.addExecutable(.{ .root_module = mod })`.
+JSON: `std.json.Stringify.valueAlloc(allocator, value, .{})`.
+
+**macOS build**: `zig build` may fail to link (`undefined symbol:
+__availability_version_check`) because newer Command Line Tools SDKs (26/27)
+ship `.tbd` files the 0.16 linker cannot parse. Build with SDK detection off:
+`DEVELOPER_DIR=/dev/null zig build`.
+
+**General**: error unions (`!`), allocator-passing pattern, strings are `[]const u8`.
 
 ## Reference Material
 

@@ -23,7 +23,7 @@ Browser automation tools are either too heavy (Playwright, Puppeteer — require
 
 ## Install
 
-Requires [Zig 0.15.2+](https://ziglang.org/download/):
+Requires [Zig 0.16.0](https://ziglang.org/download/) (exactly):
 
 ```bash
 git clone https://github.com/you/hibrow.git
@@ -278,7 +278,7 @@ The binary is at `./zig-out/bin/hibrow`. No external dependencies — Zig's stan
 
 If `zig build` fails to link with `undefined symbol: __availability_version_check`
 (and every libc symbol undefined), your Command Line Tools default to a newer
-macOS SDK (26.x/27.x) whose `.tbd` files Zig 0.15.2's linker can't parse. Build
+macOS SDK (26.x/27.x) whose `.tbd` files Zig 0.16.0's linker can't parse. Build
 with SDK detection disabled so Zig uses its bundled libSystem stub:
 
 ```bash
@@ -299,7 +299,7 @@ clearing `~/.cache/zig` since native libc detection is cached).
 
 - macOS (process discovery uses `proc_listpids` / `sysctl`)
 - Chrome or Chromium installed
-- Zig 0.15.2+ (build only — the output binary is standalone)
+- Zig 0.16.0 exactly (build only — the output binary is standalone)
 
 ## License
 
