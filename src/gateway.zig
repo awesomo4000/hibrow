@@ -311,6 +311,7 @@ pub const Server = struct {
             .{ "browser.list", wrapNoParams(handleBrowserList) },
             .{ "browser.launch", wrapWithParams(handleBrowserLaunch) },
             .{ "browser.eval", wrapWithParams(handleBrowserEval) },
+            .{ "browser.frames", wrapWithParams(handleBrowserFrames) },
             .{ "browser.navigate", wrapWithParams(handleBrowserNavigate) },
             .{ "browser.get", wrapWithParams(handleBrowserGet) },
             .{ "browser.kill", wrapWithParams(handleBrowserKill) },
@@ -516,6 +517,8 @@ pub const Server = struct {
             return self.fail(id, .invalid_params, "Missing 'profile' parameter");
         const expression = extractStringParam(params, "expression") orelse
             return self.fail(id, .invalid_params, "Missing 'expression' parameter");
+        // Optional frame path: "1,0,0" / "#outer/#inner" — eval inside a nested frame.
+        const frame = extractStringParam(params, "frame");
 
         const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
@@ -526,7 +529,10 @@ pub const Server = struct {
                 defer conn.deinit();
                 conn.connect(info.port) catch
                     return self.fail(id, .cdp_error, "Marionette connection failed");
-                const eval_result = conn.eval(expression) catch
+                const eval_result = (if (frame) |f|
+                    conn.evalInFrame(f, expression)
+                else
+                    conn.eval(expression)) catch
                     return self.fail(id, .cdp_error, "Eval failed");
                 if (eval_result.exception) |exc| {
                     defer self.allocator.free(exc);
@@ -537,7 +543,10 @@ pub const Server = struct {
             .chrome => {
                 const conn = self.getConnection(profile) orelse
                     return self.fail(id, .browser_not_found, "Browser not found");
-                const eval_result = conn.eval(expression) catch {
+                const eval_result = (if (frame) |f|
+                    conn.evalInFrame(f, expression)
+                else
+                    conn.eval(expression)) catch {
                     self.evictConnection(profile);
                     return self.fail(id, .cdp_error, "Eval failed");
                 };
@@ -546,6 +555,35 @@ pub const Server = struct {
                     return self.fail(id, .cdp_error, exc);
                 }
                 return self.ok(id, eval_result.value);
+            },
+        }
+    }
+
+    fn handleBrowserFrames(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {
+        const profile = extractStringParam(params, "profile") orelse
+            return self.fail(id, .invalid_params, "Missing 'profile' parameter");
+
+        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
+            return self.fail(id, .browser_not_found, "Browser not found");
+
+        switch (info.browser_type) {
+            .firefox => {
+                var conn = marionette_mod.Connection.init(self.allocator, self.io);
+                defer conn.deinit();
+                conn.connect(info.port) catch
+                    return self.fail(id, .cdp_error, "Marionette connection failed");
+                const frames = conn.frameList() catch
+                    return self.fail(id, .cdp_error, "frame list failed");
+                return self.ok(id, frames);
+            },
+            .chrome => {
+                const conn = self.getConnection(profile) orelse
+                    return self.fail(id, .browser_not_found, "Browser not found");
+                const frames = conn.frameList() catch {
+                    self.evictConnection(profile);
+                    return self.fail(id, .cdp_error, "frame list failed");
+                };
+                return self.ok(id, frames);
             },
         }
     }

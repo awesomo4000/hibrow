@@ -77,12 +77,21 @@ pub const Client = struct {
     }
 
     /// Evaluate JavaScript in the named profile's active tab.
-    pub fn eval(self: *Client, profile: []const u8, expression: []const u8) !gateway.ParsedResponse {
+    pub fn eval(self: *Client, profile: []const u8, expression: []const u8, frame: ?[]const u8) !gateway.ParsedResponse {
         var params: json.ObjectMap = .empty;
         defer params.deinit(self.allocator);
         try params.put(self.allocator, "profile", .{ .string = profile });
         try params.put(self.allocator, "expression", .{ .string = expression });
+        if (frame) |f| try params.put(self.allocator, "frame", .{ .string = f });
         return self.gw.call("browser.eval", .{ .object = params });
+    }
+
+    /// List the (nested) frames in the named profile's page.
+    pub fn frames(self: *Client, profile: []const u8) !gateway.ParsedResponse {
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
+        try params.put(self.allocator, "profile", .{ .string = profile });
+        return self.gw.call("browser.frames", .{ .object = params });
     }
 
     /// Navigate the named profile's active tab to a URL.

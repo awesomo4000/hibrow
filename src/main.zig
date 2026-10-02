@@ -40,6 +40,13 @@ const usage =
     \\  console <profile[:tab]>
     \\      Stream console output from a browser tab.
     \\
+    \\  frame list <profile>
+    \\      List nested frames (path, url, name) for use with eval --frame.
+    \\
+    \\  eval <profile> --frame <path|selector> "<js>"
+    \\      Evaluate JavaScript inside a nested frame. Path is comma/slash-
+    \\      separated frame indices and/or CSS selectors, e.g. 1,0,0 or #inner.
+    \\
     \\  tab list|new|close|switch <profile[:tab]>
     \\      Manage tabs within a browser profile.
     \\
@@ -122,6 +129,7 @@ pub fn main(init: std.process.Init) !void {
         .{ "ls", cmdList },
         .{ "nav", cmdNavigate },
         .{ "eval", cmdEval },
+        .{ "frame", cmdFrame },
         .{ "kill", cmdKill },
         .{ "url", cmdUrl },
         .{ "console", cmdConsole },
@@ -312,6 +320,40 @@ fn cmdNavigate(allocator: mem.Allocator, args: *std.process.Args.Iterator) void 
     printJsonValue(allocator, resp.result);
 }
 
+fn cmdFrame(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
+    const sub = args.next() orelse {
+        writeStderr("Error: frame requires a subcommand (list)\n", .{});
+        std.process.exit(1);
+    };
+    if (!mem.eql(u8, sub, "list")) {
+        writeStderr("Error: unknown frame subcommand: {s} (expected 'list')\n", .{sub});
+        std.process.exit(1);
+    }
+    const target = args.next() orelse {
+        writeStderr("Error: frame list requires a profile\n", .{});
+        std.process.exit(1);
+    };
+    const profile = parseProfile(target);
+
+    var client = hibrow.Client.connect(allocator, g_io) catch |err| {
+        writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer client.disconnect();
+
+    var resp = client.frames(profile) catch |err| {
+        writeStderr("Error: frame list failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer resp.deinit();
+
+    if (resp.is_error) {
+        printError(allocator, resp.result);
+        std.process.exit(1);
+    }
+    printJsonValue(allocator, resp.result);
+}
+
 fn cmdEval(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
     const target = args.next() orelse {
         writeStderr("Error: eval requires a profile[:tab] and expression\n", .{});
@@ -320,27 +362,40 @@ fn cmdEval(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
 
     const profile = parseProfile(target);
 
-    // Get expression: positional arg, -f <file>, or -f- (stdin)
-    const next_arg = args.next() orelse {
-        writeStderr("Error: eval requires a JavaScript expression\n", .{});
-        std.process.exit(1);
-    };
-
+    // Parse remaining args: the expression (positional, -f <file>, or -f-),
+    // plus an optional --frame <selector-or-path> that may appear anywhere.
     var expression: []const u8 = undefined;
     var owned_expr: ?[]u8 = null;
+    var frame: ?[]const u8 = null;
+    var expr_arg: ?[]const u8 = null;
+    var from_file: ?[]const u8 = null;
+    var from_stdin = false;
 
-    if (mem.eql(u8, next_arg, "-f")) {
-        const filename = args.next() orelse {
-            writeStderr("Error: -f requires a filename\n", .{});
-            std.process.exit(1);
-        };
+    while (args.next()) |a| {
+        if (mem.eql(u8, a, "--frame")) {
+            frame = args.next() orelse {
+                writeStderr("Error: --frame requires a selector or path (e.g. 0/0 or #inner)\n", .{});
+                std.process.exit(1);
+            };
+        } else if (mem.eql(u8, a, "-f")) {
+            from_file = args.next() orelse {
+                writeStderr("Error: -f requires a filename\n", .{});
+                std.process.exit(1);
+            };
+        } else if (mem.eql(u8, a, "-f-")) {
+            from_stdin = true;
+        } else {
+            expr_arg = a;
+        }
+    }
+
+    if (from_file) |filename| {
         owned_expr = std.Io.Dir.cwd().readFileAlloc(g_io, filename, allocator, .limited(1 << 20)) catch |err| {
             writeStderr("Error: could not read file: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
         expression = owned_expr.?;
-    } else if (mem.eql(u8, next_arg, "-f-")) {
-        // Read from stdin
+    } else if (from_stdin) {
         var stdin_buf: [4096]u8 = undefined;
         var stdin_reader = std.Io.File.stdin().readerStreaming(g_io, &stdin_buf);
         owned_expr = stdin_reader.interface.allocRemaining(allocator, .limited(1 << 20)) catch |err| {
@@ -348,8 +403,11 @@ fn cmdEval(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
             std.process.exit(1);
         };
         expression = owned_expr.?;
+    } else if (expr_arg) |e| {
+        expression = e;
     } else {
-        expression = next_arg;
+        writeStderr("Error: eval requires a JavaScript expression\n", .{});
+        std.process.exit(1);
     }
     defer if (owned_expr) |e| allocator.free(e);
 
@@ -359,7 +417,7 @@ fn cmdEval(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
     };
     defer client.disconnect();
 
-    var resp = client.eval(profile, expression) catch |err| {
+    var resp = client.eval(profile, expression, frame) catch |err| {
         writeStderr("Error: eval failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };

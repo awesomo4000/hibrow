@@ -175,6 +175,26 @@ pub fn freeVersionInfo(allocator: mem.Allocator, info: VersionInfo) void {
     if (info.webSocketDebuggerUrl) |ws| allocator.free(ws);
 }
 
+/// Read a string field from a Page.getFrameTree `frame` object (or "" if absent).
+fn frameField(frame: ?json.Value, key: []const u8) []const u8 {
+    const f = frame orelse return "";
+    if (f != .object) return "";
+    const v = f.object.get(key) orelse return "";
+    if (v != .string) return "";
+    return v.string;
+}
+
+/// Extract the frame id from a Page.getFrameTree node:
+/// {frame: {id, url, ...}, childFrames?: [...]}.
+fn frameIdOf(node: json.Value) ?[]const u8 {
+    if (node != .object) return null;
+    const fr = node.object.get("frame") orelse return null;
+    if (fr != .object) return null;
+    const idv = fr.object.get("id") orelse return null;
+    if (idv != .string) return null;
+    return idv.string;
+}
+
 // ---------------------------------------------------------------------------
 // CDP Connection — WebSocket commands
 // ---------------------------------------------------------------------------
@@ -256,9 +276,34 @@ pub const Connection = struct {
         }
     }
 
-    /// Evaluate JavaScript in the connected target.
+    /// Parse a Runtime.evaluate CDP result into an EvalResult.
+    /// CDP returns {"result": {"type": "...", "value": ...}, "exceptionDetails": {...}}.
+    fn parseEvalResult(self: *Connection, result: json.Value) !EvalResult {
+        if (result == .object) {
+            const result_obj = result.object;
+            if (result_obj.get("exceptionDetails")) |exception| {
+                if (exception == .object) {
+                    if (exception.object.get("text")) |text| {
+                        if (text == .string) {
+                            return .{ .exception = try self.allocator.dupe(u8, text.string) };
+                        }
+                    }
+                }
+                return .{ .exception = try self.allocator.dupe(u8, "Unknown exception") };
+            }
+            if (result_obj.get("result")) |inner_result| {
+                if (inner_result == .object) {
+                    if (inner_result.object.get("value")) |val| {
+                        return .{ .value = try cloneJsonValue(self.allocator, val) };
+                    }
+                }
+            }
+        }
+        return .{};
+    }
+
+    /// Evaluate JavaScript in the connected target (top frame).
     pub fn eval(self: *Connection, expression: []const u8) !EvalResult {
-        // Build params: {"expression": ..., "returnByValue": true}
         var params_obj: json.ObjectMap = .empty;
         defer params_obj.deinit(self.allocator);
         try params_obj.put(self.allocator, "expression", .{ .string = expression });
@@ -266,37 +311,131 @@ pub const Connection = struct {
 
         var cdp_result = try self.send("Runtime.evaluate", .{ .object = params_obj });
         defer cdp_result.deinit();
+        return self.parseEvalResult(cdp_result.result);
+    }
 
-        // CDP returns {"result": {"result": {"type": "...", "value": ...}, "exceptionDetails": {...}}}
-        if (cdp_result.result == .object) {
-            const result_obj = cdp_result.result.object;
+    /// Evaluate JavaScript within a specific execution context (used for frames).
+    fn evalInContext(self: *Connection, context_id: i64, expression: []const u8) !EvalResult {
+        var params_obj: json.ObjectMap = .empty;
+        defer params_obj.deinit(self.allocator);
+        try params_obj.put(self.allocator, "expression", .{ .string = expression });
+        try params_obj.put(self.allocator, "returnByValue", .{ .bool = true });
+        try params_obj.put(self.allocator, "contextId", .{ .integer = context_id });
 
-            // Check for exception
-            if (result_obj.get("exceptionDetails")) |exception| {
-                if (exception == .object) {
-                    if (exception.object.get("text")) |text| {
-                        if (text == .string) {
-                            return .{
-                                .exception = try self.allocator.dupe(u8, text.string),
-                            };
-                        }
-                    }
-                }
-                return .{ .exception = try self.allocator.dupe(u8, "Unknown exception") };
-            }
+        var cdp_result = try self.send("Runtime.evaluate", .{ .object = params_obj });
+        defer cdp_result.deinit();
+        return self.parseEvalResult(cdp_result.result);
+    }
 
-            // Extract result value
-            if (result_obj.get("result")) |inner_result| {
-                if (inner_result == .object) {
-                    if (inner_result.object.get("value")) |val| {
-                        // Clone the value so it outlives the parsed response
-                        return .{ .value = try cloneJsonValue(self.allocator, val) };
-                    }
-                }
+    /// Create an isolated world for a frame and return its execution context id.
+    /// Isolated worlds share the frame's DOM and session (cookies/login) but not
+    /// the page's own JS globals — sufficient for DOM reads, clicks, form fills.
+    fn createIsolatedWorld(self: *Connection, frame_id: []const u8) !i64 {
+        var p: json.ObjectMap = .empty;
+        defer p.deinit(self.allocator);
+        try p.put(self.allocator, "frameId", .{ .string = frame_id });
+        try p.put(self.allocator, "worldName", .{ .string = "hibrow" });
+        try p.put(self.allocator, "grantUniveralAccess", .{ .bool = true });
+
+        var r = try self.send("Page.createIsolatedWorld", .{ .object = p });
+        defer r.deinit();
+        if (r.result == .object) {
+            if (r.result.object.get("executionContextId")) |c| {
+                if (c == .integer) return c.integer;
             }
         }
+        return error.FrameContextFailed;
+    }
 
-        return .{};
+    /// Find the child-frame index of the <iframe>/<frame> matching `selector`
+    /// within the frame identified by `frame_id`.
+    fn selectorFrameIndex(self: *Connection, frame_id: []const u8, selector: []const u8) !usize {
+        const ctx = try self.createIsolatedWorld(frame_id);
+        const sel_json = try json.Stringify.valueAlloc(self.allocator, json.Value{ .string = selector }, .{});
+        defer self.allocator.free(sel_json);
+        const expr = try std.fmt.allocPrint(self.allocator, "(function(){{var t=document.querySelector({s});var l=[].slice.call(document.querySelectorAll('iframe,frame'));return l.indexOf(t);}})()", .{sel_json});
+        defer self.allocator.free(expr);
+
+        const res = try self.evalInContext(ctx, expr);
+        if (res.exception) |e| {
+            self.allocator.free(e);
+            return error.FrameNotFound;
+        }
+        if (res.value == .integer and res.value.integer >= 0) return @intCast(res.value.integer);
+        return error.FrameNotFound;
+    }
+
+    /// Resolve a frame path ("1,0,0" / "#outer/#inner") to a CDP frameId.
+    /// Caller owns the returned slice.
+    fn resolveFramePath(self: *Connection, frame_path: []const u8) ![]u8 {
+        var tree = try self.send("Page.getFrameTree", null);
+        defer tree.deinit();
+        if (tree.result != .object) return error.FrameNotFound;
+        var node = tree.result.object.get("frameTree") orelse return error.FrameNotFound;
+
+        var current_id = try self.allocator.dupe(u8, frameIdOf(node) orelse return error.FrameNotFound);
+        errdefer self.allocator.free(current_id);
+
+        var it = mem.tokenizeAny(u8, frame_path, ",/");
+        while (it.next()) |seg| {
+            const children = node.object.get("childFrames");
+            const arr: []const json.Value = if (children) |c|
+                (if (c == .array) c.array.items else &.{})
+            else
+                &.{};
+
+            const index: usize = std.fmt.parseInt(usize, seg, 10) catch
+                try self.selectorFrameIndex(current_id, seg);
+            if (index >= arr.len) return error.FrameNotFound;
+
+            node = arr[index];
+            const next_id = frameIdOf(node) orelse return error.FrameNotFound;
+            self.allocator.free(current_id);
+            current_id = try self.allocator.dupe(u8, next_id);
+        }
+        return current_id;
+    }
+
+    /// Evaluate `expression` inside a nested frame (see resolveFramePath for the
+    /// `frame_path` grammar). Runs in an isolated world of the target frame.
+    pub fn evalInFrame(self: *Connection, frame_path: []const u8, expression: []const u8) !EvalResult {
+        const frame_id = try self.resolveFramePath(frame_path);
+        defer self.allocator.free(frame_id);
+        const ctx = try self.createIsolatedWorld(frame_id);
+        return self.evalInContext(ctx, expression);
+    }
+
+    /// List all (nested) frames as an array of {path, url, name}, where `path`
+    /// is the index path usable with evalInFrame (e.g. "0", "0/1").
+    pub fn frameList(self: *Connection) !json.Value {
+        var tree = try self.send("Page.getFrameTree", null);
+        defer tree.deinit();
+        var arr = json.Array.init(self.allocator);
+        if (tree.result == .object) {
+            if (tree.result.object.get("frameTree")) |root| {
+                try self.appendChildFrames(&arr, root, "");
+            }
+        }
+        return .{ .array = arr };
+    }
+
+    fn appendChildFrames(self: *Connection, arr: *json.Array, node: json.Value, prefix: []const u8) !void {
+        if (node != .object) return;
+        const children = node.object.get("childFrames") orelse return;
+        if (children != .array) return;
+        for (children.array.items, 0..) |child, i| {
+            const path = if (prefix.len == 0)
+                try std.fmt.allocPrint(self.allocator, "{d}", .{i})
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}/{d}", .{ prefix, i });
+            const frame = if (child == .object) child.object.get("frame") else null;
+            var obj: json.ObjectMap = .empty;
+            try obj.put(self.allocator, "path", .{ .string = path });
+            try obj.put(self.allocator, "url", .{ .string = try self.allocator.dupe(u8, frameField(frame, "url")) });
+            try obj.put(self.allocator, "name", .{ .string = try self.allocator.dupe(u8, frameField(frame, "name")) });
+            try arr.append(.{ .object = obj });
+            try self.appendChildFrames(arr, child, path);
+        }
     }
 
     /// Navigate the connected target to a URL.

@@ -388,6 +388,35 @@ hibrow eval work -f .hibrow-scripts/acme/list-orders.js | jq .
 This turns flaky one-off selectors into a maintained, re-runnable toolkit, and
 lets the next agent pick up where you left off.
 
+## Frames / iframes
+
+Content inside an `<iframe>` — especially a cross-origin one — is NOT reachable
+from a normal `eval` on the top page. Target the frame explicitly.
+
+List the frames (both browsers), with a `path` you can pass to `--frame`:
+
+```bash
+hibrow frame list work
+# [{"path":"0","url":"...","name":"..."},{"path":"0/0","url":"..."},{"path":"1",...}]
+```
+
+Eval inside a frame with `--frame <path>`. A path is frame indices and/or CSS
+selectors of the `<iframe>` element, nested, separated by `/` or `,`:
+
+```bash
+hibrow eval work --frame 0 "document.body.innerText"      # first child frame
+hibrow eval work --frame 0/0 "document.title"             # nested: frame 0, its child 0
+hibrow eval work --frame 1,0,0 "..."                      # commas work too
+hibrow eval work --frame "#content" "..."                 # by iframe selector
+hibrow eval work --frame "#outer/#inner" "..."            # nested selectors
+```
+
+Works on Chrome (CDP execution contexts) and Firefox (Marionette SwitchToFrame),
+preserving the session (cookies/login). On Chrome the frame eval runs in an
+isolated world: full DOM access (read text, click, fill) but not the frame
+page's own JS globals. If a `--frame` eval returns null/empty, the frame may
+still be loading — retry, or `frame list` to confirm the path.
+
 ## Tabs
 
 ```bash

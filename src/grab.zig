@@ -37,7 +37,7 @@ pub const GrabResult = struct {
 fn evalOnce(allocator: mem.Allocator, io: std.Io, profile: []const u8, expression: []const u8) !gateway.ParsedResponse {
     var client = try hibrow.Client.connect(allocator, io);
     defer client.disconnect();
-    return client.eval(profile, expression);
+    return client.eval(profile, expression, null);
 }
 
 /// Grab binary data from the browser.

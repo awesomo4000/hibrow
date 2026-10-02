@@ -239,6 +239,95 @@ pub const Connection = struct {
         return .{};
     }
 
+    /// Switch into a child frame by index (Marionette SwitchToFrame id=<int>).
+    pub fn switchToFrameIndex(self: *Connection, index: i64) !void {
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
+        try params.put(self.allocator, "id", .{ .integer = index });
+        var result = try self.send("WebDriver:SwitchToFrame", .{ .object = params });
+        defer result.deinit();
+        if (result.err) |_| return error.FrameSwitchFailed;
+    }
+
+    /// Switch into a child frame whose <iframe>/<frame> element matches a CSS
+    /// selector (FindElement in the current frame, then SwitchToFrame id=<element>).
+    pub fn switchToFrameSelector(self: *Connection, selector: []const u8) !void {
+        var find_params: json.ObjectMap = .empty;
+        defer find_params.deinit(self.allocator);
+        try find_params.put(self.allocator, "using", .{ .string = "css selector" });
+        try find_params.put(self.allocator, "value", .{ .string = selector });
+        var find_result = try self.send("WebDriver:FindElement", .{ .object = find_params });
+        defer find_result.deinit();
+        if (find_result.err) |_| return error.FrameNotFound;
+
+        // FindElement result is {"value": <web-element-ref-object>}.
+        const elem = if (find_result.result == .object)
+            find_result.result.object.get("value") orelse return error.FrameNotFound
+        else
+            return error.FrameNotFound;
+
+        const elem_clone = try cloneJsonValue(self.allocator, elem);
+        var switch_params: json.ObjectMap = .empty;
+        defer switch_params.deinit(self.allocator);
+        try switch_params.put(self.allocator, "id", elem_clone);
+        var switch_result = try self.send("WebDriver:SwitchToFrame", .{ .object = switch_params });
+        defer switch_result.deinit();
+        if (switch_result.err) |_| return error.FrameSwitchFailed;
+    }
+
+    /// Switch back up to the parent frame.
+    pub fn switchToParentFrame(self: *Connection) !void {
+        var result = try self.send("WebDriver:SwitchToParentFrame", .null);
+        defer result.deinit();
+        if (result.err) |_| return error.FrameSwitchFailed;
+    }
+
+    /// Evaluate `expression` inside a nested frame. `frame_path` is a path of
+    /// segments separated by "," or "/"; each segment is either a numeric frame
+    /// index or a CSS selector for the <iframe> element in the parent frame.
+    /// e.g. "1,0,0" or "#outer/#inner" or "0/#inner".
+    pub fn evalInFrame(self: *Connection, frame_path: []const u8, expression: []const u8) !EvalResult {
+        var it = mem.tokenizeAny(u8, frame_path, ",/");
+        while (it.next()) |seg| {
+            if (std.fmt.parseInt(i64, seg, 10)) |idx| {
+                try self.switchToFrameIndex(idx);
+            } else |_| {
+                try self.switchToFrameSelector(seg);
+            }
+        }
+        return self.eval(expression);
+    }
+
+    /// List all (nested) frames as an array of {path, url, name}. Walks the tree
+    /// by switching into each child frame and enumerating its own children.
+    pub fn frameList(self: *Connection) !json.Value {
+        var arr = json.Array.init(self.allocator);
+        try self.collectFrames(&arr, "");
+        return .{ .array = arr };
+    }
+
+    fn collectFrames(self: *Connection, arr: *json.Array, prefix: []const u8) !void {
+        const res = self.eval(
+            "Array.from(document.querySelectorAll('iframe,frame')).map(function(f){return {src:f.src||'',name:f.name||''};})",
+        ) catch return;
+        if (res.value != .array) return;
+        for (res.value.array.items, 0..) |child, i| {
+            const path = if (prefix.len == 0)
+                try std.fmt.allocPrint(self.allocator, "{d}", .{i})
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}/{d}", .{ prefix, i });
+            var obj: json.ObjectMap = .empty;
+            try obj.put(self.allocator, "path", .{ .string = path });
+            try obj.put(self.allocator, "url", .{ .string = try self.allocator.dupe(u8, objField(child, "src")) });
+            try obj.put(self.allocator, "name", .{ .string = try self.allocator.dupe(u8, objField(child, "name")) });
+            try arr.append(.{ .object = obj });
+
+            self.switchToFrameIndex(@intCast(i)) catch continue;
+            self.collectFrames(arr, path) catch {};
+            self.switchToParentFrame() catch {};
+        }
+    }
+
     /// Navigate to a URL.
     pub fn navigate(self: *Connection, url: []const u8) !void {
         var params: json.ObjectMap = .empty;
@@ -454,6 +543,14 @@ pub const Connection = struct {
 };
 
 /// Deep-clone a json.Value so it outlives its parsed source.
+/// Read a string field from a JSON object value (or "" if absent).
+fn objField(v: json.Value, key: []const u8) []const u8 {
+    if (v != .object) return "";
+    const x = v.object.get(key) orelse return "";
+    if (x != .string) return "";
+    return x.string;
+}
+
 fn cloneJsonValue(allocator: mem.Allocator, val: json.Value) !json.Value {
     switch (val) {
         .null => return .null,
