@@ -195,6 +195,12 @@ fn frameField(frame: ?json.Value, key: []const u8) []const u8 {
     return v.string;
 }
 
+/// Free an owned list of owned strings.
+fn freeStrList(allocator: mem.Allocator, list: *std.ArrayList([]const u8)) void {
+    for (list.items) |s| allocator.free(s);
+    list.deinit(allocator);
+}
+
 /// Extract the frame id from a Page.getFrameTree node:
 /// {frame: {id, url, ...}, childFrames?: [...]}.
 fn frameIdOf(node: json.Value) ?[]const u8 {
@@ -216,15 +222,39 @@ pub const Connection = struct {
     ws: websocket.WebSocket,
     /// Next message ID (CDP uses incrementing integers).
     next_id: u64 = 1,
+    /// Whether Page/Target auto-attach has been enabled (for OOPIF support).
+    frame_support_enabled: bool = false,
+    /// OOPIF (out-of-process iframe) frameId -> CDP sessionId.
+    oopif_session: ?std.StringHashMap([]u8) = null,
+    /// OOPIF frameId -> its parent frameId.
+    oopif_parent: ?std.StringHashMap([]u8) = null,
 
     pub fn init(allocator: mem.Allocator, io: std.Io) Connection {
         return .{
             .allocator = allocator,
             .ws = websocket.WebSocket.init(allocator, io),
+            .oopif_session = std.StringHashMap([]u8).init(allocator),
+            .oopif_parent = std.StringHashMap([]u8).init(allocator),
         };
     }
 
     pub fn deinit(self: *Connection) void {
+        if (self.oopif_session) |*m| {
+            var it = m.iterator();
+            while (it.next()) |e| {
+                self.allocator.free(e.key_ptr.*);
+                self.allocator.free(e.value_ptr.*);
+            }
+            m.deinit();
+        }
+        if (self.oopif_parent) |*m| {
+            var it = m.iterator();
+            while (it.next()) |e| {
+                self.allocator.free(e.key_ptr.*);
+                self.allocator.free(e.value_ptr.*);
+            }
+            m.deinit();
+        }
         self.ws.deinit();
     }
 
@@ -234,14 +264,19 @@ pub const Connection = struct {
         try self.ws.connect(parsed.host, parsed.port, parsed.path);
     }
 
-    /// Send a CDP command and wait for the matching response.
-    /// Returns a CdpResult that owns the parsed response. Caller must deinit.
+    /// Send a CDP command on the default (page) session and wait for the response.
     pub fn send(self: *Connection, method: []const u8, params: ?json.Value) !CdpResult {
+        return self.sendSession(method, params, null);
+    }
+
+    /// Send a CDP command, optionally routed to an OOPIF session via `sessionId`.
+    /// Returns a CdpResult that owns the parsed response. Caller must deinit.
+    pub fn sendSession(self: *Connection, method: []const u8, params: ?json.Value, session_id: ?[]const u8) !CdpResult {
         const id = self.next_id;
         self.next_id += 1;
 
         // Build CDP message
-        const msg_json = try buildCdpMessage(self.allocator, id, method, params);
+        const msg_json = try buildCdpMessage(self.allocator, id, method, params, session_id);
         defer self.allocator.free(msg_json);
 
         // Send over WebSocket
@@ -282,9 +317,107 @@ pub const Connection = struct {
                     }
                 }
             }
-            // Not our response (probably an event) — discard and keep reading
+            // Not our response (an event) — record OOPIF attach/detach, then discard.
+            self.handleEvent(parsed.value) catch {};
             parsed.deinit();
         }
+    }
+
+    /// Record Target.attachedToTarget / detachedFromTarget events so we can
+    /// route commands to out-of-process iframe (OOPIF) sessions.
+    fn handleEvent(self: *Connection, msg: json.Value) !void {
+        if (msg != .object) return;
+        const method_v = msg.object.get("method") orelse return;
+        if (method_v != .string) return;
+        const params_v = msg.object.get("params") orelse return;
+        if (params_v != .object) return;
+        const p = params_v.object;
+
+        if (mem.eql(u8, method_v.string, "Target.attachedToTarget")) {
+            const session_v = p.get("sessionId") orelse return;
+            const ti_v = p.get("targetInfo") orelse return;
+            if (session_v != .string or ti_v != .object) return;
+            const ti = ti_v.object;
+            const type_v = ti.get("type") orelse return;
+            if (type_v != .string or !mem.eql(u8, type_v.string, "iframe")) return;
+            const target_v = ti.get("targetId") orelse return;
+            if (target_v != .string) return;
+            const parent_v = ti.get("parentFrameId");
+
+            const fid = target_v.string;
+            try self.putOopif(&self.oopif_session.?, fid, session_v.string);
+            if (parent_v) |pv| {
+                if (pv == .string) try self.putOopif(&self.oopif_parent.?, fid, pv.string);
+            }
+        } else if (mem.eql(u8, method_v.string, "Target.detachedFromTarget")) {
+            const session_v = p.get("sessionId") orelse return;
+            if (session_v != .string) return;
+            // Remove any frameId whose session matches.
+            var it = self.oopif_session.?.iterator();
+            var victim: ?[]const u8 = null;
+            while (it.next()) |e| {
+                if (mem.eql(u8, e.value_ptr.*, session_v.string)) {
+                    victim = e.key_ptr.*;
+                    break;
+                }
+            }
+            if (victim) |fid| {
+                if (self.oopif_session.?.fetchRemove(fid)) |kv| {
+                    self.allocator.free(kv.key);
+                    self.allocator.free(kv.value);
+                }
+                if (self.oopif_parent.?.fetchRemove(fid)) |kv| {
+                    self.allocator.free(kv.key);
+                    self.allocator.free(kv.value);
+                }
+            }
+        }
+    }
+
+    /// Insert/replace a frameId -> value mapping, duplicating both strings.
+    fn putOopif(self: *Connection, map: *std.StringHashMap([]u8), key: []const u8, value: []const u8) !void {
+        if (map.fetchRemove(key)) |kv| {
+            self.allocator.free(kv.key);
+            self.allocator.free(kv.value);
+        }
+        const k = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(k);
+        const v = try self.allocator.dupe(u8, value);
+        try map.put(k, v);
+    }
+
+    /// Enable Page + Target auto-attach so cross-origin OOPIF frames (one level
+    /// below the main page) are discoverable and routable. Idempotent.
+    ///
+    /// Note: auto-attach is enabled only on the main session, so a single level
+    /// of OOPIF is fully supported. Frames nested INSIDE an OOPIF (OOPIF-within-
+    /// OOPIF) are not attached and are silently omitted — chasing them by
+    /// enabling auto-attach on child sessions proved able to hang the event
+    /// stream, so it is deliberately not done.
+    fn ensureFrameSupport(self: *Connection) !void {
+        if (self.frame_support_enabled) return;
+        self.frame_support_enabled = true;
+
+        {
+            var r = self.send("Page.enable", null) catch |e| return e;
+            r.deinit();
+        }
+        try self.enableAutoAttach(null);
+        // Drain any attach events now in flight.
+        {
+            var r = self.send("Target.getTargets", null) catch |e| return e;
+            r.deinit();
+        }
+    }
+
+    fn enableAutoAttach(self: *Connection, session_id: ?[]const u8) !void {
+        var p: json.ObjectMap = .empty;
+        defer p.deinit(self.allocator);
+        try p.put(self.allocator, "autoAttach", .{ .bool = true });
+        try p.put(self.allocator, "waitForDebuggerOnStart", .{ .bool = false });
+        try p.put(self.allocator, "flatten", .{ .bool = true });
+        var r = try self.sendSession("Target.setAutoAttach", .{ .object = p }, session_id);
+        r.deinit();
     }
 
     /// Parse a Runtime.evaluate CDP result into an EvalResult.
@@ -325,15 +458,16 @@ pub const Connection = struct {
         return self.parseEvalResult(cdp_result.result);
     }
 
-    /// Evaluate JavaScript within a specific execution context (used for frames).
-    fn evalInContext(self: *Connection, context_id: i64, expression: []const u8) !EvalResult {
+    /// Evaluate JavaScript within a specific execution context (used for frames),
+    /// optionally on an OOPIF session.
+    fn evalInContext(self: *Connection, context_id: i64, expression: []const u8, session: ?[]const u8) !EvalResult {
         var params_obj: json.ObjectMap = .empty;
         defer params_obj.deinit(self.allocator);
         try params_obj.put(self.allocator, "expression", .{ .string = expression });
         try params_obj.put(self.allocator, "returnByValue", .{ .bool = true });
         try params_obj.put(self.allocator, "contextId", .{ .integer = context_id });
 
-        var cdp_result = try self.send("Runtime.evaluate", .{ .object = params_obj });
+        var cdp_result = try self.sendSession("Runtime.evaluate", .{ .object = params_obj }, session);
         defer cdp_result.deinit();
         return self.parseEvalResult(cdp_result.result);
     }
@@ -341,14 +475,14 @@ pub const Connection = struct {
     /// Create an isolated world for a frame and return its execution context id.
     /// Isolated worlds share the frame's DOM and session (cookies/login) but not
     /// the page's own JS globals — sufficient for DOM reads, clicks, form fills.
-    fn createIsolatedWorld(self: *Connection, frame_id: []const u8) !i64 {
+    fn createIsolatedWorld(self: *Connection, frame_id: []const u8, session: ?[]const u8) !i64 {
         var p: json.ObjectMap = .empty;
         defer p.deinit(self.allocator);
         try p.put(self.allocator, "frameId", .{ .string = frame_id });
         try p.put(self.allocator, "worldName", .{ .string = "hibrow" });
         try p.put(self.allocator, "grantUniveralAccess", .{ .bool = true });
 
-        var r = try self.send("Page.createIsolatedWorld", .{ .object = p });
+        var r = try self.sendSession("Page.createIsolatedWorld", .{ .object = p }, session);
         defer r.deinit();
         if (r.result == .object) {
             if (r.result.object.get("executionContextId")) |c| {
@@ -359,15 +493,15 @@ pub const Connection = struct {
     }
 
     /// Find the child-frame index of the <iframe>/<frame> matching `selector`
-    /// within the frame identified by `frame_id`.
-    fn selectorFrameIndex(self: *Connection, frame_id: []const u8, selector: []const u8) !usize {
-        const ctx = try self.createIsolatedWorld(frame_id);
+    /// within the frame identified by `frame_id` (on the given session).
+    fn selectorFrameIndex(self: *Connection, frame_id: []const u8, session: ?[]const u8, selector: []const u8) !usize {
+        const ctx = try self.createIsolatedWorld(frame_id, session);
         const sel_json = try json.Stringify.valueAlloc(self.allocator, json.Value{ .string = selector }, .{});
         defer self.allocator.free(sel_json);
         const expr = try std.fmt.allocPrint(self.allocator, "(function(){{var t=document.querySelector({s});var l=[].slice.call(document.querySelectorAll('iframe,frame'));return l.indexOf(t);}})()", .{sel_json});
         defer self.allocator.free(expr);
 
-        const res = try self.evalInContext(ctx, expr);
+        const res = try self.evalInContext(ctx, expr, session);
         if (res.exception) |e| {
             self.allocator.free(e);
             return error.FrameNotFound;
@@ -376,44 +510,104 @@ pub const Connection = struct {
         return error.FrameNotFound;
     }
 
-    /// Resolve a frame path ("1,0,0" / "#outer/#inner") to a CDP frameId.
-    /// Caller owns the returned slice.
-    fn resolveFramePath(self: *Connection, frame_path: []const u8) ![]u8 {
-        var tree = try self.send("Page.getFrameTree", null);
-        defer tree.deinit();
+    /// A resolved frame: its CDP frameId plus the OOPIF session that owns it
+    /// (null = the main page session). Both strings are owned by the caller.
+    const FrameTarget = struct {
+        session: ?[]u8,
+        frame_id: []u8,
+
+        fn deinit(t: *FrameTarget, allocator: mem.Allocator) void {
+            if (t.session) |s| allocator.free(s);
+            allocator.free(t.frame_id);
+        }
+    };
+
+    /// Resolve a frame path ("1,0,0" / "#outer/#inner") to a FrameTarget, walking
+    /// a unified tree where each frame's children are its same-process children
+    /// (from Page.getFrameTree) followed by its OOPIF children (from auto-attach).
+    fn resolveFrameTarget(self: *Connection, frame_path: []const u8) !FrameTarget {
+        try self.ensureFrameSupport();
+
+        var tree = try self.sendSession("Page.getFrameTree", null, null);
+        var owns_tree = true;
+        defer if (owns_tree) tree.deinit();
+
         if (tree.result != .object) return error.FrameNotFound;
         var node = tree.result.object.get("frameTree") orelse return error.FrameNotFound;
 
+        var current_session: ?[]u8 = null;
+        errdefer if (current_session) |s| self.allocator.free(s);
         var current_id = try self.allocator.dupe(u8, frameIdOf(node) orelse return error.FrameNotFound);
         errdefer self.allocator.free(current_id);
 
         var it = mem.tokenizeAny(u8, frame_path, ",/");
         while (it.next()) |seg| {
             const children = node.object.get("childFrames");
-            const arr: []const json.Value = if (children) |c|
+            const same: []const json.Value = if (children) |c|
                 (if (c == .array) c.array.items else &.{})
             else
                 &.{};
 
-            const index: usize = std.fmt.parseInt(usize, seg, 10) catch
-                try self.selectorFrameIndex(current_id, seg);
-            if (index >= arr.len) return error.FrameNotFound;
+            var oopif = try self.oopifChildrenOf(current_id);
+            defer freeStrList(self.allocator, &oopif);
 
-            node = arr[index];
-            const next_id = frameIdOf(node) orelse return error.FrameNotFound;
-            self.allocator.free(current_id);
-            current_id = try self.allocator.dupe(u8, next_id);
+            const total = same.len + oopif.items.len;
+            const index: usize = std.fmt.parseInt(usize, seg, 10) catch
+                try self.selectorFrameIndex(current_id, current_session, seg);
+            if (index >= total) return error.FrameNotFound;
+
+            if (index < same.len) {
+                node = same[index];
+                const next_id = frameIdOf(node) orelse return error.FrameNotFound;
+                self.allocator.free(current_id);
+                current_id = try self.allocator.dupe(u8, next_id);
+            } else {
+                const oopif_fid = oopif.items[index - same.len];
+                const sess = self.oopif_session.?.get(oopif_fid) orelse return error.FrameNotFound;
+                const new_session = try self.allocator.dupe(u8, sess);
+                if (current_session) |s| self.allocator.free(s);
+                current_session = new_session;
+                self.allocator.free(current_id);
+                current_id = try self.allocator.dupe(u8, oopif_fid);
+
+                const sub = try self.sendSession("Page.getFrameTree", null, current_session);
+                if (owns_tree) tree.deinit();
+                tree = sub;
+                owns_tree = true;
+                if (tree.result != .object) return error.FrameNotFound;
+                node = tree.result.object.get("frameTree") orelse return error.FrameNotFound;
+            }
         }
-        return current_id;
+        return .{ .session = current_session, .frame_id = current_id };
     }
 
-    /// Evaluate `expression` inside a nested frame (see resolveFramePath for the
-    /// `frame_path` grammar). Runs in an isolated world of the target frame.
+    /// OOPIF frameIds whose parent is `frame_id`, sorted for stable ordering.
+    /// Returns OWNED copies (safe across later map mutation); caller frees each
+    /// item and deinits the list via `freeStrList`.
+    fn oopifChildrenOf(self: *Connection, frame_id: []const u8) !std.ArrayList([]const u8) {
+        var list: std.ArrayList([]const u8) = .empty;
+        errdefer freeStrList(self.allocator, &list);
+        var mit = self.oopif_parent.?.iterator();
+        while (mit.next()) |e| {
+            if (mem.eql(u8, e.value_ptr.*, frame_id)) {
+                try list.append(self.allocator, try self.allocator.dupe(u8, e.key_ptr.*));
+            }
+        }
+        std.mem.sort([]const u8, list.items, {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return mem.order(u8, a, b) == .lt;
+            }
+        }.lt);
+        return list;
+    }
+
+    /// Evaluate `expression` inside a nested frame. Runs in an isolated world of
+    /// the target frame (routed to its OOPIF session if cross-process).
     pub fn evalInFrame(self: *Connection, frame_path: []const u8, expression: []const u8) !EvalResult {
-        const frame_id = try self.resolveFramePath(frame_path);
-        defer self.allocator.free(frame_id);
-        const ctx = try self.createIsolatedWorld(frame_id);
-        return self.evalInContext(ctx, expression);
+        var target = try self.resolveFrameTarget(frame_path);
+        defer target.deinit(self.allocator);
+        const ctx = try self.createIsolatedWorld(target.frame_id, target.session);
+        return self.evalInContext(ctx, expression, target.session);
     }
 
     /// Click the element matching `selector` in the top frame. Scrolls it into
@@ -430,78 +624,126 @@ pub const Connection = struct {
     pub fn clickInFrame(self: *Connection, frame_path: []const u8, selector: []const u8) !void {
         const expr = try clickerExpr(self.allocator, selector);
         defer self.allocator.free(expr);
-        const frame_id = try self.resolveFramePath(frame_path);
-        defer self.allocator.free(frame_id);
-        const ctx = try self.createIsolatedWorld(frame_id);
-        const r = try self.evalInContext(ctx, expr);
+        var target = try self.resolveFrameTarget(frame_path);
+        defer target.deinit(self.allocator);
+        const ctx = try self.createIsolatedWorld(target.frame_id, target.session);
+        const r = try self.evalInContext(ctx, expr, target.session);
         if (r.value == .bool and r.value.bool) return;
         return error.ElementNotFound;
     }
 
-    /// List all (nested) frames as an array of {path, url, name}, where `path`
-    /// is the index path usable with evalInFrame (e.g. "0", "0/1").
+    /// List all (nested) frames, including cross-origin OOPIF frames, as an array
+    /// of {path, parent, url, name, selector, title}. `path` is usable directly
+    /// with `--frame` (e.g. "0", "0/1").
     pub fn frameList(self: *Connection) !json.Value {
-        var tree = try self.send("Page.getFrameTree", null);
+        try self.ensureFrameSupport();
+        var tree = try self.sendSession("Page.getFrameTree", null, null);
         defer tree.deinit();
         var arr = json.Array.init(self.allocator);
         if (tree.result == .object) {
             if (tree.result.object.get("frameTree")) |root| {
-                try self.appendChildFrames(&arr, root, "");
+                if (frameIdOf(root)) |root_id| {
+                    try self.appendFramesUnified(&arr, root, root_id, null, "");
+                }
             }
         }
         return .{ .array = arr };
     }
 
-    fn appendChildFrames(self: *Connection, arr: *json.Array, node: json.Value, prefix: []const u8) !void {
+    /// Append the children of frame (frame_id / session, whose subtree node is
+    /// `node`) to `arr`, same-process children first then OOPIF children, recursing.
+    fn appendFramesUnified(self: *Connection, arr: *json.Array, node: json.Value, frame_id: []const u8, session: ?[]const u8, prefix: []const u8) !void {
         if (node != .object) return;
-        const parent_id = frameIdOf(node);
-        const children = node.object.get("childFrames") orelse return;
-        if (children != .array) return;
-        for (children.array.items, 0..) |child, i| {
-            const path = if (prefix.len == 0)
-                try std.fmt.allocPrint(self.allocator, "{d}", .{i})
-            else
-                try std.fmt.allocPrint(self.allocator, "{s}/{d}", .{ prefix, i });
+        const children = node.object.get("childFrames");
+        const same: []const json.Value = if (children) |c|
+            (if (c == .array) c.array.items else &.{})
+        else
+            &.{};
+
+        // Same-process children.
+        for (same, 0..) |child, i| {
             const frame = if (child == .object) child.object.get("frame") else null;
-
-            // Selector hint: evaluated in the PARENT frame's context.
-            var selector = try self.allocator.dupe(u8, "");
-            if (parent_id) |pid| {
-                if (self.createIsolatedWorld(pid)) |ctx| {
-                    const sexpr = try std.fmt.allocPrint(self.allocator, "(function(){{var e=document.querySelectorAll('iframe,frame')[{d}];return e?(e.id?('#'+e.id):(e.name?('[name=\"'+e.name+'\"]'):'')):'';}})()", .{i});
-                    defer self.allocator.free(sexpr);
-                    if (self.evalInContext(ctx, sexpr)) |sr| {
-                        if (sr.value == .string) {
-                            self.allocator.free(selector);
-                            selector = try self.allocator.dupe(u8, sr.value.string);
-                        }
-                    } else |_| {}
-                } else |_| {}
-            }
-
-            // Title: evaluated in the CHILD frame's context.
-            var title = try self.allocator.dupe(u8, "");
+            try self.appendOneFrame(arr, prefix, i, i, frame_id, session, frameIdOf(child), session, frameField(frame, "url"), frameField(frame, "name"));
+            const path = try self.framePath(prefix, i);
+            defer self.allocator.free(path);
             if (frameIdOf(child)) |cid| {
-                if (self.createIsolatedWorld(cid)) |ctx| {
-                    if (self.evalInContext(ctx, "document.title")) |tr| {
-                        if (tr.value == .string) {
-                            self.allocator.free(title);
-                            title = try self.allocator.dupe(u8, tr.value.string);
-                        }
-                    } else |_| {}
-                } else |_| {}
+                try self.appendFramesUnified(arr, child, cid, session, path);
             }
-
-            var obj: json.ObjectMap = .empty;
-            try obj.put(self.allocator, "path", .{ .string = path });
-            try obj.put(self.allocator, "parent", .{ .string = try self.allocator.dupe(u8, prefix) });
-            try obj.put(self.allocator, "url", .{ .string = try self.allocator.dupe(u8, frameField(frame, "url")) });
-            try obj.put(self.allocator, "name", .{ .string = try self.allocator.dupe(u8, frameField(frame, "name")) });
-            try obj.put(self.allocator, "selector", .{ .string = selector });
-            try obj.put(self.allocator, "title", .{ .string = title });
-            try arr.append(.{ .object = obj });
-            try self.appendChildFrames(arr, child, path);
         }
+
+        // OOPIF children.
+        var oopif = try self.oopifChildrenOf(frame_id);
+        defer freeStrList(self.allocator, &oopif);
+        for (oopif.items, 0..) |oopif_fid, j| {
+            const index = same.len + j;
+            const child_session = self.oopif_session.?.get(oopif_fid) orelse continue;
+            var sub = self.sendSession("Page.getFrameTree", null, child_session) catch continue;
+            defer sub.deinit();
+            const sub_root = if (sub.result == .object) sub.result.object.get("frameTree") else null;
+            const frame = if (sub_root) |sr| (if (sr == .object) sr.object.get("frame") else null) else null;
+            try self.appendOneFrame(arr, prefix, index, index, frame_id, session, oopif_fid, child_session, frameField(frame, "url"), frameField(frame, "name"));
+            const path = try self.framePath(prefix, index);
+            defer self.allocator.free(path);
+            if (sub_root) |sr| try self.appendFramesUnified(arr, sr, oopif_fid, child_session, path);
+        }
+    }
+
+    fn framePath(self: *Connection, prefix: []const u8, index: usize) ![]u8 {
+        return if (prefix.len == 0)
+            std.fmt.allocPrint(self.allocator, "{d}", .{index})
+        else
+            std.fmt.allocPrint(self.allocator, "{s}/{d}", .{ prefix, index });
+    }
+
+    /// Append a single frame entry (with selector hint from the parent context
+    /// and title from the child context).
+    fn appendOneFrame(
+        self: *Connection,
+        arr: *json.Array,
+        prefix: []const u8,
+        path_index: usize,
+        dom_index: usize,
+        parent_frame_id: []const u8,
+        parent_session: ?[]const u8,
+        child_frame_id: ?[]const u8,
+        child_session: ?[]const u8,
+        url: []const u8,
+        name: []const u8,
+    ) !void {
+        const path = try self.framePath(prefix, path_index);
+
+        var selector = try self.allocator.dupe(u8, "");
+        if (self.createIsolatedWorld(parent_frame_id, parent_session)) |ctx| {
+            const sexpr = try std.fmt.allocPrint(self.allocator, "(function(){{var e=document.querySelectorAll('iframe,frame')[{d}];return e?(e.id?('#'+e.id):(e.name?('[name=\"'+e.name+'\"]'):'')):'';}})()", .{dom_index});
+            defer self.allocator.free(sexpr);
+            if (self.evalInContext(ctx, sexpr, parent_session)) |sr| {
+                if (sr.value == .string) {
+                    self.allocator.free(selector);
+                    selector = try self.allocator.dupe(u8, sr.value.string);
+                }
+            } else |_| {}
+        } else |_| {}
+
+        var title = try self.allocator.dupe(u8, "");
+        if (child_frame_id) |cid| {
+            if (self.createIsolatedWorld(cid, child_session)) |ctx| {
+                if (self.evalInContext(ctx, "document.title", child_session)) |tr| {
+                    if (tr.value == .string) {
+                        self.allocator.free(title);
+                        title = try self.allocator.dupe(u8, tr.value.string);
+                    }
+                } else |_| {}
+            } else |_| {}
+        }
+
+        var obj: json.ObjectMap = .empty;
+        try obj.put(self.allocator, "path", .{ .string = path });
+        try obj.put(self.allocator, "parent", .{ .string = try self.allocator.dupe(u8, prefix) });
+        try obj.put(self.allocator, "url", .{ .string = try self.allocator.dupe(u8, url) });
+        try obj.put(self.allocator, "name", .{ .string = try self.allocator.dupe(u8, name) });
+        try obj.put(self.allocator, "selector", .{ .string = selector });
+        try obj.put(self.allocator, "title", .{ .string = title });
+        try arr.append(.{ .object = obj });
     }
 
     /// Navigate the connected target to a URL.
@@ -603,18 +845,28 @@ pub const Connection = struct {
         return error.InvalidResponse;
     }
 
-    /// Capture a PNG (base64) of a nested frame's rendered region, by clipping
-    /// to the frame's rectangle (accumulated across the nesting path).
+    /// Capture a PNG (base64) of a nested frame's rendered region by clipping the
+    /// top page screenshot to the frame's rectangle (accumulated across the path).
+    /// Works for same-process and cross-origin OOPIF frames (which are composited
+    /// into the top page, so a top-level clip captures their pixels).
     pub fn screenshotFrame(self: *Connection, frame_path: []const u8) ![]const u8 {
         const rect = try self.resolveFrameRect(frame_path);
         return self.captureClip(rect.x, rect.y, rect.w, rect.h);
     }
 
+    /// Resolve a frame path to its rectangle in the TOP viewport, walking the
+    /// unified tree (same-process + OOPIF) and accumulating each hop's owner
+    /// iframe rect (evaluated in the parent frame's — possibly OOPIF — context).
     fn resolveFrameRect(self: *Connection, frame_path: []const u8) !Rect {
-        var tree = try self.send("Page.getFrameTree", null);
-        defer tree.deinit();
+        try self.ensureFrameSupport();
+        var tree = try self.sendSession("Page.getFrameTree", null, null);
+        var owns_tree = true;
+        defer if (owns_tree) tree.deinit();
         if (tree.result != .object) return error.FrameNotFound;
         var node = tree.result.object.get("frameTree") orelse return error.FrameNotFound;
+
+        var current_session: ?[]u8 = null;
+        defer if (current_session) |s| self.allocator.free(s);
         var current_id = try self.allocator.dupe(u8, frameIdOf(node) orelse return error.FrameNotFound);
         defer self.allocator.free(current_id);
 
@@ -625,40 +877,52 @@ pub const Connection = struct {
         var it = mem.tokenizeAny(u8, frame_path, ",/");
         while (it.next()) |seg| {
             const children = node.object.get("childFrames");
-            const arr: []const json.Value = if (children) |c|
+            const same: []const json.Value = if (children) |c|
                 (if (c == .array) c.array.items else &.{})
             else
                 &.{};
+            var oopif = try self.oopifChildrenOf(current_id);
+            defer freeStrList(self.allocator, &oopif);
+            const total = same.len + oopif.items.len;
 
-            var index: usize = undefined;
-            var elem_expr: []u8 = undefined;
-            if (std.fmt.parseInt(usize, seg, 10)) |i| {
-                index = i;
-                elem_expr = try std.fmt.allocPrint(self.allocator, "document.querySelectorAll('iframe,frame')[{d}]", .{i});
-            } else |_| {
-                index = try self.selectorFrameIndex(current_id, seg);
-                const sel_json = try json.Stringify.valueAlloc(self.allocator, json.Value{ .string = seg }, .{});
-                defer self.allocator.free(sel_json);
-                elem_expr = try std.fmt.allocPrint(self.allocator, "document.querySelector({s})", .{sel_json});
-            }
-            defer self.allocator.free(elem_expr);
-            if (index >= arr.len) return error.FrameNotFound;
+            const index: usize = std.fmt.parseInt(usize, seg, 10) catch
+                try self.selectorFrameIndex(current_id, current_session, seg);
+            if (index >= total) return error.FrameNotFound;
 
-            const ctx = try self.createIsolatedWorld(current_id);
-            const rect_expr = try std.fmt.allocPrint(self.allocator, "(function(){{var e={s};var r=e.getBoundingClientRect();return [r.left,r.top,r.width,r.height];}})()", .{elem_expr});
+            // Rect of the owner iframe element at `index` in the current frame.
+            const ctx = try self.createIsolatedWorld(current_id, current_session);
+            const rect_expr = try std.fmt.allocPrint(self.allocator, "(function(){{var e=document.querySelectorAll('iframe,frame')[{d}];if(!e)return[0,0,0,0];var r=e.getBoundingClientRect();return [r.left,r.top,r.width,r.height];}})()", .{index});
             defer self.allocator.free(rect_expr);
-            const rr = try self.evalInContext(ctx, rect_expr);
-            if (rr.value != .array or rr.value.array.items.len < 4) return error.FrameNotFound;
-            const items = rr.value.array.items;
-            acc_x += numOf(items[0], 0);
-            acc_y += numOf(items[1], 0);
-            w = numOf(items[2], 0);
-            h = numOf(items[3], 0);
+            const rr = try self.evalInContext(ctx, rect_expr, current_session);
+            if (rr.value == .array and rr.value.array.items.len >= 4) {
+                const items = rr.value.array.items;
+                acc_x += numOf(items[0], 0);
+                acc_y += numOf(items[1], 0);
+                w = numOf(items[2], 0);
+                h = numOf(items[3], 0);
+            }
 
-            node = arr[index];
-            const next_id = frameIdOf(node) orelse return error.FrameNotFound;
-            self.allocator.free(current_id);
-            current_id = try self.allocator.dupe(u8, next_id);
+            if (index < same.len) {
+                node = same[index];
+                const next_id = frameIdOf(node) orelse return error.FrameNotFound;
+                self.allocator.free(current_id);
+                current_id = try self.allocator.dupe(u8, next_id);
+            } else {
+                const oopif_fid = oopif.items[index - same.len];
+                const sess = self.oopif_session.?.get(oopif_fid) orelse return error.FrameNotFound;
+                const new_session = try self.allocator.dupe(u8, sess);
+                if (current_session) |s| self.allocator.free(s);
+                current_session = new_session;
+                self.allocator.free(current_id);
+                current_id = try self.allocator.dupe(u8, oopif_fid);
+
+                const sub = try self.sendSession("Page.getFrameTree", null, current_session);
+                if (owns_tree) tree.deinit();
+                tree = sub;
+                owns_tree = true;
+                if (tree.result != .object) return error.FrameNotFound;
+                node = tree.result.object.get("frameTree") orelse return error.FrameNotFound;
+            }
         }
         if (w == 0 or h == 0) return error.FrameNotFound;
         return .{ .x = acc_x, .y = acc_y, .w = w, .h = h };
@@ -748,7 +1012,7 @@ pub fn activateTarget(allocator: mem.Allocator, io: std.Io, port: u16, target_id
 // ---------------------------------------------------------------------------
 
 /// Build a CDP JSON message string.
-fn buildCdpMessage(allocator: mem.Allocator, id: u64, method: []const u8, params: ?json.Value) ![]u8 {
+fn buildCdpMessage(allocator: mem.Allocator, id: u64, method: []const u8, params: ?json.Value, session_id: ?[]const u8) ![]u8 {
     // Build as json.Value manually for correct serialization
     var msg_obj: json.ObjectMap = .empty;
     defer msg_obj.deinit(allocator);
@@ -756,6 +1020,9 @@ fn buildCdpMessage(allocator: mem.Allocator, id: u64, method: []const u8, params
     try msg_obj.put(allocator, "method", .{ .string = method });
     if (params) |p| {
         try msg_obj.put(allocator, "params", p);
+    }
+    if (session_id) |s| {
+        try msg_obj.put(allocator, "sessionId", .{ .string = s });
     }
 
     return try json.Stringify.valueAlloc(allocator, json.Value{ .object = msg_obj }, .{});
@@ -903,7 +1170,7 @@ test "parseWsUrl rejects empty host" {
 
 test "buildCdpMessage produces valid JSON" {
     const allocator = std.testing.allocator;
-    const msg = try buildCdpMessage(allocator, 1, "Runtime.evaluate", null);
+    const msg = try buildCdpMessage(allocator, 1, "Runtime.evaluate", null, null);
     defer allocator.free(msg);
 
     const parsed = try json.parseFromSlice(json.Value, allocator, msg, .{});
@@ -920,7 +1187,7 @@ test "buildCdpMessage with params" {
     defer params.deinit(allocator);
     try params.put(allocator, "expression", .{ .string = "1+1" });
 
-    const msg = try buildCdpMessage(allocator, 5, "Runtime.evaluate", .{ .object = params });
+    const msg = try buildCdpMessage(allocator, 5, "Runtime.evaluate", .{ .object = params }, null);
     defer allocator.free(msg);
 
     const parsed = try json.parseFromSlice(json.Value, allocator, msg, .{});

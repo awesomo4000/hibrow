@@ -436,10 +436,11 @@ hibrow screenshot work -o lesson.png --frame 0/0          # screenshot just the 
 Works on Chrome (CDP execution contexts) and Firefox (Marionette SwitchToFrame),
 preserving the session (cookies/login). On Chrome the frame eval runs in an
 isolated world: full DOM access (read text, click, fill) but not the frame
-page's own JS globals; and **cross-origin out-of-process (OOPIF) frames are not
-supported on Chrome — use `--browser firefox` for those.** If a `--frame` op
-returns null/empty, the frame may still be loading — `wait`, or `frame list` to
-confirm the path.
+page's own JS globals. Chrome supports **one level** of cross-origin
+out-of-process (OOPIF) frame; for **deeply nested cross-origin** frames
+(cross-origin inside cross-origin), use `--browser firefox`, which handles
+arbitrary nesting. If a `--frame` op returns null/empty, the frame may still be
+loading — `wait`, or `frame list` to confirm the path.
 
 ## Tabs
 
