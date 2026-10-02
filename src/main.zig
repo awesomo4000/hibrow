@@ -9,6 +9,12 @@ const json = std.json;
 const mem = std.mem;
 const hibrow = @import("hibrow");
 
+/// Don't dump a stack trace for "unexpected" errnos. hibrow handles its own
+/// errors (e.g. connecting to a stale/absent gateway socket returns
+/// ECONNREFUSED, which Zig 0.16 does not map to a named error — without this it
+/// would print an alarming trace on a normal `gateway status` / auto-start).
+pub const std_options: std.Options = .{ .unexpected_error_tracing = false };
+
 const usage =
     \\Usage: hibrow <command> [options]
     \\
