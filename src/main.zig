@@ -55,6 +55,11 @@ const usage =
     \\      Poll until a selector appears (or disappears with --gone). Default
     \\      timeout 10s.
     \\
+    \\  media list|mute|unmute|play|pause|wait-ended <profile[:tab]> [selector] [--frame <path>]
+    \\      Inspect/control <video>/<audio>. 'list' reports state + caption tracks;
+    \\      'mute [--persist]' mutes (and keeps new players muted); 'wait-ended'
+    \\      polls until a media element finishes (--timeout <secs>).
+    \\
     \\  tab list|new|close|switch <profile[:tab]>
     \\      Manage tabs within a browser profile.
     \\
@@ -140,6 +145,7 @@ pub fn main(init: std.process.Init) !void {
         .{ "frame", cmdFrame },
         .{ "click", cmdClick },
         .{ "wait", cmdWait },
+        .{ "media", cmdMedia },
         .{ "kill", cmdKill },
         .{ "url", cmdUrl },
         .{ "console", cmdConsole },
@@ -431,6 +437,139 @@ fn cmdWait(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
         std.process.exit(1);
     }
     printJsonValue(allocator, resp.result);
+}
+
+fn cmdMedia(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
+    const sub = args.next() orelse {
+        writeStderr("Error: media requires a subcommand (list|mute|unmute|play|pause|wait-ended)\n", .{});
+        std.process.exit(1);
+    };
+    const target = args.next() orelse {
+        writeStderr("Error: media requires a profile[:tab]\n", .{});
+        std.process.exit(1);
+    };
+    const profile = parseProfile(target);
+
+    var selector: ?[]const u8 = null;
+    var frame: ?[]const u8 = null;
+    var persist = false;
+    var timeout_s: f64 = 120;
+    while (args.next()) |a| {
+        if (mem.eql(u8, a, "--frame")) {
+            frame = args.next() orelse {
+                writeStderr("Error: --frame requires a selector or path\n", .{});
+                std.process.exit(1);
+            };
+        } else if (mem.eql(u8, a, "--persist")) {
+            persist = true;
+        } else if (mem.eql(u8, a, "--timeout")) {
+            const s = args.next() orelse {
+                writeStderr("Error: --timeout requires seconds\n", .{});
+                std.process.exit(1);
+            };
+            timeout_s = std.fmt.parseFloat(f64, s) catch {
+                writeStderr("Error: --timeout must be a number of seconds\n", .{});
+                std.process.exit(1);
+            };
+        } else {
+            selector = a;
+        }
+    }
+    const media_sel = selector orelse "video,audio";
+    const sel_json = json.Stringify.valueAlloc(allocator, json.Value{ .string = media_sel }, .{}) catch {
+        writeStderr("Error: out of memory\n", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(sel_json);
+
+    const MUTE_JS = "(function(){var l=document.querySelectorAll('video,audio');l.forEach(function(m){m.muted=true});return {muted:l.length}})()";
+    const MUTE_PERSIST_JS = "(function(){var mute=function(){document.querySelectorAll('video,audio').forEach(function(m){m.muted=true})};mute();if(!window.__hibrowMute){window.__hibrowMute=new MutationObserver(mute);window.__hibrowMute.observe(document.documentElement,{childList:true,subtree:true})}return {muted:true,persist:true}})()";
+    const UNMUTE_JS = "(function(){if(window.__hibrowMute){window.__hibrowMute.disconnect();window.__hibrowMute=null}document.querySelectorAll('video,audio').forEach(function(m){m.muted=false});return {muted:false}})()";
+
+    var owned_js: ?[]u8 = null;
+    defer if (owned_js) |j| allocator.free(j);
+    var js: []const u8 = undefined;
+
+    if (mem.eql(u8, sub, "list") or mem.eql(u8, sub, "state")) {
+        owned_js = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ "Array.from(document.querySelectorAll(", sel_json, ")).map(function(m,i){return {i:i,tag:m.tagName.toLowerCase(),src:m.currentSrc||m.src||'',duration:m.duration,currentTime:m.currentTime,paused:m.paused,ended:m.ended,muted:m.muted,readyState:m.readyState,captions:Array.from(m.textTracks||[]).map(function(t){return {kind:t.kind,label:t.label,language:t.language,mode:t.mode}})}})" }) catch oom();
+        js = owned_js.?;
+    } else if (mem.eql(u8, sub, "mute")) {
+        js = if (persist) MUTE_PERSIST_JS else MUTE_JS;
+    } else if (mem.eql(u8, sub, "unmute")) {
+        js = UNMUTE_JS;
+    } else if (mem.eql(u8, sub, "play")) {
+        owned_js = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ "(function(){var e=document.querySelector(", sel_json, ");if(!e)return {error:'not found'};try{e.play()}catch(x){}return {tag:e.tagName.toLowerCase(),paused:e.paused,currentTime:e.currentTime,duration:e.duration}})()" }) catch oom();
+        js = owned_js.?;
+    } else if (mem.eql(u8, sub, "pause")) {
+        owned_js = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ "(function(){var e=document.querySelector(", sel_json, ");if(!e)return {error:'not found'};try{e.pause()}catch(x){}return {tag:e.tagName.toLowerCase(),paused:e.paused,currentTime:e.currentTime}})()" }) catch oom();
+        js = owned_js.?;
+    } else if (mem.eql(u8, sub, "wait-ended")) {
+        const check = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ "(function(){var e=document.querySelector(", sel_json, ");return e?{ended:e.ended,paused:e.paused,currentTime:e.currentTime,duration:e.duration}:null})()" }) catch oom();
+        defer allocator.free(check);
+        var elapsed: f64 = 0;
+        const deadline_ms = timeout_s * 1000.0;
+        while (elapsed <= deadline_ms) {
+            // The gateway serves one request per connection, so reconnect each poll.
+            var poll_client = hibrow.Client.connect(allocator, g_io) catch |err| {
+                writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            var resp = poll_client.eval(profile, check, frame) catch |err| {
+                poll_client.disconnect();
+                writeStderr("Error: media wait-ended failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            if (resp.is_error) {
+                printError(allocator, resp.result);
+                resp.deinit();
+                poll_client.disconnect();
+                std.process.exit(1);
+            }
+            const ended = blk: {
+                if (resp.result == .object) {
+                    if (resp.result.object.get("ended")) |e| if (e == .bool) break :blk e.bool;
+                }
+                break :blk false;
+            };
+            if (ended) {
+                printJsonValue(allocator, resp.result);
+                resp.deinit();
+                poll_client.disconnect();
+                return;
+            }
+            resp.deinit();
+            poll_client.disconnect();
+            hibrow.gateway.sleepMs(1000);
+            elapsed += 1000;
+        }
+        writeStderr("Error: timeout waiting for media to end\n", .{});
+        std.process.exit(1);
+    } else {
+        writeStderr("Error: unknown media subcommand: {s}\n", .{sub});
+        std.process.exit(1);
+    }
+
+    var client = hibrow.Client.connect(allocator, g_io) catch |err| {
+        writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer client.disconnect();
+
+    var resp = client.eval(profile, js, frame) catch |err| {
+        writeStderr("Error: media {s} failed: {s}\n", .{ sub, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer resp.deinit();
+    if (resp.is_error) {
+        printError(allocator, resp.result);
+        std.process.exit(1);
+    }
+    printJsonValue(allocator, resp.result);
+}
+
+fn oom() noreturn {
+    writeStderr("Error: out of memory\n", .{});
+    std.process.exit(1);
 }
 
 fn cmdFrame(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {

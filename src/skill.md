@@ -445,6 +445,34 @@ out-of-process (OOPIF) frame; for **deeply nested cross-origin** frames
 arbitrary nesting. If a `--frame` op returns null/empty, the frame may still be
 loading — `wait`, or `frame list` to confirm the path.
 
+## Media (video / audio)
+
+Inspect and control `<video>`/`<audio>` elements. All subcommands are
+frame-aware — add `--frame <path>` to target media inside a frame:
+
+```bash
+hibrow media list work
+# [{"i":0,"tag":"video","src":"...","duration":212.5,"currentTime":0,
+#   "paused":true,"ended":false,"muted":false,"readyState":4,
+#   "captions":[{"kind":"captions","label":"English","language":"en","mode":"disabled"}]}]
+
+hibrow media mute work --persist      # mute all; --persist keeps SPA-created players muted
+hibrow media unmute work
+hibrow media play work "#player"      # best-effort (see note)
+hibrow media pause work "#player"
+hibrow media wait-ended work "#player" --timeout 600   # poll until the media ends
+```
+
+Notes:
+- **Autoplay policy** blocks programmatic `play()` for unmuted media without a
+  user gesture (the "`video.play()` did nothing" case). For a gated player,
+  **`hibrow click`** the play button (a trusted click) instead, then use the
+  media commands to inspect/await it.
+- `media list` reports each element's **caption tracks** — handy for summarizing
+  training videos.
+- After a carousel/tab switch, re-run `media list` to get the resulting state
+  (hidden players may pause).
+
 ## Tabs
 
 ```bash
