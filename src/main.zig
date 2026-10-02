@@ -40,7 +40,7 @@ const usage =
     \\  console <profile[:tab]>
     \\      Stream console output from a browser tab.
     \\
-    \\  frame list <profile>
+    \\  frame list <profile> [--tree]
     \\      List nested frames (path, url, name) for use with eval --frame.
     \\
     \\  eval <profile> --frame <path|selector> "<js>"
@@ -67,7 +67,7 @@ const usage =
     \\      Push text into the browser. Target is a CSS selector (sets .value)
     \\      or a window.* variable name (assigns directly).
     \\
-    \\  screenshot <profile[:tab]> -o <file>
+    \\  screenshot <profile[:tab]> -o <file> [--frame <path>]
     \\      Capture a screenshot of the browser tab and save as PNG.
     \\
     \\  gateway status
@@ -448,6 +448,11 @@ fn cmdFrame(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
     };
     const profile = parseProfile(target);
 
+    var tree = false;
+    while (args.next()) |a| {
+        if (mem.eql(u8, a, "--tree")) tree = true;
+    }
+
     var client = hibrow.Client.connect(allocator, g_io) catch |err| {
         writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
         std.process.exit(1);
@@ -464,7 +469,51 @@ fn cmdFrame(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
         printError(allocator, resp.result);
         std.process.exit(1);
     }
-    printJsonValue(allocator, resp.result);
+    if (tree) {
+        printFrameTree(resp.result);
+    } else {
+        printJsonValue(allocator, resp.result);
+    }
+}
+
+/// Print a flat frame list (DFS order) as an indented tree, using each entry's
+/// path depth for indentation.
+fn printFrameTree(result: json.Value) void {
+    if (result != .array) {
+        writeStdout("(no frames)\n", .{});
+        return;
+    }
+    if (result.array.items.len == 0) {
+        writeStdout("(no frames)\n", .{});
+        return;
+    }
+    for (result.array.items) |item| {
+        if (item != .object) continue;
+        const path = strField(item, "path");
+        const name = strField(item, "name");
+        const selector = strField(item, "selector");
+        const title = strField(item, "title");
+        const url = strField(item, "url");
+
+        var depth: usize = 0;
+        for (path) |c| {
+            if (c == '/') depth += 1;
+        }
+        var i: usize = 0;
+        while (i < depth) : (i += 1) writeStdout("  ", .{});
+
+        const label = if (selector.len > 0) selector else if (name.len > 0) name else "iframe";
+        writeStdout("[{s}] {s}", .{ path, label });
+        if (title.len > 0) writeStdout("  \"{s}\"", .{title});
+        writeStdout("  {s}\n", .{url});
+    }
+}
+
+fn strField(obj: json.Value, key: []const u8) []const u8 {
+    if (obj != .object) return "";
+    const v = obj.object.get(key) orelse return "";
+    if (v != .string) return "";
+    return v.string;
 }
 
 fn cmdEval(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
@@ -855,12 +904,18 @@ fn cmdScreenshot(allocator: mem.Allocator, args: *std.process.Args.Iterator) voi
     };
 
     var output: ?[]const u8 = null;
+    var frame: ?[]const u8 = null;
 
-    // Parse remaining args: -o <file>
+    // Parse remaining args: -o <file>, optional --frame <path>
     while (args.next()) |arg| {
         if (mem.eql(u8, arg, "-o")) {
             output = args.next() orelse {
                 writeStderr("Error: -o requires a filename\n", .{});
+                std.process.exit(1);
+            };
+        } else if (mem.eql(u8, arg, "--frame")) {
+            frame = args.next() orelse {
+                writeStderr("Error: --frame requires a selector or path\n", .{});
                 std.process.exit(1);
             };
         } else {
@@ -889,7 +944,7 @@ fn cmdScreenshot(allocator: mem.Allocator, args: *std.process.Args.Iterator) voi
     };
     defer client.disconnect();
 
-    var resp = client.screenshot(profile, tab) catch |err| {
+    var resp = client.screenshot(profile, tab, frame) catch |err| {
         writeStderr("Error: screenshot failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };

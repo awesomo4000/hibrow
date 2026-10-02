@@ -126,11 +126,12 @@ pub const Client = struct {
     }
 
     /// Take a screenshot of the named profile's browser. Returns base64 PNG.
-    pub fn screenshot(self: *Client, profile: []const u8, tab_idx: ?i64) !gateway.ParsedResponse {
+    pub fn screenshot(self: *Client, profile: []const u8, tab_idx: ?i64, frame: ?[]const u8) !gateway.ParsedResponse {
         var params: json.ObjectMap = .empty;
         defer params.deinit(self.allocator);
         try params.put(self.allocator, "profile", .{ .string = profile });
         if (tab_idx) |t| try params.put(self.allocator, "tab", .{ .integer = t });
+        if (frame) |f| try params.put(self.allocator, "frame", .{ .string = f });
         return self.gw.call("browser.screenshot", .{ .object = params });
     }
 

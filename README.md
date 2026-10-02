@@ -49,9 +49,12 @@ The gateway daemon auto-starts on the first command — you don't manage it.
 | `hibrow launch <profile> [--browser chrome\|firefox]` | Launch a browser with a named, persistent profile |
 | `hibrow ls [profile]` | List running sessions (or details for one) |
 | `hibrow nav <profile[:tab]> <url>` | Navigate to a URL |
-| `hibrow eval <profile[:tab]> "<js>" \| -f <file> \| -f-` | Run JavaScript, return the result as JSON |
+| `hibrow eval <profile[:tab]> "<js>" \| -f <file> \| -f- [--frame <path>]` | Run JavaScript, return the result as JSON |
+| `hibrow click <profile[:tab]> <selector> [--frame <path>]` | Natively click an element (trusted click on Firefox) |
+| `hibrow wait <profile[:tab]> <selector> [--frame <path>] [--timeout <s>] [--gone]` | Poll until a selector appears/disappears |
+| `hibrow frame list <profile> [--tree]` | List nested frames (path, selector, title, url) |
 | `hibrow url <profile[:tab]>` | Print the current URL |
-| `hibrow screenshot <profile[:tab]> -o <file>` | Save a PNG screenshot |
+| `hibrow screenshot <profile[:tab]> -o <file> [--frame <path>]` | Save a PNG screenshot (optionally of one frame) |
 | `hibrow grab <profile> <url-or-js> -o <file>` | Download binary data through the browser to a file |
 | `hibrow push <profile[:tab]> <target> <text> \| -f <file>` | Inject text into an input or `window.*` variable |
 | `hibrow tab list\|new\|close\|switch <profile[:tab]>` | Manage tabs |

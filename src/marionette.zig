@@ -349,7 +349,7 @@ pub const Connection = struct {
 
     fn collectFrames(self: *Connection, arr: *json.Array, prefix: []const u8) !void {
         const res = self.eval(
-            "Array.from(document.querySelectorAll('iframe,frame')).map(function(f){return {src:f.src||'',name:f.name||''};})",
+            "Array.from(document.querySelectorAll('iframe,frame')).map(function(f){return {src:f.src||'',name:f.name||'',id:f.id||''};})",
         ) catch return;
         if (res.value != .array) return;
         for (res.value.array.items, 0..) |child, i| {
@@ -357,15 +357,30 @@ pub const Connection = struct {
                 try std.fmt.allocPrint(self.allocator, "{d}", .{i})
             else
                 try std.fmt.allocPrint(self.allocator, "{s}/{d}", .{ prefix, i });
+            const selector = try selectorHint(self.allocator, objField(child, "id"), objField(child, "name"));
+
+            // Switch in to read the frame's title and recurse.
+            var title: []const u8 = "";
+            const switched = if (self.switchToFrameIndex(@intCast(i))) |_| true else |_| false;
+            if (switched) {
+                if (self.eval("document.title")) |tr| {
+                    if (tr.value == .string) title = tr.value.string;
+                } else |_| {}
+            }
+
             var obj: json.ObjectMap = .empty;
             try obj.put(self.allocator, "path", .{ .string = path });
+            try obj.put(self.allocator, "parent", .{ .string = try self.allocator.dupe(u8, prefix) });
             try obj.put(self.allocator, "url", .{ .string = try self.allocator.dupe(u8, objField(child, "src")) });
             try obj.put(self.allocator, "name", .{ .string = try self.allocator.dupe(u8, objField(child, "name")) });
+            try obj.put(self.allocator, "selector", .{ .string = selector });
+            try obj.put(self.allocator, "title", .{ .string = try self.allocator.dupe(u8, title) });
             try arr.append(.{ .object = obj });
 
-            self.switchToFrameIndex(@intCast(i)) catch continue;
-            self.collectFrames(arr, path) catch {};
-            self.switchToParentFrame() catch {};
+            if (switched) {
+                self.collectFrames(arr, path) catch {};
+                self.switchToParentFrame() catch {};
+            }
         }
     }
 
@@ -427,6 +442,48 @@ pub const Connection = struct {
     /// Take a screenshot. Returns base64-encoded PNG data.
     /// Attempts full-page first; if Firefox fails (page too tall for canvas),
     /// falls back to viewport-only screenshot.
+    /// Screenshot a nested frame: switch into it, then capture its root element
+    /// (Marionette's full-page screenshot ignores the frame switch, so we grab
+    /// the frame's <html> element instead). Falls back to a viewport capture.
+    pub fn screenshotFrame(self: *Connection, frame_path: []const u8) ![]const u8 {
+        try self.switchToFramePath(frame_path);
+
+        var find_params: json.ObjectMap = .empty;
+        defer find_params.deinit(self.allocator);
+        try find_params.put(self.allocator, "using", .{ .string = "css selector" });
+        try find_params.put(self.allocator, "value", .{ .string = "html" });
+        var find = self.send("WebDriver:FindElement", .{ .object = find_params }) catch
+            return self.takeScreenshot();
+        defer find.deinit();
+        if (find.err != null) return self.takeScreenshot();
+
+        const elem = if (find.result == .object)
+            find.result.object.get("value") orelse return self.takeScreenshot()
+        else
+            return self.takeScreenshot();
+        if (elem != .object) return self.takeScreenshot();
+        var uuid: ?[]const u8 = null;
+        var kit = elem.object.iterator();
+        if (kit.next()) |e| if (e.value_ptr.* == .string) {
+            uuid = e.value_ptr.string;
+        };
+        const uuid_s = uuid orelse return self.takeScreenshot();
+        const uuid_clone = try self.allocator.dupe(u8, uuid_s);
+        defer self.allocator.free(uuid_clone);
+
+        var shot_params: json.ObjectMap = .empty;
+        defer shot_params.deinit(self.allocator);
+        try shot_params.put(self.allocator, "id", .{ .string = uuid_clone });
+        var r = try self.send("WebDriver:TakeScreenshot", .{ .object = shot_params });
+        defer r.deinit();
+        if (r.err == null and r.result == .object) {
+            if (r.result.object.get("value")) |val| {
+                if (val == .string) return try self.allocator.dupe(u8, val.string);
+            }
+        }
+        return self.takeScreenshot();
+    }
+
     pub fn takeScreenshot(self: *Connection) ![]const u8 {
         // Try full-page screenshot first
         {
@@ -584,6 +641,13 @@ pub const Connection = struct {
 };
 
 /// Deep-clone a json.Value so it outlives its parsed source.
+/// Build a CSS selector hint for an iframe from its id/name (owned, "" if none).
+fn selectorHint(allocator: mem.Allocator, id: []const u8, name: []const u8) ![]u8 {
+    if (id.len > 0) return std.fmt.allocPrint(allocator, "#{s}", .{id});
+    if (name.len > 0) return std.fmt.allocPrint(allocator, "[name=\"{s}\"]", .{name});
+    return allocator.dupe(u8, "");
+}
+
 /// Read a string field from a JSON object value (or "" if absent).
 fn objField(v: json.Value, key: []const u8) []const u8 {
     if (v != .object) return "";

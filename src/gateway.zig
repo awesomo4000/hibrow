@@ -1020,6 +1020,7 @@ pub const Server = struct {
     fn handleBrowserScreenshot(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {
         const profile = extractStringParam(params, "profile") orelse
             return self.fail(id, .invalid_params, "Missing 'profile' parameter");
+        const frame = extractStringParam(params, "frame");
 
         const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
@@ -1047,7 +1048,7 @@ pub const Server = struct {
                         return self.fail(id, .cdp_error, "Could not switch tab");
                 }
 
-                const b64 = conn.takeScreenshot() catch
+                const b64 = (if (frame) |f| conn.screenshotFrame(f) else conn.takeScreenshot()) catch
                     return self.fail(id, .cdp_error, "Screenshot failed");
                 defer self.allocator.free(b64);
                 return self.ok(id, .{ .string = b64 });
@@ -1055,7 +1056,7 @@ pub const Server = struct {
             .chrome => {
                 const conn = self.getConnection(profile) orelse
                     return self.fail(id, .browser_not_found, "Browser not found");
-                const b64 = conn.takeScreenshot() catch {
+                const b64 = (if (frame) |f| conn.screenshotFrame(f) else conn.takeScreenshot()) catch {
                     self.evictConnection(profile);
                     return self.fail(id, .cdp_error, "Screenshot failed");
                 };

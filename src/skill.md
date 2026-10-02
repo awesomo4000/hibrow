@@ -405,29 +405,41 @@ lets the next agent pick up where you left off.
 Content inside an `<iframe>` — especially a cross-origin one — is NOT reachable
 from a normal `eval` on the top page. Target the frame explicitly.
 
-List the frames (both browsers), with a `path` you can pass to `--frame`:
+List the frames (both browsers). Each entry has a `path` (for `--frame`), a
+`selector` hint, `title`, `url`, `name`, and `parent`. Use `--tree` for a view:
 
 ```bash
 hibrow frame list work
-# [{"path":"0","url":"...","name":"..."},{"path":"0/0","url":"..."},{"path":"1",...}]
+# [{"path":"0","parent":"","url":"...","name":"fa","selector":"#fa","title":"a"}, ...]
+
+hibrow frame list work --tree
+#   [0] #fa  "a"  file:///.../a.html
+#     [0/0] #fg  "g"  file:///.../g.html
+#   [1] #fb  "b"  file:///.../b.html
 ```
 
-Eval inside a frame with `--frame <path>`. A path is frame indices and/or CSS
-selectors of the `<iframe>` element, nested, separated by `/` or `,`:
+Then target a frame with `--frame <path>`. A path is frame indices and/or CSS
+selectors of the `<iframe>` element, nested, separated by `/` or `,`. The same
+`--frame` works on `eval`, `click`, `wait`, and `screenshot`:
 
 ```bash
 hibrow eval work --frame 0 "document.body.innerText"      # first child frame
 hibrow eval work --frame 0/0 "document.title"             # nested: frame 0, its child 0
 hibrow eval work --frame 1,0,0 "..."                      # commas work too
-hibrow eval work --frame "#content" "..."                 # by iframe selector
+hibrow eval work --frame "#content" "..."                 # by iframe selector (from frame list)
 hibrow eval work --frame "#outer/#inner" "..."            # nested selectors
+hibrow click work "#play" --frame 0/0                     # click inside a frame
+hibrow wait  work "#lesson" --frame 0/0                   # wait inside a frame
+hibrow screenshot work -o lesson.png --frame 0/0          # screenshot just the frame
 ```
 
 Works on Chrome (CDP execution contexts) and Firefox (Marionette SwitchToFrame),
 preserving the session (cookies/login). On Chrome the frame eval runs in an
 isolated world: full DOM access (read text, click, fill) but not the frame
-page's own JS globals. If a `--frame` eval returns null/empty, the frame may
-still be loading — retry, or `frame list` to confirm the path.
+page's own JS globals; and **cross-origin out-of-process (OOPIF) frames are not
+supported on Chrome — use `--browser firefox` for those.** If a `--frame` op
+returns null/empty, the frame may still be loading — `wait`, or `frame list` to
+confirm the path.
 
 ## Tabs
 

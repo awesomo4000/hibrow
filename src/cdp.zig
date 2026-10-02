@@ -454,6 +454,7 @@ pub const Connection = struct {
 
     fn appendChildFrames(self: *Connection, arr: *json.Array, node: json.Value, prefix: []const u8) !void {
         if (node != .object) return;
+        const parent_id = frameIdOf(node);
         const children = node.object.get("childFrames") orelse return;
         if (children != .array) return;
         for (children.array.items, 0..) |child, i| {
@@ -462,10 +463,42 @@ pub const Connection = struct {
             else
                 try std.fmt.allocPrint(self.allocator, "{s}/{d}", .{ prefix, i });
             const frame = if (child == .object) child.object.get("frame") else null;
+
+            // Selector hint: evaluated in the PARENT frame's context.
+            var selector = try self.allocator.dupe(u8, "");
+            if (parent_id) |pid| {
+                if (self.createIsolatedWorld(pid)) |ctx| {
+                    const sexpr = try std.fmt.allocPrint(self.allocator, "(function(){{var e=document.querySelectorAll('iframe,frame')[{d}];return e?(e.id?('#'+e.id):(e.name?('[name=\"'+e.name+'\"]'):'')):'';}})()", .{i});
+                    defer self.allocator.free(sexpr);
+                    if (self.evalInContext(ctx, sexpr)) |sr| {
+                        if (sr.value == .string) {
+                            self.allocator.free(selector);
+                            selector = try self.allocator.dupe(u8, sr.value.string);
+                        }
+                    } else |_| {}
+                } else |_| {}
+            }
+
+            // Title: evaluated in the CHILD frame's context.
+            var title = try self.allocator.dupe(u8, "");
+            if (frameIdOf(child)) |cid| {
+                if (self.createIsolatedWorld(cid)) |ctx| {
+                    if (self.evalInContext(ctx, "document.title")) |tr| {
+                        if (tr.value == .string) {
+                            self.allocator.free(title);
+                            title = try self.allocator.dupe(u8, tr.value.string);
+                        }
+                    } else |_| {}
+                } else |_| {}
+            }
+
             var obj: json.ObjectMap = .empty;
             try obj.put(self.allocator, "path", .{ .string = path });
+            try obj.put(self.allocator, "parent", .{ .string = try self.allocator.dupe(u8, prefix) });
             try obj.put(self.allocator, "url", .{ .string = try self.allocator.dupe(u8, frameField(frame, "url")) });
             try obj.put(self.allocator, "name", .{ .string = try self.allocator.dupe(u8, frameField(frame, "name")) });
+            try obj.put(self.allocator, "selector", .{ .string = selector });
+            try obj.put(self.allocator, "title", .{ .string = title });
             try arr.append(.{ .object = obj });
             try self.appendChildFrames(arr, child, path);
         }
@@ -542,13 +575,17 @@ pub const Connection = struct {
             }
         }
 
-        // Capture with clip covering full content
+        return self.captureClip(0, 0, width, height);
+    }
+
+    /// Capture a PNG (base64) of a rectangular region of the page.
+    fn captureClip(self: *Connection, x: f64, y: f64, w: f64, h: f64) ![]const u8 {
         var clip: json.ObjectMap = .empty;
         defer clip.deinit(self.allocator);
-        try clip.put(self.allocator, "x", .{ .integer = 0 });
-        try clip.put(self.allocator, "y", .{ .integer = 0 });
-        try clip.put(self.allocator, "width", .{ .float = width });
-        try clip.put(self.allocator, "height", .{ .float = height });
+        try clip.put(self.allocator, "x", .{ .float = x });
+        try clip.put(self.allocator, "y", .{ .float = y });
+        try clip.put(self.allocator, "width", .{ .float = w });
+        try clip.put(self.allocator, "height", .{ .float = h });
         try clip.put(self.allocator, "scale", .{ .integer = 1 });
 
         var params: json.ObjectMap = .empty;
@@ -558,18 +595,86 @@ pub const Connection = struct {
 
         var cdp_result = try self.send("Page.captureScreenshot", .{ .object = params });
         defer cdp_result.deinit();
-
-        // Response: {"data": "<base64 png>"}
         if (cdp_result.result == .object) {
             if (cdp_result.result.object.get("data")) |val| {
-                if (val == .string) {
-                    return try self.allocator.dupe(u8, val.string);
-                }
+                if (val == .string) return try self.allocator.dupe(u8, val.string);
             }
         }
         return error.InvalidResponse;
     }
+
+    /// Capture a PNG (base64) of a nested frame's rendered region, by clipping
+    /// to the frame's rectangle (accumulated across the nesting path).
+    pub fn screenshotFrame(self: *Connection, frame_path: []const u8) ![]const u8 {
+        const rect = try self.resolveFrameRect(frame_path);
+        return self.captureClip(rect.x, rect.y, rect.w, rect.h);
+    }
+
+    fn resolveFrameRect(self: *Connection, frame_path: []const u8) !Rect {
+        var tree = try self.send("Page.getFrameTree", null);
+        defer tree.deinit();
+        if (tree.result != .object) return error.FrameNotFound;
+        var node = tree.result.object.get("frameTree") orelse return error.FrameNotFound;
+        var current_id = try self.allocator.dupe(u8, frameIdOf(node) orelse return error.FrameNotFound);
+        defer self.allocator.free(current_id);
+
+        var acc_x: f64 = 0;
+        var acc_y: f64 = 0;
+        var w: f64 = 0;
+        var h: f64 = 0;
+        var it = mem.tokenizeAny(u8, frame_path, ",/");
+        while (it.next()) |seg| {
+            const children = node.object.get("childFrames");
+            const arr: []const json.Value = if (children) |c|
+                (if (c == .array) c.array.items else &.{})
+            else
+                &.{};
+
+            var index: usize = undefined;
+            var elem_expr: []u8 = undefined;
+            if (std.fmt.parseInt(usize, seg, 10)) |i| {
+                index = i;
+                elem_expr = try std.fmt.allocPrint(self.allocator, "document.querySelectorAll('iframe,frame')[{d}]", .{i});
+            } else |_| {
+                index = try self.selectorFrameIndex(current_id, seg);
+                const sel_json = try json.Stringify.valueAlloc(self.allocator, json.Value{ .string = seg }, .{});
+                defer self.allocator.free(sel_json);
+                elem_expr = try std.fmt.allocPrint(self.allocator, "document.querySelector({s})", .{sel_json});
+            }
+            defer self.allocator.free(elem_expr);
+            if (index >= arr.len) return error.FrameNotFound;
+
+            const ctx = try self.createIsolatedWorld(current_id);
+            const rect_expr = try std.fmt.allocPrint(self.allocator, "(function(){{var e={s};var r=e.getBoundingClientRect();return [r.left,r.top,r.width,r.height];}})()", .{elem_expr});
+            defer self.allocator.free(rect_expr);
+            const rr = try self.evalInContext(ctx, rect_expr);
+            if (rr.value != .array or rr.value.array.items.len < 4) return error.FrameNotFound;
+            const items = rr.value.array.items;
+            acc_x += numOf(items[0], 0);
+            acc_y += numOf(items[1], 0);
+            w = numOf(items[2], 0);
+            h = numOf(items[3], 0);
+
+            node = arr[index];
+            const next_id = frameIdOf(node) orelse return error.FrameNotFound;
+            self.allocator.free(current_id);
+            current_id = try self.allocator.dupe(u8, next_id);
+        }
+        if (w == 0 or h == 0) return error.FrameNotFound;
+        return .{ .x = acc_x, .y = acc_y, .w = w, .h = h };
+    }
 };
+
+const Rect = struct { x: f64, y: f64, w: f64, h: f64 };
+
+/// Coerce a JSON number value to f64, or `default` if not numeric.
+fn numOf(v: json.Value, default: f64) f64 {
+    return switch (v) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => default,
+    };
+}
 
 // ---------------------------------------------------------------------------
 // HTTP-based target management (no WebSocket needed)
