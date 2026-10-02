@@ -445,6 +445,29 @@ out-of-process (OOPIF) frame; for **deeply nested cross-origin** frames
 arbitrary nesting. If a `--frame` op returns null/empty, the frame may still be
 loading — `wait`, or `frame list` to confirm the path.
 
+## Shadow DOM (open roots)
+
+Content inside an **open shadow root** (e.g. Articulate Rise / Mondrian blocks)
+is NOT in `document.body.innerText` and NOT reachable by a normal
+`querySelector`. Read all text, descending into nested open shadow roots (and
+frame-aware):
+
+```bash
+hibrow text work                     # whole body, piercing open shadow roots
+hibrow text work "#lesson-root"      # from a sub-tree
+hibrow text work --frame 0/0         # inside a frame
+```
+
+To find or click an element inside a shadow root, `eval` a piercing query:
+
+```bash
+hibrow eval work '(function(){function q(sel,root){root=root||document;var e=root.querySelector(sel);if(e)return e;var all=root.querySelectorAll("*");for(var i=0;i<all.length;i++){if(all[i].shadowRoot){var r=q(sel,all[i].shadowRoot);if(r)return r;}}return null;}var e=q(".continue-btn");if(e){e.scrollIntoView({block:"center"});e.click();return "clicked";}return "not found";})()'
+```
+
+Notes: closed shadow roots are inaccessible by design. A trusted `hibrow click`
+(Firefox `ElementClick`) cannot target inside a shadow root — use the eval
+`.click()` above, or click a light-DOM ancestor.
+
 ## Media (video / audio)
 
 Inspect and control `<video>`/`<audio>` elements. All subcommands are

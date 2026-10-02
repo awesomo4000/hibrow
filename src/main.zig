@@ -60,6 +60,10 @@ const usage =
     \\      'mute [--persist]' mutes (and keeps new players muted); 'wait-ended'
     \\      polls until a media element finishes (--timeout <secs>).
     \\
+    \\  text <profile[:tab]> [root-selector] [--frame <path>]
+    \\      Extract visible text, descending into open shadow roots (content that
+    \\      document.body.innerText misses). Defaults to the whole body.
+    \\
     \\  tab list|new|close|switch <profile[:tab]>
     \\      Manage tabs within a browser profile.
     \\
@@ -146,6 +150,7 @@ pub fn main(init: std.process.Init) !void {
         .{ "click", cmdClick },
         .{ "wait", cmdWait },
         .{ "media", cmdMedia },
+        .{ "text", cmdText },
         .{ "kill", cmdKill },
         .{ "url", cmdUrl },
         .{ "console", cmdConsole },
@@ -570,6 +575,60 @@ fn cmdMedia(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
 fn oom() noreturn {
     writeStderr("Error: out of memory\n", .{});
     std.process.exit(1);
+}
+
+fn cmdText(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
+    const target = args.next() orelse {
+        writeStderr("Error: text requires a profile[:tab]\n", .{});
+        std.process.exit(1);
+    };
+    const profile = parseProfile(target);
+
+    var frame: ?[]const u8 = null;
+    var root_sel: ?[]const u8 = null;
+    while (args.next()) |a| {
+        if (mem.eql(u8, a, "--frame")) {
+            frame = args.next() orelse {
+                writeStderr("Error: --frame requires a selector or path\n", .{});
+                std.process.exit(1);
+            };
+        } else {
+            root_sel = a;
+        }
+    }
+
+    // Collect visible text, descending into (nested) OPEN shadow roots — content
+    // document.body.innerText misses (e.g. Rise/Mondrian blocks). Frame-aware.
+    const sel_json = json.Stringify.valueAlloc(allocator, json.Value{ .string = root_sel orelse "body" }, .{}) catch oom();
+    defer allocator.free(sel_json);
+    const js = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
+        "(function(){var parts=[];function visit(root){root.childNodes.forEach(function(n){if(n.nodeType===3){var t=n.textContent.replace(/\\s+/g,' ').trim();if(t)parts.push(t);}else if(n.nodeType===1){var tag=n.tagName.toLowerCase();if(tag==='script'||tag==='style'||tag==='noscript')return;if(n.shadowRoot)visit(n.shadowRoot);visit(n);}});}var r=document.querySelector(",
+        sel_json,
+        ");if(r)visit(r);return parts.join('\\n');})()",
+    }) catch oom();
+    defer allocator.free(js);
+
+    var client = hibrow.Client.connect(allocator, g_io) catch |err| {
+        writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer client.disconnect();
+
+    var resp = client.eval(profile, js, frame) catch |err| {
+        writeStderr("Error: text failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer resp.deinit();
+    if (resp.is_error) {
+        printError(allocator, resp.result);
+        std.process.exit(1);
+    }
+    // Print the extracted text raw (not JSON-quoted).
+    if (resp.result == .string) {
+        writeStdout("{s}\n", .{resp.result.string});
+    } else {
+        printJsonValue(allocator, resp.result);
+    }
 }
 
 fn cmdFrame(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
