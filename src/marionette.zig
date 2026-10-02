@@ -241,10 +241,35 @@ pub const Connection = struct {
 
     /// Switch into a child frame by index (Marionette SwitchToFrame id=<int>).
     pub fn switchToFrameIndex(self: *Connection, index: i64) !void {
-        var params: json.ObjectMap = .empty;
-        defer params.deinit(self.allocator);
-        try params.put(self.allocator, "id", .{ .integer = index });
-        var result = try self.send("WebDriver:SwitchToFrame", .{ .object = params });
+        // Element-based: switch into the index-th <iframe>/<frame> in DOM order,
+        // so numeric paths line up with `frame list` enumeration and selector
+        // hints. (WebDriver's numeric SwitchToFrame uses browsing-context order,
+        // which can differ from DOM order when a frame is injected, e.g. WalkMe.)
+        var find_params: json.ObjectMap = .empty;
+        defer find_params.deinit(self.allocator);
+        try find_params.put(self.allocator, "using", .{ .string = "css selector" });
+        try find_params.put(self.allocator, "value", .{ .string = "iframe,frame" });
+        var find = try self.send("WebDriver:FindElements", .{ .object = find_params });
+        defer find.deinit();
+        if (find.err) |_| return error.FrameNotFound;
+
+        const list: []const json.Value = if (find.result == .array)
+            find.result.array.items
+        else if (find.result == .object) blk: {
+            const v = find.result.object.get("value") orelse return error.FrameNotFound;
+            if (v != .array) return error.FrameNotFound;
+            break :blk v.array.items;
+        } else return error.FrameNotFound;
+
+        if (index < 0 or @as(usize, @intCast(index)) >= list.len) return error.FrameNotFound;
+        const elem = list[@intCast(index)];
+        if (elem != .object) return error.FrameNotFound;
+
+        const elem_clone = try cloneJsonValue(self.allocator, elem);
+        var switch_params: json.ObjectMap = .empty;
+        defer switch_params.deinit(self.allocator);
+        try switch_params.put(self.allocator, "id", elem_clone);
+        var result = try self.send("WebDriver:SwitchToFrame", .{ .object = switch_params });
         defer result.deinit();
         if (result.err) |_| return error.FrameSwitchFailed;
     }
@@ -359,19 +384,27 @@ pub const Connection = struct {
                 try std.fmt.allocPrint(self.allocator, "{s}/{d}", .{ prefix, i });
             const selector = try selectorHint(self.allocator, objField(child, "id"), objField(child, "name"));
 
-            // Switch in to read the frame's title and recurse.
+            // Switch in to read the frame's title + CURRENT document URL, recurse.
+            // `url` is the live location.href (an SPA may have navigated away from
+            // the static `src` attribute, which we report separately as `src`).
             var title: []const u8 = "";
+            var cur_url: []const u8 = "";
             const switched = if (self.switchToFrameIndex(@intCast(i))) |_| true else |_| false;
             if (switched) {
                 if (self.eval("document.title")) |tr| {
                     if (tr.value == .string) title = tr.value.string;
                 } else |_| {}
+                if (self.eval("location.href")) |ur| {
+                    if (ur.value == .string) cur_url = ur.value.string;
+                } else |_| {}
             }
+            const url = if (cur_url.len > 0) cur_url else objField(child, "src");
 
             var obj: json.ObjectMap = .empty;
             try obj.put(self.allocator, "path", .{ .string = path });
             try obj.put(self.allocator, "parent", .{ .string = try self.allocator.dupe(u8, prefix) });
-            try obj.put(self.allocator, "url", .{ .string = try self.allocator.dupe(u8, objField(child, "src")) });
+            try obj.put(self.allocator, "url", .{ .string = try self.allocator.dupe(u8, url) });
+            try obj.put(self.allocator, "src", .{ .string = try self.allocator.dupe(u8, objField(child, "src")) });
             try obj.put(self.allocator, "name", .{ .string = try self.allocator.dupe(u8, objField(child, "name")) });
             try obj.put(self.allocator, "selector", .{ .string = selector });
             try obj.put(self.allocator, "title", .{ .string = try self.allocator.dupe(u8, title) });

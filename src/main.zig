@@ -1072,6 +1072,15 @@ fn parseProfile(target: []const u8) []const u8 {
 /// Print a JSON-RPC error response to stderr.
 fn printError(allocator: mem.Allocator, err_val: json.Value) void {
     if (err_val == .object) {
+        // -32601 "method not found" almost always means the running gateway
+        // daemon is an older hibrow than this CLI (methods were added since).
+        if (err_val.object.get("code")) |code| {
+            if (code == .integer and code.integer == -32601) {
+                writeStderr("Error: the running gateway is an older hibrow than this CLI.\n" ++
+                    "Run 'hibrow gateway stop' and retry — your browsers stay open.\n", .{});
+                return;
+            }
+        }
         const msg = err_val.object.get("message") orelse .null;
         if (msg == .string) {
             writeStderr("Error: {s}\n", .{msg.string});
