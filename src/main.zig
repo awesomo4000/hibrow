@@ -48,8 +48,8 @@ const usage =
     \\      separated frame indices and/or CSS selectors, e.g. 1,0,0 or #inner.
     \\
     \\  click <profile[:tab]> <selector> [--frame <path>]
-    \\      Natively click an element (scrolls into view; real trusted click on
-    \\      Firefox). Works inside a frame with --frame.
+    \\      Trusted click of an element (scrolls into view). Selector may pierce
+    \\      open shadow roots with >>> (e.g. "#host >>> .btn"). Frame via --frame.
     \\
     \\  wait <profile[:tab]> <selector> [--frame <path>] [--timeout <secs>] [--gone]
     \\      Poll until a selector appears (or disappears with --gone). Default

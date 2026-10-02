@@ -1,9 +1,12 @@
 <!doctype html><meta charset="utf-8"><title>shadow lab</title>
 <div id="light">LIGHT-TEXT</div>
 <div id="host"></div>
+<div id="result">idle</div>
 <script>
 var sr=document.getElementById('host').attachShadow({mode:'open'});
-sr.innerHTML='<p>SHADOW-TEXT</p><div id="nh"></div>';
+sr.innerHTML='<p>SHADOW-TEXT</p><button id="sbtn">press</button><div id="nh"></div>';
+sr.getElementById('sbtn').addEventListener('click',function(){document.getElementById('result').textContent='SHADOW-CLICKED';});
 var nsr=sr.getElementById('nh').attachShadow({mode:'open'});
-nsr.innerHTML='<span>NESTED-SHADOW-TEXT</span>';
+nsr.innerHTML='<span>NESTED-SHADOW-TEXT</span><button id="nbtn">deep</button>';
+nsr.getElementById('nbtn').addEventListener('click',function(){document.getElementById('result').textContent='NESTED-CLICKED';});
 </script>

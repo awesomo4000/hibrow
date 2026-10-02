@@ -186,6 +186,24 @@ fn clickerExpr(allocator: mem.Allocator, selector: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ prefix, sel_json, suffix });
 }
 
+/// Build a JS expression that resolves `selector` (which may pierce OPEN shadow
+/// roots with `>>>`), scrolls it into view, and returns its viewport rect as
+/// [left, top, width, height], or null if not found.
+fn deepRectExpr(allocator: mem.Allocator, selector: []const u8) ![]u8 {
+    const sel_json = try json.Stringify.valueAlloc(allocator, json.Value{ .string = selector }, .{});
+    defer allocator.free(sel_json);
+    const prefix = "(function(){var sel=";
+    const suffix = ";var parts=sel.split('>>>');var root=document,el=null;for(var i=0;i<parts.length;i++){el=root.querySelector(parts[i].trim());if(!el)return null;if(i<parts.length-1){if(!el.shadowRoot)return null;root=el.shadowRoot;}}el.scrollIntoView({block:'center'});var r=el.getBoundingClientRect();return [r.left,r.top,r.width,r.height];})()";
+    return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ prefix, sel_json, suffix });
+}
+
+/// Extract a [x,y,w,h] rect from a JSON array value, or null.
+fn rectFromValue(v: json.Value) ?Rect {
+    if (v != .array or v.array.items.len < 4) return null;
+    const it = v.array.items;
+    return .{ .x = numOf(it[0], 0), .y = numOf(it[1], 0), .w = numOf(it[2], 0), .h = numOf(it[3], 0) };
+}
+
 /// Read a string field from a Page.getFrameTree `frame` object (or "" if absent).
 fn frameField(frame: ?json.Value, key: []const u8) []const u8 {
     const f = frame orelse return "";
@@ -610,26 +628,52 @@ pub const Connection = struct {
         return self.evalInContext(ctx, expression, target.session);
     }
 
-    /// Click the element matching `selector` in the top frame. Scrolls it into
-    /// view and dispatches a full pointer/mouse event sequence plus .click().
-    pub fn click(self: *Connection, selector: []const u8) !void {
-        const expr = try clickerExpr(self.allocator, selector);
-        defer self.allocator.free(expr);
-        const r = try self.eval(expr);
-        if (r.value == .bool and r.value.bool) return;
-        return error.ElementNotFound;
+    /// Dispatch a trusted (isTrusted) left click at top-level viewport (x,y) via
+    /// the Input domain. The browser routes it to whatever frame renders there,
+    /// so this works across same-process and OOPIF frames.
+    fn dispatchClickAt(self: *Connection, x: f64, y: f64) !void {
+        const types = [_]struct { t: []const u8, buttons: i64 }{
+            .{ .t = "mouseMoved", .buttons = 0 },
+            .{ .t = "mousePressed", .buttons = 1 },
+            .{ .t = "mouseReleased", .buttons = 0 },
+        };
+        for (types) |ev| {
+            var p: json.ObjectMap = .empty;
+            defer p.deinit(self.allocator);
+            try p.put(self.allocator, "type", .{ .string = ev.t });
+            try p.put(self.allocator, "x", .{ .float = x });
+            try p.put(self.allocator, "y", .{ .float = y });
+            try p.put(self.allocator, "button", .{ .string = "left" });
+            try p.put(self.allocator, "buttons", .{ .integer = ev.buttons });
+            try p.put(self.allocator, "clickCount", .{ .integer = 1 });
+            var r = try self.send("Input.dispatchMouseEvent", .{ .object = p });
+            r.deinit();
+        }
     }
 
-    /// Click the element matching `selector` inside a nested frame.
-    pub fn clickInFrame(self: *Connection, frame_path: []const u8, selector: []const u8) !void {
-        const expr = try clickerExpr(self.allocator, selector);
+    /// Click the element matching `selector` (may pierce open shadow roots with
+    /// `>>>`) in the top frame — a trusted input-level click.
+    pub fn click(self: *Connection, selector: []const u8) !void {
+        const expr = try deepRectExpr(self.allocator, selector);
         defer self.allocator.free(expr);
+        const r = try self.eval(expr);
+        const rect = rectFromValue(r.value) orelse return error.ElementNotFound;
+        try self.dispatchClickAt(rect.x + rect.w / 2, rect.y + rect.h / 2);
+    }
+
+    /// Click the element matching `selector` inside a nested frame — a trusted
+    /// input-level click, dispatched at the element's top-level coordinates
+    /// (frame offset + element rect), which also works for OOPIF frames.
+    pub fn clickInFrame(self: *Connection, frame_path: []const u8, selector: []const u8) !void {
+        const foff = try self.resolveFrameRect(frame_path);
         var target = try self.resolveFrameTarget(frame_path);
         defer target.deinit(self.allocator);
         const ctx = try self.createIsolatedWorld(target.frame_id, target.session);
+        const expr = try deepRectExpr(self.allocator, selector);
+        defer self.allocator.free(expr);
         const r = try self.evalInContext(ctx, expr, target.session);
-        if (r.value == .bool and r.value.bool) return;
-        return error.ElementNotFound;
+        const rect = rectFromValue(r.value) orelse return error.ElementNotFound;
+        try self.dispatchClickAt(foff.x + rect.x + rect.w / 2, foff.y + rect.y + rect.h / 2);
     }
 
     /// List all (nested) frames, including cross-origin OOPIF frames, as an array

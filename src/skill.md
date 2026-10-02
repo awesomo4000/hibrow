@@ -157,8 +157,10 @@ Array.from(document.querySelectorAll("a,button,[role=button],input,select,textar
 ```
 
 Then click it. Prefer the first-class `click` command over a JS `.click()` — it
-scrolls into view and, on Firefox, performs a real trusted click (works where a
-JS `.click()` or `video.play()` is blocked, e.g. media play buttons):
+scrolls into view and performs a **real trusted click** (`isTrusted` true, via
+Firefox `ElementClick` / Chrome `Input.dispatchMouseEvent`), which works where a
+JS `.click()` or `video.play()` is blocked, e.g. media play buttons. Selectors
+may pierce open shadow roots with `>>>` (see Shadow DOM):
 
 ```bash
 hibrow click work "#submit"
@@ -458,15 +460,23 @@ hibrow text work "#lesson-root"      # from a sub-tree
 hibrow text work --frame 0/0         # inside a frame
 ```
 
-To find or click an element inside a shadow root, `eval` a piercing query:
+To **click** an element inside a shadow root, use `>>>` in the selector — each
+segment after `>>>` is found inside the previous element's shadow root. This is
+a trusted click on both browsers and works at any nesting depth, inside frames:
 
 ```bash
-hibrow eval work '(function(){function q(sel,root){root=root||document;var e=root.querySelector(sel);if(e)return e;var all=root.querySelectorAll("*");for(var i=0;i<all.length;i++){if(all[i].shadowRoot){var r=q(sel,all[i].shadowRoot);if(r)return r;}}return null;}var e=q(".continue-btn");if(e){e.scrollIntoView({block:"center"});e.click();return "clicked";}return "not found";})()'
+hibrow click work "#host >>> .continue-btn"          # one level
+hibrow click work "#outer >>> #inner-host >>> .btn"  # nested shadow roots
+hibrow click work "#host >>> .play" --frame 0/0      # shadow inside a frame
 ```
 
-Notes: closed shadow roots are inaccessible by design. A trusted `hibrow click`
-(Firefox `ElementClick`) cannot target inside a shadow root — use the eval
-`.click()` above, or click a light-DOM ancestor.
+To read/eval inside a shadow root, use a piercing query:
+
+```bash
+hibrow eval work '(function(){function q(sel,root){root=root||document;var e=root.querySelector(sel);if(e)return e;var all=root.querySelectorAll("*");for(var i=0;i<all.length;i++){if(all[i].shadowRoot){var r=q(sel,all[i].shadowRoot);if(r)return r;}}return null;}return q(".score")?.textContent;})()'
+```
+
+Note: closed shadow roots are inaccessible by design.
 
 ## Media (video / audio)
 

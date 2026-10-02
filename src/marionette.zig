@@ -331,34 +331,62 @@ pub const Connection = struct {
     /// Natively click the element matching `selector` in the current frame, using
     /// WebDriver:ElementClick (a real/trusted click — scrolls into view per spec,
     /// works where a JS .click() does not, e.g. media play buttons).
+    /// Resolve a selector to a web-element uuid. The selector may pierce OPEN
+    /// shadow roots with `>>>`: each segment after a `>>>` is found inside the
+    /// previous element's shadow root (GetShadowRoot + FindElementFromShadowRoot).
+    /// Caller owns the returned uuid.
+    fn resolveElementUuid(self: *Connection, selector: []const u8) ![]u8 {
+        var it = std.mem.splitSequence(u8, selector, ">>>");
+        const first = std.mem.trim(u8, it.first(), " ");
+
+        var fp: json.ObjectMap = .empty;
+        defer fp.deinit(self.allocator);
+        try fp.put(self.allocator, "using", .{ .string = "css selector" });
+        try fp.put(self.allocator, "value", .{ .string = first });
+        var fr = try self.send("WebDriver:FindElement", .{ .object = fp });
+        defer fr.deinit();
+        if (fr.err) |_| return error.ElementNotFound;
+        const e0 = if (fr.result == .object) fr.result.object.get("value") orelse return error.ElementNotFound else return error.ElementNotFound;
+        var uuid = try self.allocator.dupe(u8, firstStringValue(e0) orelse return error.ElementNotFound);
+        errdefer self.allocator.free(uuid);
+
+        while (it.next()) |seg_raw| {
+            const seg = std.mem.trim(u8, seg_raw, " ");
+            // GetShadowRoot of the current element.
+            var gp: json.ObjectMap = .empty;
+            defer gp.deinit(self.allocator);
+            try gp.put(self.allocator, "id", .{ .string = uuid });
+            var gr = try self.send("WebDriver:GetShadowRoot", .{ .object = gp });
+            defer gr.deinit();
+            if (gr.err) |_| return error.ShadowRootNotFound;
+            const sref = if (gr.result == .object) gr.result.object.get("value") orelse return error.ShadowRootNotFound else return error.ShadowRootNotFound;
+            const shadow_uuid = try self.allocator.dupe(u8, firstStringValue(sref) orelse return error.ShadowRootNotFound);
+            defer self.allocator.free(shadow_uuid);
+
+            // Find the next element inside that shadow root.
+            var sp: json.ObjectMap = .empty;
+            defer sp.deinit(self.allocator);
+            try sp.put(self.allocator, "shadowRoot", .{ .string = shadow_uuid });
+            try sp.put(self.allocator, "using", .{ .string = "css selector" });
+            try sp.put(self.allocator, "value", .{ .string = seg });
+            var sr2 = try self.send("WebDriver:FindElementFromShadowRoot", .{ .object = sp });
+            defer sr2.deinit();
+            if (sr2.err) |_| return error.ElementNotFound;
+            const en = if (sr2.result == .object) sr2.result.object.get("value") orelse return error.ElementNotFound else return error.ElementNotFound;
+            const next = try self.allocator.dupe(u8, firstStringValue(en) orelse return error.ElementNotFound);
+            self.allocator.free(uuid);
+            uuid = next;
+        }
+        return uuid;
+    }
+
     pub fn clickElement(self: *Connection, selector: []const u8) !void {
-        var find_params: json.ObjectMap = .empty;
-        defer find_params.deinit(self.allocator);
-        try find_params.put(self.allocator, "using", .{ .string = "css selector" });
-        try find_params.put(self.allocator, "value", .{ .string = selector });
-        var find = try self.send("WebDriver:FindElement", .{ .object = find_params });
-        defer find.deinit();
-        if (find.err) |_| return error.ElementNotFound;
-
-        const elem = if (find.result == .object)
-            find.result.object.get("value") orelse return error.ElementNotFound
-        else
-            return error.ElementNotFound;
-        if (elem != .object) return error.ElementNotFound;
-
-        // A web-element reference is {<key>: <uuid>}; ElementClick wants the uuid.
-        var uuid: ?[]const u8 = null;
-        var kit = elem.object.iterator();
-        if (kit.next()) |e| if (e.value_ptr.* == .string) {
-            uuid = e.value_ptr.string;
-        };
-        const uuid_s = uuid orelse return error.ElementNotFound;
-        const uuid_clone = try self.allocator.dupe(u8, uuid_s);
-        defer self.allocator.free(uuid_clone);
+        const uuid = try self.resolveElementUuid(selector);
+        defer self.allocator.free(uuid);
 
         var click_params: json.ObjectMap = .empty;
         defer click_params.deinit(self.allocator);
-        try click_params.put(self.allocator, "id", .{ .string = uuid_clone });
+        try click_params.put(self.allocator, "id", .{ .string = uuid });
         var r = try self.send("WebDriver:ElementClick", .{ .object = click_params });
         defer r.deinit();
         if (r.err) |_| return error.ClickFailed;
@@ -674,6 +702,15 @@ pub const Connection = struct {
 };
 
 /// Deep-clone a json.Value so it outlives its parsed source.
+/// Return the first string value in an object (web-element / shadow-root refs
+/// are single-entry objects like {"<key>": "<uuid>"}).
+fn firstStringValue(v: json.Value) ?[]const u8 {
+    if (v != .object) return null;
+    var it = v.object.iterator();
+    if (it.next()) |e| if (e.value_ptr.* == .string) return e.value_ptr.string;
+    return null;
+}
+
 /// Build a CSS selector hint for an iframe from its id/name (owned, "" if none).
 fn selectorHint(allocator: mem.Allocator, id: []const u8, name: []const u8) ![]u8 {
     if (id.len > 0) return std.fmt.allocPrint(allocator, "#{s}", .{id});
