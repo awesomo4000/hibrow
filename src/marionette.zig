@@ -286,7 +286,8 @@ pub const Connection = struct {
     /// segments separated by "," or "/"; each segment is either a numeric frame
     /// index or a CSS selector for the <iframe> element in the parent frame.
     /// e.g. "1,0,0" or "#outer/#inner" or "0/#inner".
-    pub fn evalInFrame(self: *Connection, frame_path: []const u8, expression: []const u8) !EvalResult {
+    /// Switch down a frame path ("1,0,0" / "#outer/#inner") from the top frame.
+    pub fn switchToFramePath(self: *Connection, frame_path: []const u8) !void {
         var it = mem.tokenizeAny(u8, frame_path, ",/");
         while (it.next()) |seg| {
             if (std.fmt.parseInt(i64, seg, 10)) |idx| {
@@ -295,7 +296,47 @@ pub const Connection = struct {
                 try self.switchToFrameSelector(seg);
             }
         }
+    }
+
+    pub fn evalInFrame(self: *Connection, frame_path: []const u8, expression: []const u8) !EvalResult {
+        try self.switchToFramePath(frame_path);
         return self.eval(expression);
+    }
+
+    /// Natively click the element matching `selector` in the current frame, using
+    /// WebDriver:ElementClick (a real/trusted click — scrolls into view per spec,
+    /// works where a JS .click() does not, e.g. media play buttons).
+    pub fn clickElement(self: *Connection, selector: []const u8) !void {
+        var find_params: json.ObjectMap = .empty;
+        defer find_params.deinit(self.allocator);
+        try find_params.put(self.allocator, "using", .{ .string = "css selector" });
+        try find_params.put(self.allocator, "value", .{ .string = selector });
+        var find = try self.send("WebDriver:FindElement", .{ .object = find_params });
+        defer find.deinit();
+        if (find.err) |_| return error.ElementNotFound;
+
+        const elem = if (find.result == .object)
+            find.result.object.get("value") orelse return error.ElementNotFound
+        else
+            return error.ElementNotFound;
+        if (elem != .object) return error.ElementNotFound;
+
+        // A web-element reference is {<key>: <uuid>}; ElementClick wants the uuid.
+        var uuid: ?[]const u8 = null;
+        var kit = elem.object.iterator();
+        if (kit.next()) |e| if (e.value_ptr.* == .string) {
+            uuid = e.value_ptr.string;
+        };
+        const uuid_s = uuid orelse return error.ElementNotFound;
+        const uuid_clone = try self.allocator.dupe(u8, uuid_s);
+        defer self.allocator.free(uuid_clone);
+
+        var click_params: json.ObjectMap = .empty;
+        defer click_params.deinit(self.allocator);
+        try click_params.put(self.allocator, "id", .{ .string = uuid_clone });
+        var r = try self.send("WebDriver:ElementClick", .{ .object = click_params });
+        defer r.deinit();
+        if (r.err) |_| return error.ClickFailed;
     }
 
     /// List all (nested) frames as an array of {path, url, name}. Walks the tree

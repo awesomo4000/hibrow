@@ -1,2 +1,5 @@
 <!doctype html><meta charset="utf-8"><title>g</title>
 <h3 id="g">GRANDCHILD</h3>
+<button id="gbtn" onclick="document.getElementById('gstate').textContent='CLICKED'">press</button>
+<span id="gstate">idle</span>
+<script>setTimeout(function(){var d=document.createElement('div');d.id='glate';d.textContent='LATE';document.body.appendChild(d);},1500);</script>

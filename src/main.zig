@@ -47,6 +47,14 @@ const usage =
     \\      Evaluate JavaScript inside a nested frame. Path is comma/slash-
     \\      separated frame indices and/or CSS selectors, e.g. 1,0,0 or #inner.
     \\
+    \\  click <profile[:tab]> <selector> [--frame <path>]
+    \\      Natively click an element (scrolls into view; real trusted click on
+    \\      Firefox). Works inside a frame with --frame.
+    \\
+    \\  wait <profile[:tab]> <selector> [--frame <path>] [--timeout <secs>] [--gone]
+    \\      Poll until a selector appears (or disappears with --gone). Default
+    \\      timeout 10s.
+    \\
     \\  tab list|new|close|switch <profile[:tab]>
     \\      Manage tabs within a browser profile.
     \\
@@ -130,6 +138,8 @@ pub fn main(init: std.process.Init) !void {
         .{ "nav", cmdNavigate },
         .{ "eval", cmdEval },
         .{ "frame", cmdFrame },
+        .{ "click", cmdClick },
+        .{ "wait", cmdWait },
         .{ "kill", cmdKill },
         .{ "url", cmdUrl },
         .{ "console", cmdConsole },
@@ -313,6 +323,109 @@ fn cmdNavigate(allocator: mem.Allocator, args: *std.process.Args.Iterator) void 
     };
     defer resp.deinit();
 
+    if (resp.is_error) {
+        printError(allocator, resp.result);
+        std.process.exit(1);
+    }
+    printJsonValue(allocator, resp.result);
+}
+
+fn cmdClick(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
+    const target = args.next() orelse {
+        writeStderr("Error: click requires a profile[:tab] and selector\n", .{});
+        std.process.exit(1);
+    };
+    const profile = parseProfile(target);
+
+    var selector: ?[]const u8 = null;
+    var frame: ?[]const u8 = null;
+    while (args.next()) |a| {
+        if (mem.eql(u8, a, "--frame")) {
+            frame = args.next() orelse {
+                writeStderr("Error: --frame requires a selector or path\n", .{});
+                std.process.exit(1);
+            };
+        } else {
+            selector = a;
+        }
+    }
+    const sel = selector orelse {
+        writeStderr("Error: click requires a CSS selector\n", .{});
+        std.process.exit(1);
+    };
+
+    var client = hibrow.Client.connect(allocator, g_io) catch |err| {
+        writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer client.disconnect();
+
+    var resp = client.click(profile, sel, frame) catch |err| {
+        writeStderr("Error: click failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer resp.deinit();
+    if (resp.is_error) {
+        printError(allocator, resp.result);
+        std.process.exit(1);
+    }
+    printJsonValue(allocator, resp.result);
+}
+
+fn cmdWait(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
+    const target = args.next() orelse {
+        writeStderr("Error: wait requires a profile[:tab] and --selector\n", .{});
+        std.process.exit(1);
+    };
+    const profile = parseProfile(target);
+
+    var selector: ?[]const u8 = null;
+    var frame: ?[]const u8 = null;
+    var timeout_ms: ?i64 = null;
+    var gone = false;
+    while (args.next()) |a| {
+        if (mem.eql(u8, a, "--frame")) {
+            frame = args.next() orelse {
+                writeStderr("Error: --frame requires a selector or path\n", .{});
+                std.process.exit(1);
+            };
+        } else if (mem.eql(u8, a, "--selector")) {
+            selector = args.next() orelse {
+                writeStderr("Error: --selector requires a value\n", .{});
+                std.process.exit(1);
+            };
+        } else if (mem.eql(u8, a, "--timeout")) {
+            const secs = args.next() orelse {
+                writeStderr("Error: --timeout requires seconds\n", .{});
+                std.process.exit(1);
+            };
+            const s = std.fmt.parseFloat(f64, secs) catch {
+                writeStderr("Error: --timeout must be a number of seconds\n", .{});
+                std.process.exit(1);
+            };
+            timeout_ms = @intFromFloat(s * 1000.0);
+        } else if (mem.eql(u8, a, "--gone")) {
+            gone = true;
+        } else {
+            selector = a;
+        }
+    }
+    const sel = selector orelse {
+        writeStderr("Error: wait requires a CSS selector (positional or --selector)\n", .{});
+        std.process.exit(1);
+    };
+
+    var client = hibrow.Client.connect(allocator, g_io) catch |err| {
+        writeStderr("Error: could not connect to gateway: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer client.disconnect();
+
+    var resp = client.wait(profile, sel, frame, timeout_ms, gone) catch |err| {
+        writeStderr("Error: wait failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer resp.deinit();
     if (resp.is_error) {
         printError(allocator, resp.result);
         std.process.exit(1);

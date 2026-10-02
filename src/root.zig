@@ -94,6 +94,28 @@ pub const Client = struct {
         return self.gw.call("browser.frames", .{ .object = params });
     }
 
+    /// Natively click an element (optionally inside a frame).
+    pub fn click(self: *Client, profile: []const u8, selector: []const u8, frame: ?[]const u8) !gateway.ParsedResponse {
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
+        try params.put(self.allocator, "profile", .{ .string = profile });
+        try params.put(self.allocator, "selector", .{ .string = selector });
+        if (frame) |f| try params.put(self.allocator, "frame", .{ .string = f });
+        return self.gw.call("browser.click", .{ .object = params });
+    }
+
+    /// Wait for a selector to appear (or disappear, with `gone`), up to timeout_ms.
+    pub fn wait(self: *Client, profile: []const u8, selector: []const u8, frame: ?[]const u8, timeout_ms: ?i64, gone: bool) !gateway.ParsedResponse {
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
+        try params.put(self.allocator, "profile", .{ .string = profile });
+        try params.put(self.allocator, "selector", .{ .string = selector });
+        if (frame) |f| try params.put(self.allocator, "frame", .{ .string = f });
+        if (timeout_ms) |t| try params.put(self.allocator, "timeout_ms", .{ .integer = t });
+        if (gone) try params.put(self.allocator, "gone", .{ .bool = true });
+        return self.gw.call("browser.wait", .{ .object = params });
+    }
+
     /// Navigate the named profile's active tab to a URL.
     pub fn navigate(self: *Client, profile: []const u8, url: []const u8) !gateway.ParsedResponse {
         var params: json.ObjectMap = .empty;

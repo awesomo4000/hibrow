@@ -175,6 +175,17 @@ pub fn freeVersionInfo(allocator: mem.Allocator, info: VersionInfo) void {
     if (info.webSocketDebuggerUrl) |ws| allocator.free(ws);
 }
 
+/// Build a JS expression that scrolls the selected element into view, dispatches
+/// a pointer/mouse event sequence, calls .click(), and returns whether it was
+/// found. The halves are plain string literals so the JS braces need no escaping.
+fn clickerExpr(allocator: mem.Allocator, selector: []const u8) ![]u8 {
+    const sel_json = try json.Stringify.valueAlloc(allocator, json.Value{ .string = selector }, .{});
+    defer allocator.free(sel_json);
+    const prefix = "(function(){var e=document.querySelector(";
+    const suffix = ");if(!e)return false;e.scrollIntoView({block:'center'});try{e.focus()}catch(_){}var r=e.getBoundingClientRect();var o={bubbles:true,cancelable:true,view:window,clientX:r.left+r.width/2,clientY:r.top+r.height/2};['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(t){e.dispatchEvent(new MouseEvent(t,o))});if(e.click)e.click();return true;})()";
+    return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ prefix, sel_json, suffix });
+}
+
 /// Read a string field from a Page.getFrameTree `frame` object (or "" if absent).
 fn frameField(frame: ?json.Value, key: []const u8) []const u8 {
     const f = frame orelse return "";
@@ -403,6 +414,28 @@ pub const Connection = struct {
         defer self.allocator.free(frame_id);
         const ctx = try self.createIsolatedWorld(frame_id);
         return self.evalInContext(ctx, expression);
+    }
+
+    /// Click the element matching `selector` in the top frame. Scrolls it into
+    /// view and dispatches a full pointer/mouse event sequence plus .click().
+    pub fn click(self: *Connection, selector: []const u8) !void {
+        const expr = try clickerExpr(self.allocator, selector);
+        defer self.allocator.free(expr);
+        const r = try self.eval(expr);
+        if (r.value == .bool and r.value.bool) return;
+        return error.ElementNotFound;
+    }
+
+    /// Click the element matching `selector` inside a nested frame.
+    pub fn clickInFrame(self: *Connection, frame_path: []const u8, selector: []const u8) !void {
+        const expr = try clickerExpr(self.allocator, selector);
+        defer self.allocator.free(expr);
+        const frame_id = try self.resolveFramePath(frame_path);
+        defer self.allocator.free(frame_id);
+        const ctx = try self.createIsolatedWorld(frame_id);
+        const r = try self.evalInContext(ctx, expr);
+        if (r.value == .bool and r.value.bool) return;
+        return error.ElementNotFound;
     }
 
     /// List all (nested) frames as an array of {path, url, name}, where `path`

@@ -312,6 +312,8 @@ pub const Server = struct {
             .{ "browser.launch", wrapWithParams(handleBrowserLaunch) },
             .{ "browser.eval", wrapWithParams(handleBrowserEval) },
             .{ "browser.frames", wrapWithParams(handleBrowserFrames) },
+            .{ "browser.click", wrapWithParams(handleBrowserClick) },
+            .{ "browser.wait", wrapWithParams(handleBrowserWait) },
             .{ "browser.navigate", wrapWithParams(handleBrowserNavigate) },
             .{ "browser.get", wrapWithParams(handleBrowserGet) },
             .{ "browser.kill", wrapWithParams(handleBrowserKill) },
@@ -584,6 +586,92 @@ pub const Server = struct {
                     return self.fail(id, .cdp_error, "frame list failed");
                 };
                 return self.ok(id, frames);
+            },
+        }
+    }
+
+    fn handleBrowserClick(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {
+        const profile = extractStringParam(params, "profile") orelse
+            return self.fail(id, .invalid_params, "Missing 'profile' parameter");
+        const selector = extractStringParam(params, "selector") orelse
+            return self.fail(id, .invalid_params, "Missing 'selector' parameter");
+        const frame = extractStringParam(params, "frame");
+
+        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
+            return self.fail(id, .browser_not_found, "Browser not found");
+
+        switch (info.browser_type) {
+            .firefox => {
+                var conn = marionette_mod.Connection.init(self.allocator, self.io);
+                defer conn.deinit();
+                conn.connect(info.port) catch
+                    return self.fail(id, .cdp_error, "Marionette connection failed");
+                if (frame) |f| conn.switchToFramePath(f) catch
+                    return self.fail(id, .cdp_error, "Frame not found");
+                conn.clickElement(selector) catch
+                    return self.fail(id, .cdp_error, "Click failed (element not found?)");
+                return self.ok(id, .{ .string = "clicked" });
+            },
+            .chrome => {
+                const conn = self.getConnection(profile) orelse
+                    return self.fail(id, .browser_not_found, "Browser not found");
+                (if (frame) |f| conn.clickInFrame(f, selector) else conn.click(selector)) catch {
+                    self.evictConnection(profile);
+                    return self.fail(id, .cdp_error, "Click failed (element not found?)");
+                };
+                return self.ok(id, .{ .string = "clicked" });
+            },
+        }
+    }
+
+    fn handleBrowserWait(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {
+        const profile = extractStringParam(params, "profile") orelse
+            return self.fail(id, .invalid_params, "Missing 'profile' parameter");
+        const selector = extractStringParam(params, "selector") orelse
+            return self.fail(id, .invalid_params, "Missing 'selector' parameter");
+        const frame = extractStringParam(params, "frame");
+        const timeout_ms = extractIntParam(params, "timeout_ms") orelse 10000;
+        const gone = extractBoolParam(params, "gone") orelse false;
+        const desired = !gone;
+
+        const sel_json = try json.Stringify.valueAlloc(self.allocator, json.Value{ .string = selector }, .{});
+        defer self.allocator.free(sel_json);
+        const check = try std.fmt.allocPrint(self.allocator, "!!document.querySelector({s})", .{sel_json});
+        defer self.allocator.free(check);
+
+        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
+            return self.fail(id, .browser_not_found, "Browser not found");
+
+        const interval: u64 = 200;
+        var elapsed: i64 = 0;
+        switch (info.browser_type) {
+            .firefox => {
+                var conn = marionette_mod.Connection.init(self.allocator, self.io);
+                defer conn.deinit();
+                conn.connect(info.port) catch
+                    return self.fail(id, .cdp_error, "Marionette connection failed");
+                if (frame) |f| conn.switchToFramePath(f) catch
+                    return self.fail(id, .cdp_error, "Frame not found");
+                while (elapsed <= timeout_ms) {
+                    const res = conn.eval(check) catch break;
+                    const found = res.value == .bool and res.value.bool;
+                    if (found == desired) return self.ok(id, .{ .bool = true });
+                    sleepMs(interval);
+                    elapsed += interval;
+                }
+                return self.fail(id, .cdp_error, "Timeout waiting for selector");
+            },
+            .chrome => {
+                const conn = self.getConnection(profile) orelse
+                    return self.fail(id, .browser_not_found, "Browser not found");
+                while (elapsed <= timeout_ms) {
+                    const res = (if (frame) |f| conn.evalInFrame(f, check) else conn.eval(check)) catch break;
+                    const found = res.value == .bool and res.value.bool;
+                    if (found == desired) return self.ok(id, .{ .bool = true });
+                    sleepMs(interval);
+                    elapsed += interval;
+                }
+                return self.fail(id, .cdp_error, "Timeout waiting for selector");
             },
         }
     }

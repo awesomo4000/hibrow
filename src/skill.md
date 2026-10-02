@@ -156,14 +156,26 @@ Array.from(document.querySelectorAll("a,button,[role=button],input,select,textar
   .filter(function (o) { return o.text || o.sel; })
 ```
 
-Then click by the selector you found:
+Then click it. Prefer the first-class `click` command over a JS `.click()` — it
+scrolls into view and, on Firefox, performs a real trusted click (works where a
+JS `.click()` or `video.play()` is blocked, e.g. media play buttons):
 
 ```bash
-hibrow eval work 'document.querySelector("#submit").click(); "clicked"'
+hibrow click work "#submit"
+hibrow click work "#play" --frame 0/0      # click inside a nested frame
 ```
 
-If an element isn't there yet (SPA still rendering), use `wait_for` above, or
-poll: `hibrow eval work 'document.querySelector("#submit") ? "ready" : "waiting"'`.
+(Plain `hibrow eval work 'document.querySelector("#submit").click()'` still works
+for simple cases.)
+
+**Wait** for an element instead of guessing with `sleep` (SPAs render late and
+keep stale controls around):
+
+```bash
+hibrow wait work "#results"                    # until it appears (default 10s)
+hibrow wait work "#spinner" --gone --timeout 20   # until it disappears
+hibrow wait work "#lesson-body" --frame 0/0    # inside a frame
+```
 
 ## Filling inputs (and the React gotcha)
 
