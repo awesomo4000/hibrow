@@ -422,7 +422,7 @@ Then target a frame with `--frame <path>`. A path is frame indices and/or CSS
 selectors of the `<iframe>` element, nested, separated by `/` or `,`. Numeric
 indices follow **DOM order** — the order `frame list` shows. On pages that inject
 frames (ad/analytics/WalkMe widgets) the DOM order is the safe reference;
-**selector paths are the most robust** (`#ScormContent/#content-frame`). The same
+**selector paths are the most robust** (`#player/#lesson-frame`). The same
 `--frame` works on `eval`, `click`, `wait`, and `screenshot`:
 
 ```bash
