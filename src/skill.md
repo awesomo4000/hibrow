@@ -1,6 +1,6 @@
 ---
 name: hibrow
-description: Drive a real Chrome or Firefox from the command line to do browser tasks — navigate, read/scrape pages, fill forms, click, log in, screenshot, and download. Use this whenever you need to interact with a website, inspect a live page, automate a web UI, test a web app, extract data from a page that needs a real browser (JS-rendered, auth-gated, or behind a login), capture a site's network traffic, or whenever the user mentions hibrow.
+description: Drive a real Chrome or Firefox from the command line to do browser tasks — navigate, read/scrape pages, fill forms, trusted-click, log in, screenshot, and download. Use this whenever you need to interact with a website, inspect a live page, automate a web UI, test a web app, extract data from a page that needs a real browser (JS-rendered, auth-gated, or behind a login), or capture a site's network traffic. Reach for it especially when you are blocked by a cross-origin iframe (SecurityError on contentWindow), content inside a shadow root (missing from innerText / unreachable by querySelector), a click or video that only responds to a real trusted gesture, or a SCORM/LMS/e-learning course — or whenever the user mentions hibrow.
 ---
 
 # hibrow
