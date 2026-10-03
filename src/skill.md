@@ -28,6 +28,12 @@ first command — you never manage it.
    one shell-quoted line. The multi-line snippets below are meant to be saved to
    a `.js` file and run with `hibrow eval <profile> -f file.js` (or piped via
    `-f-`). This avoids quoting hell and makes them reusable.
+6. **Build a reusable toolkit — don't rawdog fresh JS every time.** When you work
+   a site, save the selectors and snippets that worked (login, extract-X,
+   enumerate controls, instrument) into `.hibrow-scripts/<site>/` and re-run them
+   with `-f`, instead of re-deriving brittle selectors each session. Ask the user
+   before creating the directory. Treat it as a growing library the next run (or
+   the next agent) inherits. See "Project convention: `.hibrow-scripts/`".
 
 ## Core commands
 
