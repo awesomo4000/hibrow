@@ -40,6 +40,10 @@ cp ./zig-out/bin/hibrow ~/.local/bin/
 
 > **macOS build note:** if linking fails with `undefined symbol: __availability_version_check`, your Command Line Tools default to a newer SDK the 0.16 linker can't read. Build with `DEVELOPER_DIR=/dev/null zig build`.
 
+**Tests:** `zig build test` runs the unit suite. `./tests/e2e-features.sh` runs the
+full command surface against real Chrome **and** Firefox (headless) using local
+fixtures — pass `chrome` or `firefox` to run just one.
+
 ## Commands
 
 The gateway daemon auto-starts on the first command — you don't manage it.

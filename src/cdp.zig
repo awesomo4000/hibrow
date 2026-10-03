@@ -1273,3 +1273,52 @@ test "CdpResult struct layout" {
     _ = @hasField(CdpResult, "parsed");
     _ = @hasField(CdpResult, "result");
 }
+
+test "deepRectExpr embeds JSON-escaped selector and shadow split" {
+    const a = std.testing.allocator;
+    const js = try deepRectExpr(a, "#x >>> .y");
+    defer a.free(js);
+    try std.testing.expect(mem.indexOf(u8, js, "\"#x >>> .y\"") != null);
+    try std.testing.expect(mem.indexOf(u8, js, "split('>>>')") != null);
+    try std.testing.expect(mem.indexOf(u8, js, "getBoundingClientRect") != null);
+}
+
+test "clickerExpr JSON-escapes quotes in selector" {
+    const a = std.testing.allocator;
+    const js = try clickerExpr(a, "a[title=\"x\"]");
+    defer a.free(js);
+    try std.testing.expect(mem.indexOf(u8, js, "\\\"x\\\"") != null);
+}
+
+test "rectFromValue parses [x,y,w,h] and rejects non-arrays" {
+    const a = std.testing.allocator;
+    var p = try json.parseFromSlice(json.Value, a, "[1.5,2,3,4]", .{});
+    defer p.deinit();
+    const r = rectFromValue(p.value).?;
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), r.x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 2), r.y, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 4), r.h, 0.001);
+    var p2 = try json.parseFromSlice(json.Value, a, "5", .{});
+    defer p2.deinit();
+    try std.testing.expect(rectFromValue(p2.value) == null);
+    var p3 = try json.parseFromSlice(json.Value, a, "[1,2]", .{});
+    defer p3.deinit();
+    try std.testing.expect(rectFromValue(p3.value) == null);
+}
+
+test "numOf coerces integer/float and falls back" {
+    try std.testing.expectEqual(@as(f64, 3), numOf(.{ .integer = 3 }, 0));
+    try std.testing.expectEqual(@as(f64, 2.5), numOf(.{ .float = 2.5 }, 0));
+    try std.testing.expectEqual(@as(f64, 9), numOf(.{ .string = "x" }, 9));
+}
+
+test "frameIdOf and frameField extract from a frame tree node" {
+    const a = std.testing.allocator;
+    var p = try json.parseFromSlice(json.Value, a, "{\"frame\":{\"id\":\"F1\",\"url\":\"http://x\"}}", .{});
+    defer p.deinit();
+    try std.testing.expectEqualStrings("F1", frameIdOf(p.value).?);
+    const frame = p.value.object.get("frame");
+    try std.testing.expectEqualStrings("http://x", frameField(frame, "url"));
+    try std.testing.expectEqualStrings("", frameField(frame, "name"));
+    try std.testing.expect(frameIdOf(.{ .integer = 1 }) == null);
+}

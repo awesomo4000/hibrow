@@ -787,3 +787,35 @@ test "cloneJsonValue clones primitives" {
     defer allocator.free(str_val.string);
     try std.testing.expectEqualStrings("hello", str_val.string);
 }
+
+test "firstStringValue reads a web-element/shadow-root ref" {
+    const a = std.testing.allocator;
+    var p = try json.parseFromSlice(json.Value, a, "{\"element-6066-11e4\":\"uuid-123\"}", .{});
+    defer p.deinit();
+    try std.testing.expectEqualStrings("uuid-123", firstStringValue(p.value).?);
+    var p2 = try json.parseFromSlice(json.Value, a, "{}", .{});
+    defer p2.deinit();
+    try std.testing.expect(firstStringValue(p2.value) == null);
+    try std.testing.expect(firstStringValue(.{ .integer = 1 }) == null);
+}
+
+test "selectorHint prefers id, then name, else empty" {
+    const a = std.testing.allocator;
+    const s1 = try selectorHint(a, "myid", "nm");
+    defer a.free(s1);
+    try std.testing.expectEqualStrings("#myid", s1);
+    const s2 = try selectorHint(a, "", "nm");
+    defer a.free(s2);
+    try std.testing.expectEqualStrings("[name=\"nm\"]", s2);
+    const s3 = try selectorHint(a, "", "");
+    defer a.free(s3);
+    try std.testing.expectEqualStrings("", s3);
+}
+
+test "objField reads string fields" {
+    const a = std.testing.allocator;
+    var p = try json.parseFromSlice(json.Value, a, "{\"src\":\"S\",\"name\":\"N\"}", .{});
+    defer p.deinit();
+    try std.testing.expectEqualStrings("S", objField(p.value, "src"));
+    try std.testing.expectEqualStrings("", objField(p.value, "missing"));
+}
