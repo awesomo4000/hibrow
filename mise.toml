@@ -1,0 +1,33 @@
+# mise configuration for hibrow — https://mise.jdx.dev
+# Pins the toolchain and provides build/test tasks.
+
+[tools]
+zig = "0.16.0"
+
+[env]
+# Newer macOS Command Line Tools SDKs (26.x/27.x) ship `.tbd` files the Zig
+# 0.16 linker cannot parse, so `zig build` fails to link libSystem with
+# `undefined symbol: __availability_version_check`. Disabling SDK detection
+# makes Zig fall back to its bundled libSystem stub. Safe for this Zig-only
+# project; remove it if you add tooling that needs xcrun/the macOS SDK.
+DEVELOPER_DIR = "/dev/null"
+
+[tasks.build]
+description = "Build hibrow (debug)"
+run = "zig build"
+
+[tasks.release]
+description = "Build optimized (ReleaseFast)"
+run = "zig build -Doptimize=ReleaseFast"
+
+[tasks.test]
+description = "Run the unit test suite"
+run = "zig build test"
+
+[tasks.e2e]
+description = "Run the dual-browser (Chrome + Firefox) e2e feature tests"
+run = "./tests/e2e-features.sh"
+
+[tasks.run]
+description = "Run the hibrow CLI (args after --, e.g. mise run run -- --help)"
+run = "zig build run --"

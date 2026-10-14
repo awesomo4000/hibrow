@@ -38,7 +38,11 @@ zig build -Doptimize=.ReleaseFast
 cp ./zig-out/bin/hibrow ~/.local/bin/
 ```
 
-> **macOS build note:** if linking fails with `undefined symbol: __availability_version_check`, your Command Line Tools default to a newer SDK the 0.16 linker can't read. Build with `DEVELOPER_DIR=/dev/null zig build`.
+> **Using [mise](https://mise.jdx.dev)?** `mise install` pins Zig 0.16.0, and the
+> tasks handle everything: `mise run build`, `mise run test`, `mise run e2e`,
+> `mise run run -- --help`. The macOS SDK workaround below is applied automatically.
+
+> **macOS build note:** if linking fails with `undefined symbol: __availability_version_check`, your Command Line Tools default to a newer SDK the 0.16 linker can't read. Build with `DEVELOPER_DIR=/dev/null zig build` (mise does this for you).
 
 **Tests:** `zig build test` runs the unit suite. `./tests/e2e-features.sh` runs the
 full command surface against real Chrome **and** Firefox (headless) using local
