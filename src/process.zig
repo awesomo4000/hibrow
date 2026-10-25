@@ -27,11 +27,9 @@ pub const DiscoveredProcess = struct {
 /// Caller owns the returned slice and all strings within it.
 /// Free with freeDiscovered().
 pub fn findChromeBrowsers(allocator: mem.Allocator, io: std.Io) ![]DiscoveredProcess {
-    if (comptime builtin.os.tag == .macos) {
-        return findBrowsersMacOS(allocator, io);
-    } else {
-        // Linux: TODO — use /proc/PID/cmdline
-        return &[_]DiscoveredProcess{};
+    switch (comptime builtin.os.tag) {
+        .macos, .linux => return findBrowsersScan(allocator, io),
+        else => return &[_]DiscoveredProcess{},
     }
 }
 
@@ -69,9 +67,9 @@ extern "c" fn proc_listpids(
 const CTL_KERN: c_int = 1;
 const KERN_PROCARGS2: c_int = 49;
 
-fn findBrowsersMacOS(allocator: mem.Allocator, io: std.Io) ![]DiscoveredProcess {
+fn findBrowsersScan(allocator: mem.Allocator, io: std.Io) ![]DiscoveredProcess {
     // Step 1: Get list of all PIDs
-    const pids = try listAllPids(allocator);
+    const pids = try listAllPids(allocator, io);
     defer allocator.free(pids);
 
     var results: std.ArrayList(DiscoveredProcess) = .empty;
@@ -84,7 +82,7 @@ fn findBrowsersMacOS(allocator: mem.Allocator, io: std.Io) ![]DiscoveredProcess 
     for (pids) |pid| {
         if (pid <= 0) continue;
 
-        const parsed = getProcArgs(allocator, pid) catch continue;
+        const parsed = getProcArgs(allocator, io, pid) catch continue;
         defer allocator.free(parsed.raw_buf);
         defer allocator.free(parsed.argv);
 
@@ -184,7 +182,53 @@ fn readMarionettePort(allocator: mem.Allocator, io: std.Io, profile_dir: []const
 }
 
 /// Get all PIDs on the system.
-fn listAllPids(allocator: mem.Allocator) ![]posix.pid_t {
+fn listAllPids(allocator: mem.Allocator, io: std.Io) ![]posix.pid_t {
+    if (comptime builtin.os.tag == .linux) return listAllPidsLinux(allocator, io);
+    return listAllPidsMacOS(allocator);
+}
+
+fn listAllPidsLinux(allocator: mem.Allocator, io: std.Io) ![]posix.pid_t {
+    var dir = try std.Io.Dir.openDirAbsolute(io, "/proc", .{ .iterate = true });
+    defer dir.close(io);
+    var pids: std.ArrayList(posix.pid_t) = .empty;
+    errdefer pids.deinit(allocator);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        const pid = std.fmt.parseInt(posix.pid_t, entry.name, 10) catch continue;
+        try pids.append(allocator, pid);
+    }
+    return pids.toOwnedSlice(allocator);
+}
+
+/// Read /proc/PID/cmdline (NUL-separated argv).
+fn getProcArgsLinux(allocator: mem.Allocator, io: std.Io, pid: posix.pid_t) !ProcArgs {
+    _ = io;
+    // procfs reports st_size 0, so Dir.readFileAlloc returns nothing; read until EOF.
+    var path_buf: [32]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/cmdline", .{pid}, 0);
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY });
+    if (fd < 0) return error.OpenFailed;
+    defer _ = std.c.close(fd);
+    var acc: std.ArrayList(u8) = .empty;
+    errdefer acc.deinit(allocator);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = std.c.read(fd, &chunk, chunk.len);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        try acc.appendSlice(allocator, chunk[0..@intCast(n)]);
+    }
+    const buf = try acc.toOwnedSlice(allocator);
+    errdefer allocator.free(buf);
+    if (buf.len == 0) return error.EmptyProcArgs;
+    var argv_list: std.ArrayList([]const u8) = .empty;
+    defer argv_list.deinit(allocator);
+    var it = mem.splitScalar(u8, mem.trimEnd(u8, buf, "\x00"), 0);
+    while (it.next()) |a| if (a.len > 0) try argv_list.append(allocator, a);
+    return .{ .raw_buf = buf, .argv = try argv_list.toOwnedSlice(allocator) };
+}
+
+fn listAllPidsMacOS(allocator: mem.Allocator) ![]posix.pid_t {
     // First call: get required buffer size
     const bytes_needed = proc_listpids(PROC_ALL_PIDS, 0, null, 0);
     if (bytes_needed <= 0) return error.ProcListPidsFailed;
@@ -227,7 +271,8 @@ const ProcArgs = struct {
 ///   [argv[1] as null-terminated string]
 ///   ...
 ///   [argv[argc-1] as null-terminated string]
-fn getProcArgs(allocator: mem.Allocator, pid: posix.pid_t) !ProcArgs {
+fn getProcArgs(allocator: mem.Allocator, io: std.Io, pid: posix.pid_t) !ProcArgs {
+    if (comptime builtin.os.tag == .linux) return getProcArgsLinux(allocator, io, pid);
     var mib = [4]c_int{ CTL_KERN, KERN_PROCARGS2, @intCast(pid), 0 };
 
     // First call to get size
