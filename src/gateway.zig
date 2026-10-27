@@ -27,7 +27,6 @@ const socket_filename = "gateway.sock";
 /// PID filename within the per-user directory.
 const pid_filename = "gateway.pid";
 
-
 /// Read buffer size for socket I/O.
 const read_buf_size = 8192;
 
@@ -453,7 +452,10 @@ pub const Server = struct {
 
         // Shut down after encoding the response so the client gets the reply.
         self.running = false;
-        if (self.listener) |*l| { l.deinit(self.io); self.listener = null; }
+        if (self.listener) |*l| {
+            l.deinit(self.io);
+            self.listener = null;
+        }
         if (self.socket_path) |p| std.Io.Dir.deleteFileAbsolute(self.io, p) catch {};
 
         return encoded;
@@ -825,14 +827,14 @@ pub const Server = struct {
                 self.allocator.free(t.id);
                 self.allocator.free(t.title);
                 self.allocator.free(t.url);
-                self.allocator.free(t.@"type");
+                self.allocator.free(t.type);
                 if (t.webSocketDebuggerUrl) |ws| self.allocator.free(ws);
             }
             pages.deinit(self.allocator);
         }
 
         for (all_targets) |t| {
-            if (mem.eql(u8, t.@"type", "page")) {
+            if (mem.eql(u8, t.type, "page")) {
                 const ws_url = if (t.webSocketDebuggerUrl) |ws|
                     try self.allocator.dupe(u8, ws)
                 else
@@ -843,7 +845,7 @@ pub const Server = struct {
                     .id = try self.allocator.dupe(u8, t.id),
                     .title = try self.allocator.dupe(u8, t.title),
                     .url = try self.allocator.dupe(u8, t.url),
-                    .@"type" = try self.allocator.dupe(u8, t.@"type"),
+                    .type = try self.allocator.dupe(u8, t.type),
                     .webSocketDebuggerUrl = ws_url,
                 });
             }
@@ -949,7 +951,7 @@ pub const Server = struct {
                     self.allocator.free(new_target.id);
                     self.allocator.free(new_target.title);
                     self.allocator.free(new_target.url);
-                    self.allocator.free(new_target.@"type");
+                    self.allocator.free(new_target.type);
                     if (new_target.webSocketDebuggerUrl) |ws| self.allocator.free(ws);
                 }
 
@@ -1294,7 +1296,7 @@ fn collapseTilde(allocator: mem.Allocator, path: []const u8) ![]const u8 {
 /// Find the first "page" type target with a webSocketDebuggerUrl.
 fn findPageTarget(targets: []const cdp.Target) ?[]const u8 {
     for (targets) |t| {
-        if (mem.eql(u8, t.@"type", "page")) {
+        if (mem.eql(u8, t.type, "page")) {
             if (t.webSocketDebuggerUrl) |ws_url| return ws_url;
         }
     }
@@ -1374,14 +1376,14 @@ test "findPageTarget finds page type first" {
             .id = "bg1",
             .title = "Background",
             .url = "chrome-extension://abc",
-            .@"type" = "background_page",
+            .type = "background_page",
             .webSocketDebuggerUrl = "ws://127.0.0.1:9222/devtools/page/bg1",
         },
         .{
             .id = "page1",
             .title = "Example",
             .url = "https://example.com",
-            .@"type" = "page",
+            .type = "page",
             .webSocketDebuggerUrl = "ws://127.0.0.1:9222/devtools/page/page1",
         },
     };
@@ -1396,7 +1398,7 @@ test "findPageTarget falls back to any target with ws url" {
             .id = "worker1",
             .title = "Worker",
             .url = "chrome://worker",
-            .@"type" = "service_worker",
+            .type = "service_worker",
             .webSocketDebuggerUrl = "ws://127.0.0.1:9222/devtools/page/worker1",
         },
     };
@@ -1415,7 +1417,7 @@ test "findPageTarget returns null when no ws urls" {
             .id = "page1",
             .title = "No WS",
             .url = "https://example.com",
-            .@"type" = "page",
+            .type = "page",
             .webSocketDebuggerUrl = null,
         },
     };
@@ -1473,7 +1475,8 @@ test "readLine handles EOF without newline" {
     const write_fd = fds[1];
 
     // Write data without newline, then close
-    const partial = "partial data"; _ = std.c.write(write_fd, partial.ptr, partial.len);
+    const partial = "partial data";
+    _ = std.c.write(write_fd, partial.ptr, partial.len);
     _ = std.c.close(write_fd);
 
     const allocator = std.testing.allocator;

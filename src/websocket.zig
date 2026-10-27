@@ -127,7 +127,7 @@ pub fn encodeFrame(buf: []u8, opcode: Opcode, payload: []const u8, mask: bool) !
     var pos: usize = 0;
 
     // Byte 0: FIN + opcode
-    buf[pos] = 0x80 | @as(u8, @intFromEnum(opcode));
+    buf[pos] = 0x80 | @as(u8, @backingInt(opcode));
     pos += 1;
 
     // Byte 1: mask bit + payload length
@@ -321,14 +321,15 @@ pub const WebSocket = struct {
 
         // Build and send HTTP upgrade request
         var req_buf: [1024]u8 = undefined;
-        const request = try std.fmt.bufPrint(&req_buf,
+        const request = try std.fmt.bufPrint(
+            &req_buf,
             "GET {s} HTTP/1.1\r\n" ++
-            "Host: {s}:{d}\r\n" ++
-            "Upgrade: websocket\r\n" ++
-            "Connection: Upgrade\r\n" ++
-            "Sec-WebSocket-Key: {s}\r\n" ++
-            "Sec-WebSocket-Version: 13\r\n" ++
-            "\r\n",
+                "Host: {s}:{d}\r\n" ++
+                "Upgrade: websocket\r\n" ++
+                "Connection: Upgrade\r\n" ++
+                "Sec-WebSocket-Key: {s}\r\n" ++
+                "Sec-WebSocket-Version: 13\r\n" ++
+                "\r\n",
             .{ path, host, port, &client_key },
         );
         try streamWriteAll(stream, request);
@@ -463,11 +464,11 @@ pub const WebSocket = struct {
 // ---------------------------------------------------------------------------
 
 test "Opcode values match RFC 6455" {
-    try std.testing.expectEqual(@as(u4, 0x1), @intFromEnum(Opcode.text));
-    try std.testing.expectEqual(@as(u4, 0x2), @intFromEnum(Opcode.binary));
-    try std.testing.expectEqual(@as(u4, 0x8), @intFromEnum(Opcode.close));
-    try std.testing.expectEqual(@as(u4, 0x9), @intFromEnum(Opcode.ping));
-    try std.testing.expectEqual(@as(u4, 0xA), @intFromEnum(Opcode.pong));
+    try std.testing.expectEqual(@as(u4, 0x1), @backingInt(Opcode.text));
+    try std.testing.expectEqual(@as(u4, 0x2), @backingInt(Opcode.binary));
+    try std.testing.expectEqual(@as(u4, 0x8), @backingInt(Opcode.close));
+    try std.testing.expectEqual(@as(u4, 0x9), @backingInt(Opcode.ping));
+    try std.testing.expectEqual(@as(u4, 0xA), @backingInt(Opcode.pong));
 }
 
 test "applyMask is its own inverse" {

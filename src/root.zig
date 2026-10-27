@@ -6,7 +6,6 @@
 ///!   var client = try hibrow.Client.connect(allocator);
 ///!   defer client.disconnect();
 ///!   const result = try client.eval("work", "document.title");
-
 const std = @import("std");
 const json = std.json;
 const mem = std.mem;

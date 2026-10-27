@@ -56,7 +56,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path(src),
             .target = target,
             .optimize = optimize,
-        .link_libc = true,
+            .link_libc = true,
         });
         const unit_test = b.addTest(.{
             .root_module = test_mod,

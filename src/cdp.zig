@@ -15,7 +15,7 @@ pub const Target = struct {
     id: []const u8,
     title: []const u8,
     url: []const u8,
-    @"type": []const u8,
+    type: []const u8,
     webSocketDebuggerUrl: ?[]const u8 = null,
 };
 
@@ -118,7 +118,7 @@ pub fn discoverTargets(allocator: mem.Allocator, io: std.Io, port: u16) ![]Targe
             .id = try allocator.dupe(u8, id.string),
             .title = try allocator.dupe(u8, title_val.string),
             .url = try allocator.dupe(u8, url_val.string),
-            .@"type" = try allocator.dupe(u8, type_val.string),
+            .type = try allocator.dupe(u8, type_val.string),
             .webSocketDebuggerUrl = ws_url,
         });
     }
@@ -132,7 +132,7 @@ pub fn freeTargets(allocator: mem.Allocator, targets: []Target) void {
         allocator.free(t.id);
         allocator.free(t.title);
         allocator.free(t.url);
-        allocator.free(t.@"type");
+        allocator.free(t.type);
         if (t.webSocketDebuggerUrl) |ws| allocator.free(ws);
     }
     allocator.free(targets);
@@ -1026,7 +1026,7 @@ pub fn createTarget(allocator: mem.Allocator, io: std.Io, port: u16, url: ?[]con
         .id = try allocator.dupe(u8, id.string),
         .title = try allocator.dupe(u8, title_val.string),
         .url = try allocator.dupe(u8, url_val.string),
-        .@"type" = try allocator.dupe(u8, type_val.string),
+        .type = try allocator.dupe(u8, type_val.string),
         .webSocketDebuggerUrl = ws_url,
     };
 }
@@ -1159,11 +1159,11 @@ test "Target struct has expected fields" {
         .id = "ABC123",
         .title = "Example",
         .url = "https://example.com",
-        .@"type" = "page",
+        .type = "page",
         .webSocketDebuggerUrl = "ws://127.0.0.1:9222/devtools/page/ABC123",
     };
     try std.testing.expectEqualStrings("ABC123", t.id);
-    try std.testing.expectEqualStrings("page", t.@"type");
+    try std.testing.expectEqualStrings("page", t.type);
     try std.testing.expectEqualStrings("ws://127.0.0.1:9222/devtools/page/ABC123", t.webSocketDebuggerUrl.?);
 }
 

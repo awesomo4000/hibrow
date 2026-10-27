@@ -89,7 +89,7 @@ pub fn makeResponse(id: json.Value, result: json.Value) Response {
 pub fn makeErrorResponse(id: json.Value, code: ErrorCode, message: []const u8) ErrorResponse {
     return .{
         .@"error" = .{
-            .code = @intFromEnum(code),
+            .code = @backingInt(code),
             .message = message,
         },
         .id = id,
@@ -186,11 +186,11 @@ fn encodeJsonLine(allocator: mem.Allocator, value: anytype) ![]u8 {
 // ---------------------------------------------------------------------------
 
 test "ErrorCode values match JSON-RPC 2.0 spec" {
-    try std.testing.expectEqual(@as(i32, -32700), @intFromEnum(ErrorCode.parse_error));
-    try std.testing.expectEqual(@as(i32, -32600), @intFromEnum(ErrorCode.invalid_request));
-    try std.testing.expectEqual(@as(i32, -32601), @intFromEnum(ErrorCode.method_not_found));
-    try std.testing.expectEqual(@as(i32, -32602), @intFromEnum(ErrorCode.invalid_params));
-    try std.testing.expectEqual(@as(i32, -32603), @intFromEnum(ErrorCode.internal_error));
+    try std.testing.expectEqual(@as(i32, -32700), @backingInt(ErrorCode.parse_error));
+    try std.testing.expectEqual(@as(i32, -32600), @backingInt(ErrorCode.invalid_request));
+    try std.testing.expectEqual(@as(i32, -32601), @backingInt(ErrorCode.method_not_found));
+    try std.testing.expectEqual(@as(i32, -32602), @backingInt(ErrorCode.invalid_params));
+    try std.testing.expectEqual(@as(i32, -32603), @backingInt(ErrorCode.internal_error));
 }
 
 test "makeErrorResponse constructs valid error" {
