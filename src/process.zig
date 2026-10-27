@@ -356,7 +356,9 @@ test "findChromeBrowsers returns a slice" {
 test "listAllPids returns non-empty list" {
     if (comptime builtin.os.tag != .macos) return;
     const allocator = std.testing.allocator;
-    const pids = try listAllPids(allocator);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const pids = try listAllPids(allocator, threaded.io());
     defer allocator.free(pids);
     // There should always be at least a few processes
     try std.testing.expect(pids.len > 0);
@@ -365,8 +367,10 @@ test "listAllPids returns non-empty list" {
 test "getProcArgs reads own process args" {
     if (comptime builtin.os.tag != .macos) return;
     const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
     const my_pid = std.c.getpid();
-    const parsed = try getProcArgs(allocator, my_pid);
+    const parsed = try getProcArgs(allocator, threaded.io(), my_pid);
     defer allocator.free(parsed.raw_buf);
     defer allocator.free(parsed.argv);
     // Our own process should have at least one arg (the executable path)
