@@ -364,7 +364,7 @@ test "DiscoveredProcess struct has expected fields" {
         .profile = "test",
         .user_data_dir = "/home/user/.hibrow/profiles/test",
     };
-    try std.testing.expectEqual(@as(posix.pid_t, 1234), p.pid);
+    try std.testing.expectEqual(@as(os.Pid, 1234), p.pid);
     try std.testing.expectEqual(@as(u16, 9322), p.port);
     try std.testing.expectEqualStrings("test", p.profile);
 }

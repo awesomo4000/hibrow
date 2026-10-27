@@ -7,6 +7,7 @@
 ///! Frame encode/decode are pure functions (no I/O) for easy testing.
 ///! The WebSocket struct wraps them with stream I/O for real connections.
 const std = @import("std");
+const builtin = @import("builtin");
 const mem = std.mem;
 const crypto = std.crypto;
 const os = @import("os.zig");
@@ -705,38 +706,50 @@ fn testEofAfter(prefix: []const u8) !void {
     sock.deinit();
 }
 
+// The following tests drive readFrame over a real socketpair, which is
+// POSIX-only (Windows has no AF_UNIX socketpair with raw fds); the comptime
+// guard prunes them — and the TestPair/testEofAfter helpers they reference — on
+// Windows, where readFrame is covered by the e2e suite instead.
+
 test "peer closes before any frame bytes (idle cached CDP connection)" {
-    try testEofAfter("");
+    if (builtin.os.tag != .windows) try testEofAfter("");
 }
 
 test "peer closes mid-frame (large base64 response cut off)" {
     // 0x81 = FIN|text, 0x7f = 64-bit length follows; claim 1 MiB, send 4 bytes.
-    try testEofAfter(&[_]u8{ 0x81, 0x7f, 0, 0, 0, 0, 0, 0x10, 0, 0, 'A', 'A', 'A', 'A' });
+    if (builtin.os.tag != .windows)
+        try testEofAfter(&[_]u8{ 0x81, 0x7f, 0, 0, 0, 0, 0, 0x10, 0, 0, 'A', 'A', 'A', 'A' });
 }
 
 test "two frames delivered in one read: second must not be dropped" {
-    // Chrome routinely coalesces an event + a response into one TCP segment.
-    var p: TestPair = undefined;
-    try p.init(&[_]u8{ 0x81, 3, 'o', 'n', 'e', 0x81, 3, 't', 'w', 'o' });
-    defer p.deinit();
-    const a = try p.sock.readFrame();
-    defer if (a.owned_payload) |b| std.testing.allocator.free(b);
-    try std.testing.expectEqualStrings("one", a.frame.payload);
-    const b = try p.sock.readFrame();
-    defer if (b.owned_payload) |x| std.testing.allocator.free(x);
-    try std.testing.expectEqualStrings("two", b.frame.payload);
+    if (builtin.os.tag != .windows) {
+        // Chrome routinely coalesces an event + a response into one TCP segment.
+        var p: TestPair = undefined;
+        try p.init(&[_]u8{ 0x81, 3, 'o', 'n', 'e', 0x81, 3, 't', 'w', 'o' });
+        defer p.deinit();
+        const a = try p.sock.readFrame();
+        defer if (a.owned_payload) |b| std.testing.allocator.free(b);
+        try std.testing.expectEqualStrings("one", a.frame.payload);
+        const b = try p.sock.readFrame();
+        defer if (b.owned_payload) |x| std.testing.allocator.free(x);
+        try std.testing.expectEqualStrings("two", b.frame.payload);
+    }
 }
 
 test "reserved opcode is an error, not a safety panic" {
-    var p: TestPair = undefined;
-    try p.init(&[_]u8{ 0x83, 0 });
-    defer p.deinit();
-    try std.testing.expectError(error.InvalidOpcode, p.sock.readFrame());
+    if (builtin.os.tag != .windows) {
+        var p: TestPair = undefined;
+        try p.init(&[_]u8{ 0x83, 0 });
+        defer p.deinit();
+        try std.testing.expectError(error.InvalidOpcode, p.sock.readFrame());
+    }
 }
 
 test "64-bit length near maxInt is an error, not an overflow panic" {
-    var p: TestPair = undefined;
-    try p.init(&[_]u8{ 0x81, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0 });
-    defer p.deinit();
-    try std.testing.expectError(error.FrameTooLarge, p.sock.readFrame());
+    if (builtin.os.tag != .windows) {
+        var p: TestPair = undefined;
+        try p.init(&[_]u8{ 0x81, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0 });
+        defer p.deinit();
+        try std.testing.expectError(error.FrameTooLarge, p.sock.readFrame());
+    }
 }

@@ -110,8 +110,12 @@ pub fn sleepMs(ms: u64) void {
 /// leftover bytes just as with the POSIX path).
 pub fn sockRead(io: std.Io, stream: Stream, buf: []u8) !usize {
     if (is_windows) {
+        // Stream.read's low-level destructure is miscompiled on Windows in
+        // 0.17; readWithControl returns a uniform ReadResult on all platforms.
+        // data_len == 0 means EOF, matching posix.read's 0 return.
         var iov = [_][]u8{buf};
-        return stream.read(io, &iov);
+        const res = try stream.readWithControl(io, &iov, &[_]u8{});
+        return res.data_len;
     }
     return posix.read(stream.socket.handle, buf);
 }

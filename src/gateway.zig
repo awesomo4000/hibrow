@@ -1152,7 +1152,7 @@ pub fn autoStartDaemon(io: std.Io) !void {
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
-        .pgid = 0,
+        .pgid = os.new_process_group,
     });
     _ = &child;
     // Don't wait — let the daemon run independently.
