@@ -28,8 +28,19 @@ is_png()   { if [ -f "$2" ] && file "$2" | grep -q "PNG image"; then ok "$1"; el
 
 [ -x "$HIBROW" ] || { echo "$(r ERROR): build first (zig build) — $HIBROW missing"; exit 1; }
 
-have_chrome()  { [ -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ] || [ -x "/Applications/Chromium.app/Contents/MacOS/Chromium" ]; }
-have_firefox() { [ -x "/Applications/Firefox.app/Contents/MacOS/firefox" ]; }
+# Browser detection is cross-platform: macOS keeps browsers in /Applications,
+# Linux puts them on PATH under various names. hibrow itself finds them the same
+# way (app bundle on macOS, PATH search on Linux), so we just gate whether to run.
+on_path() { for n in "$@"; do command -v "$n" >/dev/null 2>&1 && return 0; done; return 1; }
+have_chrome() {
+    [ -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ] ||
+    [ -x "/Applications/Chromium.app/Contents/MacOS/Chromium" ] ||
+    on_path google-chrome google-chrome-stable chromium chromium-browser
+}
+have_firefox() {
+    [ -x "/Applications/Firefox.app/Contents/MacOS/firefox" ] ||
+    on_path firefox
+}
 
 run_browser() {
     local browser="$1" P="e2e-$1"
