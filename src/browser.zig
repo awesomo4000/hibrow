@@ -7,26 +7,19 @@
 const std = @import("std");
 const mem = std.mem;
 const fs = std.fs;
-const posix = std.posix;
 const builtin = @import("builtin");
 const process = @import("process.zig");
+const os = @import("os.zig");
+const os_windows = @import("os_windows.zig");
 
-/// Sleep for the given number of milliseconds. Zig 0.16 removed
-/// `std.Thread.sleep`; use libc `nanosleep` directly (macOS links libc).
+/// Sleep for the given number of milliseconds.
 fn sleepMs(ms: u64) void {
-    const ts: std.c.timespec = .{
-        .sec = @intCast(ms / 1000),
-        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
-    };
-    _ = std.c.nanosleep(&ts, null);
+    os.sleepMs(ms);
 }
 
-/// Read an environment variable and dupe its value. Zig 0.16 removed
-/// `std.process.getEnvVarOwned` (env access now goes through `Environ`); use
-/// libc `getenv` directly. Returns null if the variable is unset.
+/// Read an environment variable and dupe its value; null if unset.
 fn getEnvOwned(allocator: mem.Allocator, name: [*:0]const u8) !?[]u8 {
-    const val = std.c.getenv(name) orelse return null;
-    return try allocator.dupe(u8, mem.span(val));
+    return os.envOwned(allocator, name);
 }
 
 /// Browser engine type.
@@ -55,7 +48,7 @@ pub const Browser = struct {
     /// CDP debugging port (Chrome) or Marionette port (Firefox).
     port: u16,
     /// OS process IDs (Chrome spawns multiple processes per browser).
-    pids: []const posix.pid_t = &.{},
+    pids: []const os.Pid = &.{},
     /// Whether we launched this browser (vs discovered it).
     profile_dir: []const u8 = "",
     /// Browser engine type.
@@ -126,6 +119,8 @@ pub fn findChromium(allocator: mem.Allocator, io: std.Io) ![]const u8 {
                 }
             }
         }
+    } else if (builtin.os.tag == .windows) {
+        if (try os_windows.findChrome(allocator)) |path| return path;
     }
 
     return error.ChromiumNotFound;
@@ -176,6 +171,8 @@ pub fn findFirefox(allocator: mem.Allocator, io: std.Io) ![]const u8 {
                 }
             }
         }
+    } else if (builtin.os.tag == .windows) {
+        if (try os_windows.findFirefox(allocator)) |path| return path;
     }
 
     return error.FirefoxNotFound;
@@ -252,9 +249,9 @@ fn launchChrome(allocator: mem.Allocator, io: std.Io, options: LaunchOptions) !B
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
-        .pgid = 0,
+        .pgid = os.new_process_group,
     });
-    const pid = child.id.?;
+    const pid = os.childPid(child);
 
     // Wait for CDP to become responsive (poll with TCP connect, then verify HTTP)
     var attempts: u32 = 0;
@@ -263,7 +260,7 @@ fn launchChrome(allocator: mem.Allocator, io: std.Io, options: LaunchOptions) !B
         if (tcpProbe(io, port)) {
             // TCP is open — now verify CDP responds over HTTP
             if (verify(allocator, io, port) catch false) {
-                const pid_slice = try allocator.alloc(posix.pid_t, 1);
+                const pid_slice = try allocator.alloc(os.Pid, 1);
                 pid_slice[0] = pid;
                 return .{
                     .profile = try allocator.dupe(u8, options.profile),
@@ -318,9 +315,9 @@ fn launchFirefox(allocator: mem.Allocator, io: std.Io, options: LaunchOptions) !
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
-        .pgid = 0,
+        .pgid = os.new_process_group,
     });
-    const pid = child.id.?;
+    const pid = os.childPid(child);
 
     // Wait for Marionette TCP port to accept connections.
     // Unlike Chrome (which needs HTTP verify), Marionette sends a handshake
@@ -328,7 +325,7 @@ fn launchFirefox(allocator: mem.Allocator, io: std.Io, options: LaunchOptions) !
     var attempts: u32 = 0;
     while (attempts < 100) : (attempts += 1) {
         if (tcpProbe(io, port)) {
-            const pid_slice = try allocator.alloc(posix.pid_t, 1);
+            const pid_slice = try allocator.alloc(os.Pid, 1);
             pid_slice[0] = pid;
             return .{
                 .profile = try allocator.dupe(u8, options.profile),
@@ -445,7 +442,7 @@ pub fn discover(allocator: mem.Allocator, io: std.Io) ![]Browser {
             if (b.port == p.port) {
                 // Append pid to existing entry
                 const old_len = b.pids.len;
-                const new_pids = try allocator.alloc(posix.pid_t, old_len + 1);
+                const new_pids = try allocator.alloc(os.Pid, old_len + 1);
                 @memcpy(new_pids[0..old_len], b.pids);
                 new_pids[old_len] = p.pid;
                 allocator.free(b.pids);
@@ -455,7 +452,7 @@ pub fn discover(allocator: mem.Allocator, io: std.Io) ![]Browser {
             }
         }
         if (!found) {
-            const pid_slice = try allocator.alloc(posix.pid_t, 1);
+            const pid_slice = try allocator.alloc(os.Pid, 1);
             pid_slice[0] = p.pid;
             try browsers.append(allocator, .{
                 .profile = try allocator.dupe(u8, p.profile),
@@ -555,7 +552,7 @@ fn ensureDirExists(io: std.Io, path: []const u8) !void {
 // ---------------------------------------------------------------------------
 
 test "Browser struct has expected fields" {
-    const pids = [_]posix.pid_t{12345};
+    const pids = [_]os.Pid{12345};
     const b = Browser{
         .profile = "test",
         .port = 9322,
@@ -566,7 +563,7 @@ test "Browser struct has expected fields" {
     try std.testing.expectEqualStrings("test", b.profile);
     try std.testing.expectEqual(@as(u16, 9322), b.port);
     try std.testing.expectEqual(@as(usize, 1), b.pids.len);
-    try std.testing.expectEqual(@as(posix.pid_t, 12345), b.pids[0]);
+    try std.testing.expectEqual(@as(os.Pid, 12345), b.pids[0]);
     try std.testing.expectEqualStrings("/home/user/.hibrow/profiles/test", b.profile_dir);
     try std.testing.expectEqual(BrowserType.chrome, b.browser_type);
 }

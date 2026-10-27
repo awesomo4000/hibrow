@@ -14,25 +14,19 @@
 const std = @import("std");
 const mem = std.mem;
 const json = std.json;
-const posix = std.posix;
+const os = @import("os.zig");
 
-/// The 0.16 network stream type.
+/// The network stream type.
 const Stream = std.Io.net.Stream;
 
-/// Raw blocking read from the stream's socket fd (fds from the Io backend are
-/// blocking, so raw posix I/O matches the pre-0.16 Stream.read semantics).
-fn streamRead(stream: Stream, buf: []u8) !usize {
-    return posix.read(stream.socket.handle, buf);
+/// Blocking read from the stream's socket (see os.sockRead).
+fn streamRead(io: std.Io, stream: Stream, buf: []u8) !usize {
+    return os.sockRead(io, stream, buf);
 }
 
-/// Write all bytes to the stream's socket fd, looping over partial writes.
-fn streamWriteAll(stream: Stream, bytes: []const u8) !void {
-    var i: usize = 0;
-    while (i < bytes.len) {
-        const rc = std.c.write(stream.socket.handle, bytes[i..].ptr, bytes.len - i);
-        if (rc <= 0) return error.WriteFailed;
-        i += @intCast(rc);
-    }
+/// Write all bytes to the stream's socket (see os.sockWriteAll).
+fn streamWriteAll(io: std.Io, stream: Stream, bytes: []const u8) !void {
+    return os.sockWriteAll(io, stream, bytes);
 }
 
 /// Marionette handshake data sent by Firefox on connect.
@@ -151,7 +145,7 @@ pub const Connection = struct {
         const msg = try std.fmt.allocPrint(self.allocator, "{d}:{s}", .{ payload.len, payload });
         defer self.allocator.free(msg);
 
-        try streamWriteAll(s, msg);
+        try streamWriteAll(self.io, s, msg);
 
         // Read response
         const resp_data = try self.readLengthPrefixed();
@@ -673,7 +667,7 @@ pub const Connection = struct {
         var length: usize = 0;
         var buf: [1]u8 = undefined;
         while (true) {
-            const n = try streamRead(s, &buf);
+            const n = try streamRead(self.io, s, &buf);
             if (n == 0) return error.ConnectionClosed;
             const ch = buf[0];
             if (ch == ':') break;
@@ -692,7 +686,7 @@ pub const Connection = struct {
 
         var total: usize = 0;
         while (total < length) {
-            const n = try streamRead(s, payload[total..]);
+            const n = try streamRead(self.io, s, payload[total..]);
             if (n == 0) return error.ConnectionClosed;
             total += n;
         }

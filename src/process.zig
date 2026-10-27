@@ -9,10 +9,12 @@ const mem = std.mem;
 const posix = std.posix;
 const builtin = @import("builtin");
 const browser_mod = @import("browser.zig");
+const os = @import("os.zig");
+const os_windows = @import("os_windows.zig");
 
 /// A discovered Chrome process with its CDP port and profile info.
 pub const DiscoveredProcess = struct {
-    pid: posix.pid_t,
+    pid: os.Pid,
     /// CDP debugging port (Chrome) or Marionette port (Firefox).
     port: u16,
     /// Profile name (basename of profile/user-data-dir path).
@@ -29,6 +31,7 @@ pub const DiscoveredProcess = struct {
 pub fn findChromeBrowsers(allocator: mem.Allocator, io: std.Io) ![]DiscoveredProcess {
     switch (comptime builtin.os.tag) {
         .macos, .linux => return findBrowsersScan(allocator, io),
+        .windows => return os_windows.findBrowsers(allocator, io),
         else => return &[_]DiscoveredProcess{},
     }
 }
@@ -119,7 +122,7 @@ fn findBrowsersScan(allocator: mem.Allocator, io: std.Io) ![]DiscoveredProcess {
                 errdefer allocator.free(udd_owned);
                 const profile = std.fs.path.basename(udd_owned);
                 try results.append(allocator, .{
-                    .pid = pid,
+                    .pid = @intCast(pid),
                     .port = p,
                     .profile = profile,
                     .user_data_dir = udd_owned,
@@ -139,7 +142,7 @@ fn findBrowsersScan(allocator: mem.Allocator, io: std.Io) ![]DiscoveredProcess {
                 const m_port = readMarionettePort(allocator, io, pdir_owned) catch null;
                 if (m_port) |port| {
                     try results.append(allocator, .{
-                        .pid = pid,
+                        .pid = @intCast(pid),
                         .port = port,
                         .profile = profile,
                         .user_data_dir = pdir_owned,
