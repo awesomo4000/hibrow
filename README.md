@@ -95,7 +95,10 @@ A background **gateway** owns the browser connections and auto-starts on first u
 
 ## Requirements
 
-- macOS (process discovery uses `proc_listpids` / `sysctl`)
+- macOS, Linux, or Windows. Browsers are found per platform (macOS app
+  bundles, Linux `PATH`, Windows App Paths registry) and discovered by scanning
+  process command lines (`sysctl` on macOS, `/proc` on Linux, the process PEB on
+  Windows); the gateway talks to the CLI over a Unix-domain socket on all three.
 - Chrome/Chromium and/or Firefox installed
 - Zig 0.17.0 exactly (to build; the output binary is standalone)
 
