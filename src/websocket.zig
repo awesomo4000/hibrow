@@ -559,7 +559,8 @@ test "encodeFrame short masked text" {
 test "encodeFrame medium payload uses 2-byte extended length" {
     var buf: [70000]u8 = undefined;
     // 200 bytes of payload (>= 126, < 65536)
-    const payload = &[_]u8{'x'} ** 200;
+    const payload_buf: [200]u8 = @splat('x');
+    const payload = &payload_buf;
     const frame_bytes = try encodeFrame(&buf, .text, payload, false);
 
     try std.testing.expectEqual(@as(u8, 0x81), frame_bytes[0]);

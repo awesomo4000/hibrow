@@ -2,11 +2,11 @@
 # Pins the toolchain and provides build/test tasks.
 
 [tools]
-zig = "0.16.0"
+zig = "0.17.0"
 
 # NOTE: the macOS SDK workaround (DEVELOPER_DIR=/dev/null) is applied per-build-
 # task below, NOT in a project-wide [env]. Newer Command Line Tools SDKs
-# (26.x/27.x) ship `.tbd` files the Zig 0.16 linker cannot parse, so `zig build`
+# (26.x/27.x) ship `.tbd` files the Zig linker cannot parse, so `zig build`
 # fails to link libSystem with `undefined symbol: __availability_version_check`.
 # Pointing DEVELOPER_DIR at a non-directory makes Zig fall back to its bundled
 # libSystem stub. But that same variable breaks any tool that calls `xcrun`
