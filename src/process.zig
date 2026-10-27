@@ -221,11 +221,34 @@ fn getProcArgsLinux(allocator: mem.Allocator, io: std.Io, pid: posix.pid_t) !Pro
     const buf = try acc.toOwnedSlice(allocator);
     errdefer allocator.free(buf);
     if (buf.len == 0) return error.EmptyProcArgs;
+    const argv = try splitCmdline(allocator, buf);
+    return .{ .raw_buf = buf, .argv = argv };
+}
+
+/// Split a raw /proc/PID/cmdline buffer into argv entries (slices into `buf`).
+///
+/// /proc/PID/cmdline is normally NUL-separated, one entry per argv element.
+/// Chrome is the exception: it rewrites its own argv in place to set process
+/// titles, which collapses the whole command line into a single space-joined
+/// string with no interior NULs. We split on NUL first (which preserves values
+/// that legitimately contain spaces); if a resulting token is itself a mashed
+/// "prog --flag --flag" blob, we re-split it on spaces so the flags we match on
+/// are still recovered. A value containing a space cannot survive Chrome's
+/// rewrite — that information is already gone before we read it.
+fn splitCmdline(allocator: mem.Allocator, buf: []const u8) ![][]const u8 {
     var argv_list: std.ArrayList([]const u8) = .empty;
     defer argv_list.deinit(allocator);
     var it = mem.splitScalar(u8, mem.trimEnd(u8, buf, "\x00"), 0);
-    while (it.next()) |a| if (a.len > 0) try argv_list.append(allocator, a);
-    return .{ .raw_buf = buf, .argv = try argv_list.toOwnedSlice(allocator) };
+    while (it.next()) |tok| {
+        if (tok.len == 0) continue;
+        if (mem.indexOf(u8, tok, " --") != null) {
+            var sp = mem.splitScalar(u8, tok, ' ');
+            while (sp.next()) |a| if (a.len > 0) try argv_list.append(allocator, a);
+        } else {
+            try argv_list.append(allocator, tok);
+        }
+    }
+    return argv_list.toOwnedSlice(allocator);
 }
 
 fn listAllPidsMacOS(allocator: mem.Allocator) ![]posix.pid_t {
@@ -375,6 +398,40 @@ test "getProcArgs reads own process args" {
     defer allocator.free(parsed.argv);
     // Our own process should have at least one arg (the executable path)
     try std.testing.expect(parsed.argv.len > 0);
+}
+
+test "splitCmdline: canonical NUL-separated argv" {
+    const allocator = std.testing.allocator;
+    const buf = "/usr/bin/firefox\x00--marionette\x00--profile\x00/home/u/.hibrow/profiles/work\x00";
+    const argv = try splitCmdline(allocator, buf);
+    defer allocator.free(argv);
+    try std.testing.expectEqual(@as(usize, 4), argv.len);
+    try std.testing.expectEqualStrings("--marionette", argv[1]);
+    try std.testing.expectEqualStrings("--profile", argv[2]);
+    try std.testing.expectEqualStrings("/home/u/.hibrow/profiles/work", argv[3]);
+}
+
+test "splitCmdline: Chrome space-mashed cmdline (no interior NULs)" {
+    const allocator = std.testing.allocator;
+    // Chrome rewrites argv into one space-joined blob with a single trailing NUL.
+    const buf = "/opt/google/chrome/chrome --remote-debugging-port=9322 --user-data-dir=/home/u/.hibrow/profiles/work --headless=new\x00";
+    const argv = try splitCmdline(allocator, buf);
+    defer allocator.free(argv);
+    try std.testing.expectEqual(@as(usize, 4), argv.len);
+    try std.testing.expectEqualStrings("--remote-debugging-port=9322", argv[1]);
+    try std.testing.expectEqualStrings("--user-data-dir=/home/u/.hibrow/profiles/work", argv[2]);
+    try std.testing.expectEqualStrings("--headless=new", argv[3]);
+}
+
+test "splitCmdline: NUL-separated value may contain a space" {
+    const allocator = std.testing.allocator;
+    // A single NUL-delimited arg whose value has a space must stay intact; it
+    // has no " --" blob marker, so it is not re-split.
+    const buf = "prog\x00--user-data-dir=/home/u/my profile\x00";
+    const argv = try splitCmdline(allocator, buf);
+    defer allocator.free(argv);
+    try std.testing.expectEqual(@as(usize, 2), argv.len);
+    try std.testing.expectEqualStrings("--user-data-dir=/home/u/my profile", argv[1]);
 }
 
 test "freeDiscovered handles empty slice" {
