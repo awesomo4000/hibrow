@@ -4,24 +4,28 @@
 [tools]
 zig = "0.16.0"
 
-[env]
-# Newer macOS Command Line Tools SDKs (26.x/27.x) ship `.tbd` files the Zig
-# 0.16 linker cannot parse, so `zig build` fails to link libSystem with
-# `undefined symbol: __availability_version_check`. Disabling SDK detection
-# makes Zig fall back to its bundled libSystem stub. Safe for this Zig-only
-# project; remove it if you add tooling that needs xcrun/the macOS SDK.
-DEVELOPER_DIR = "/dev/null"
+# NOTE: the macOS SDK workaround (DEVELOPER_DIR=/dev/null) is applied per-build-
+# task below, NOT in a project-wide [env]. Newer Command Line Tools SDKs
+# (26.x/27.x) ship `.tbd` files the Zig 0.16 linker cannot parse, so `zig build`
+# fails to link libSystem with `undefined symbol: __availability_version_check`.
+# Pointing DEVELOPER_DIR at a non-directory makes Zig fall back to its bundled
+# libSystem stub. But that same variable breaks any tool that calls `xcrun`
+# (git, clang, etc.), so it must stay scoped to the Zig build commands only and
+# never leak into the shell for the whole project directory.
 
 [tasks.build]
 description = "Build hibrow (debug)"
+env = { DEVELOPER_DIR = "/dev/null" }
 run = "zig build"
 
 [tasks.release]
 description = "Build optimized (ReleaseFast)"
+env = { DEVELOPER_DIR = "/dev/null" }
 run = "zig build -Doptimize=ReleaseFast"
 
 [tasks.test]
 description = "Run the unit test suite"
+env = { DEVELOPER_DIR = "/dev/null" }
 run = "zig build test"
 
 [tasks.e2e]
@@ -30,4 +34,5 @@ run = "./tests/e2e-features.sh"
 
 [tasks.run]
 description = "Run the hibrow CLI (args after --, e.g. mise run run -- --help)"
+env = { DEVELOPER_DIR = "/dev/null" }
 run = "zig build run --"
