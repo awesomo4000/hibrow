@@ -178,26 +178,37 @@ pub fn encodeFrameAlloc(allocator: mem.Allocator, opcode: Opcode, payload: []con
     return frame_bytes;
 }
 
-/// Decode a WebSocket frame from a byte buffer.
-/// Returns the decoded frame and number of bytes consumed.
-/// The frame payload points into the input buffer.
-pub fn decodeFrame(data: []const u8) !DecodeResult {
+/// Upper bound on a single frame's payload. Full-page screenshots and `grab`
+/// chunks are the largest CDP messages; anything past this is a corrupt or
+/// hostile length field, not a real message.
+pub const max_payload_len: usize = 256 * 1024 * 1024;
+
+pub const DecodeError = error{ Incomplete, InvalidOpcode, FrameTooLarge };
+
+const Header = struct {
+    fin: bool,
+    opcode: Opcode,
+    masked: bool,
+    mask_key: [4]u8,
+    payload_start: usize,
+    payload_len: usize,
+};
+
+/// Parse and validate a frame header. Returns error.Incomplete until the whole
+/// frame (header + payload) is present in `data`.
+fn parseHeader(data: []const u8) DecodeError!Header {
     if (data.len < 2) return error.Incomplete;
 
-    var pos: usize = 0;
-
-    // Byte 0: FIN + opcode
     const fin = (data[0] & 0x80) != 0;
-    const opcode_raw = data[0] & 0x0F;
-    const opcode: Opcode = @enumFromInt(opcode_raw);
-    pos += 1;
+    // Reserved opcodes (0x3-0x7, 0xB-0xF) must fail the connection (RFC 6455
+    // §5.2); @enumFromInt on them is a safety panic in Debug/ReleaseSafe.
+    const opcode = std.enums.fromInt(Opcode, @as(u4, @truncate(data[0]))) orelse
+        return error.InvalidOpcode;
 
-    // Byte 1: mask + length
     const masked = (data[1] & 0x80) != 0;
-    const len7: u7 = @intCast(data[1] & 0x7F);
-    pos += 1;
+    const len7: u7 = @truncate(data[1]);
+    var pos: usize = 2;
 
-    // Extended length
     var payload_len: usize = undefined;
     if (len7 < 126) {
         payload_len = len7;
@@ -205,91 +216,69 @@ pub fn decodeFrame(data: []const u8) !DecodeResult {
         if (data.len < pos + 2) return error.Incomplete;
         payload_len = mem.readInt(u16, data[pos..][0..2], .big);
         pos += 2;
-    } else { // 127
+    } else {
         if (data.len < pos + 8) return error.Incomplete;
-        payload_len = @intCast(mem.readInt(u64, data[pos..][0..8], .big));
+        const len64 = mem.readInt(u64, data[pos..][0..8], .big);
+        if (len64 > max_payload_len) return error.FrameTooLarge;
+        payload_len = @intCast(len64);
         pos += 8;
     }
 
-    // Masking key
-    var mask_key: [4]u8 = undefined;
+    var mask_key: [4]u8 = .{ 0, 0, 0, 0 };
     if (masked) {
         if (data.len < pos + 4) return error.Incomplete;
         @memcpy(&mask_key, data[pos .. pos + 4]);
         pos += 4;
     }
 
-    // Payload
-    if (data.len < pos + payload_len) return error.Incomplete;
-    const payload_start = pos;
-    pos += payload_len;
+    if (data.len - pos < payload_len) return error.Incomplete;
 
-    // If masked, we need a mutable copy to unmask
-    // Note: for decoding we return the raw slice — caller must unmask if needed
+    return .{
+        .fin = fin,
+        .opcode = opcode,
+        .masked = masked,
+        .mask_key = mask_key,
+        .payload_start = pos,
+        .payload_len = payload_len,
+    };
+}
+
+/// Decode a WebSocket frame from a byte buffer.
+/// Returns the decoded frame and number of bytes consumed.
+/// The frame payload points into the input buffer (still masked, if it was).
+pub fn decodeFrame(data: []const u8) DecodeError!DecodeResult {
+    const h = try parseHeader(data);
     return .{
         .frame = .{
-            .fin = fin,
-            .opcode = opcode,
-            .payload = data[payload_start .. payload_start + payload_len],
+            .fin = h.fin,
+            .opcode = h.opcode,
+            .payload = data[h.payload_start .. h.payload_start + h.payload_len],
         },
-        .bytes_consumed = pos,
+        .bytes_consumed = h.payload_start + h.payload_len,
     };
 }
 
 /// Decode a frame, unmasking the payload into an allocated buffer if needed.
 /// Caller owns the returned payload memory.
 pub fn decodeFrameAlloc(allocator: mem.Allocator, data: []const u8) !struct { frame: Frame, bytes_consumed: usize, owned_payload: ?[]u8 } {
-    if (data.len < 2) return error.Incomplete;
+    const h = try parseHeader(data);
+    const raw = data[h.payload_start .. h.payload_start + h.payload_len];
+    const consumed = h.payload_start + h.payload_len;
 
-    var pos: usize = 0;
-    const fin = (data[0] & 0x80) != 0;
-    const opcode: Opcode = @enumFromInt(data[0] & 0x0F);
-    pos += 1;
-
-    const masked = (data[1] & 0x80) != 0;
-    const len7: u7 = @intCast(data[1] & 0x7F);
-    pos += 1;
-
-    var payload_len: usize = undefined;
-    if (len7 < 126) {
-        payload_len = len7;
-    } else if (len7 == 126) {
-        if (data.len < pos + 2) return error.Incomplete;
-        payload_len = mem.readInt(u16, data[pos..][0..2], .big);
-        pos += 2;
-    } else {
-        if (data.len < pos + 8) return error.Incomplete;
-        payload_len = @intCast(mem.readInt(u64, data[pos..][0..8], .big));
-        pos += 8;
-    }
-
-    var mask_key: [4]u8 = undefined;
-    if (masked) {
-        if (data.len < pos + 4) return error.Incomplete;
-        @memcpy(&mask_key, data[pos .. pos + 4]);
-        pos += 4;
-    }
-
-    if (data.len < pos + payload_len) return error.Incomplete;
-
-    if (masked) {
-        const payload = try allocator.alloc(u8, payload_len);
-        @memcpy(payload, data[pos .. pos + payload_len]);
-        applyMask(payload, mask_key);
-        pos += payload_len;
+    if (h.masked) {
+        const payload = try allocator.dupe(u8, raw);
+        applyMask(payload, h.mask_key);
         return .{
-            .frame = .{ .fin = fin, .opcode = opcode, .payload = payload },
-            .bytes_consumed = pos,
+            .frame = .{ .fin = h.fin, .opcode = h.opcode, .payload = payload },
+            .bytes_consumed = consumed,
             .owned_payload = payload,
         };
-    } else {
-        pos += payload_len;
-        return .{
-            .frame = .{ .fin = fin, .opcode = opcode, .payload = data[pos - payload_len .. pos] },
-            .bytes_consumed = pos,
-            .owned_payload = null,
-        };
     }
+    return .{
+        .frame = .{ .fin = h.fin, .opcode = h.opcode, .payload = raw },
+        .bytes_consumed = consumed,
+        .owned_payload = null,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +291,10 @@ pub const WebSocket = struct {
     io: std.Io,
     stream: ?Stream = null,
     connected: bool = false,
+    /// Bytes read from the socket but not yet consumed as a frame. Persisting
+    /// this across readFrame calls is what keeps coalesced frames (an event
+    /// and a response in one TCP segment) from being dropped.
+    rbuf: std.ArrayList(u8) = .empty,
 
     pub fn init(allocator: mem.Allocator, io: std.Io) WebSocket {
         return .{ .allocator = allocator, .io = io };
@@ -309,6 +302,7 @@ pub const WebSocket = struct {
 
     pub fn deinit(self: *WebSocket) void {
         self.close();
+        self.rbuf.deinit(self.allocator);
     }
 
     /// Perform HTTP upgrade handshake and establish WebSocket connection.
@@ -374,44 +368,33 @@ pub const WebSocket = struct {
     }
 
     /// Read the next frame from the connection.
-    /// Caller must free the returned payload if owned_payload is non-null.
+    /// The returned payload is always heap-owned: caller frees owned_payload.
     pub fn readFrame(self: *WebSocket) !ReadResult {
         const stream = self.stream orelse return error.NotConnected;
 
-        // Read into a dynamic buffer that grows as needed (no fixed size limit).
-        // Previous fixed 64KB buffer silently truncated large CDP responses.
-        var buf: std.ArrayList(u8) = .empty;
-        errdefer buf.deinit(self.allocator);
-
-        var read_buf: [8192]u8 = undefined;
         while (true) {
-            const n = try streamRead(stream, &read_buf);
-            if (n == 0) {
-                buf.deinit(self.allocator);
-                return error.ConnectionClosed;
-            }
-            try buf.appendSlice(self.allocator, read_buf[0..n]);
-
-            // Try to decode
-            const result = decodeFrameAlloc(self.allocator, buf.items) catch |err| {
-                if (err == error.Incomplete) continue;
-                return err;
-            };
-
-            if (result.owned_payload != null) {
-                // Masked frame: payload was copied into owned_payload, safe to free buf
-                buf.deinit(self.allocator);
-                return .{ .frame = result.frame, .owned_payload = result.owned_payload };
-            } else {
-                // Unmasked frame: payload points into buf.items. We must keep that
-                // memory alive, so hand ownership to the caller via owned_payload.
-                const payload_copy = try self.allocator.dupe(u8, result.frame.payload);
-                buf.deinit(self.allocator);
+            // Frame may already be buffered from a previous read.
+            if (parseHeader(self.rbuf.items)) |h| {
+                const end = h.payload_start + h.payload_len;
+                const payload = try self.allocator.dupe(u8, self.rbuf.items[h.payload_start..end]);
+                if (h.masked) applyMask(payload, h.mask_key);
+                // Drop the consumed frame, keep any trailing bytes for next call.
+                const rest = self.rbuf.items.len - end;
+                mem.copyForwards(u8, self.rbuf.items[0..rest], self.rbuf.items[end..]);
+                self.rbuf.shrinkRetainingCapacity(rest);
                 return .{
-                    .frame = .{ .fin = result.frame.fin, .opcode = result.frame.opcode, .payload = payload_copy },
-                    .owned_payload = payload_copy,
+                    .frame = .{ .fin = h.fin, .opcode = h.opcode, .payload = payload },
+                    .owned_payload = payload,
                 };
+            } else |err| switch (err) {
+                error.Incomplete => {},
+                else => return err,
             }
+
+            var read_buf: [8192]u8 = undefined;
+            const n = try streamRead(stream, &read_buf);
+            if (n == 0) return error.ConnectionClosed;
+            try self.rbuf.appendSlice(self.allocator, read_buf[0..n]);
         }
     }
 
@@ -457,6 +440,7 @@ pub const WebSocket = struct {
             self.stream = null;
         }
         self.connected = false;
+        self.rbuf.clearRetainingCapacity();
     }
 
     // Internal helper: encode and send a frame with masking.
@@ -667,4 +651,96 @@ test "encodeFrame close frame" {
     try std.testing.expectEqual(@as(u8, 0x80), frame_bytes[1]); // masked, len 0
     // 4 bytes mask key, no payload
     try std.testing.expectEqual(@as(usize, 6), frame_bytes.len);
+}
+
+// --- readFrame over a real socket: peer close, coalescing, hostile headers ---
+
+const test_c = struct {
+    extern "c" fn socketpair(domain: c_int, sock_type: c_int, protocol: c_int, sv: *[2]c_int) c_int;
+    extern "c" fn close(fd: c_int) c_int;
+    extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
+};
+
+const TestPair = struct {
+    threaded: std.Io.Threaded,
+    sock: WebSocket,
+    fd: c_int,
+
+    /// Peer writes `bytes` then hangs up; returns the client side.
+    fn init(self: *TestPair, bytes: []const u8) !void {
+        const gpa = std.testing.allocator;
+        self.threaded = .init(gpa, .{});
+        var sv: [2]c_int = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), test_c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sv));
+        if (bytes.len > 0) _ = test_c.write(sv[1], bytes.ptr, bytes.len);
+        _ = test_c.close(sv[1]);
+        self.fd = sv[0];
+        self.sock = WebSocket.init(gpa, self.threaded.io());
+        self.sock.stream = .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .loopback(0) } } };
+        self.sock.connected = true;
+    }
+
+    fn deinit(self: *TestPair) void {
+        self.sock.stream = null;
+        self.sock.deinit();
+        _ = test_c.close(self.fd);
+        self.threaded.deinit();
+    }
+};
+
+fn testEofAfter(prefix: []const u8) !void {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    var sv: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), test_c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sv));
+    defer _ = test_c.close(sv[0]);
+
+    if (prefix.len > 0) _ = test_c.write(sv[1], prefix.ptr, prefix.len);
+    _ = test_c.close(sv[1]); // peer goes away: Chrome closed the tab / quit
+
+    var sock = WebSocket.init(gpa, threaded.io());
+    sock.stream = .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .loopback(0) } } };
+    sock.connected = true;
+
+    try std.testing.expectError(error.ConnectionClosed, sock.readFrame());
+    sock.stream = null; // fd closed by defer above
+    sock.deinit();
+}
+
+test "peer closes before any frame bytes (idle cached CDP connection)" {
+    try testEofAfter("");
+}
+
+test "peer closes mid-frame (large base64 response cut off)" {
+    // 0x81 = FIN|text, 0x7f = 64-bit length follows; claim 1 MiB, send 4 bytes.
+    try testEofAfter(&[_]u8{ 0x81, 0x7f, 0, 0, 0, 0, 0, 0x10, 0, 0, 'A', 'A', 'A', 'A' });
+}
+
+test "two frames delivered in one read: second must not be dropped" {
+    // Chrome routinely coalesces an event + a response into one TCP segment.
+    var p: TestPair = undefined;
+    try p.init(&[_]u8{ 0x81, 3, 'o', 'n', 'e', 0x81, 3, 't', 'w', 'o' });
+    defer p.deinit();
+    const a = try p.sock.readFrame();
+    defer if (a.owned_payload) |b| std.testing.allocator.free(b);
+    try std.testing.expectEqualStrings("one", a.frame.payload);
+    const b = try p.sock.readFrame();
+    defer if (b.owned_payload) |x| std.testing.allocator.free(x);
+    try std.testing.expectEqualStrings("two", b.frame.payload);
+}
+
+test "reserved opcode is an error, not a safety panic" {
+    var p: TestPair = undefined;
+    try p.init(&[_]u8{ 0x83, 0 });
+    defer p.deinit();
+    try std.testing.expectError(error.InvalidOpcode, p.sock.readFrame());
+}
+
+test "64-bit length near maxInt is an error, not an overflow panic" {
+    var p: TestPair = undefined;
+    try p.init(&[_]u8{ 0x81, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0 });
+    defer p.deinit();
+    try std.testing.expectError(error.FrameTooLarge, p.sock.readFrame());
 }

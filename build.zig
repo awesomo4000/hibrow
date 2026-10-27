@@ -9,6 +9,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
 
     // CLI executable
@@ -16,6 +17,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     exe_mod.addImport("hibrow", hibrow_mod);
 
@@ -56,6 +58,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path(src),
             .target = target,
             .optimize = optimize,
+        .link_libc = true,
         });
         const unit_test = b.addTest(.{
             .root_module = test_mod,
@@ -69,6 +72,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     main_test_mod.addImport("hibrow", hibrow_mod);
     const main_test = b.addTest(.{
