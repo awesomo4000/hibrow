@@ -160,7 +160,7 @@ fn findBrowsersScan(allocator: mem.Allocator, io: std.Io) ![]DiscoveredProcess {
 
 /// Read the marionette.port value from a Firefox profile's user.js.
 /// Parses the line: user_pref("marionette.port", NNNN);
-fn readMarionettePort(allocator: mem.Allocator, io: std.Io, profile_dir: []const u8) !?u16 {
+pub fn readMarionettePort(allocator: mem.Allocator, io: std.Io, profile_dir: []const u8) !?u16 {
     const prefs_path = try std.fmt.allocPrint(allocator, "{s}/user.js", .{profile_dir});
     defer allocator.free(prefs_path);
 
