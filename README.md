@@ -48,6 +48,13 @@ cp ./zig-out/bin/hibrow ~/.local/bin/
 full command surface against real Chrome **and** Firefox (headless) using local
 fixtures — pass `chrome` or `firefox` to run just one.
 
+> **Windows testing note:** the e2e script is bash, so run it under Git Bash
+> (shipped with Git for Windows). To drive it with `mise run e2e`, point mise's
+> Windows task shell at Git Bash once:
+> `mise settings set windows_default_inline_shell_args "C:/PROGRA~1/Git/bin/bash.exe -c"`
+> (the `PROGRA~1` short name avoids the space in `Program Files`, which the
+> setting would otherwise split on).
+
 ## Commands
 
 The gateway daemon auto-starts on the first command — you don't manage it.
