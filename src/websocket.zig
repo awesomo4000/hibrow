@@ -7,27 +7,22 @@
 ///! Frame encode/decode are pure functions (no I/O) for easy testing.
 ///! The WebSocket struct wraps them with stream I/O for real connections.
 const std = @import("std");
+const builtin = @import("builtin");
 const mem = std.mem;
-const posix = std.posix;
 const crypto = std.crypto;
+const os = @import("os.zig");
 
-/// The 0.16 network stream type.
+/// The network stream type.
 const Stream = std.Io.net.Stream;
 
-/// Raw blocking read from the stream's socket fd (fds from the Io backend are
-/// blocking, so raw posix I/O matches the pre-0.16 Stream.read semantics).
-fn streamRead(stream: Stream, buf: []u8) !usize {
-    return posix.read(stream.socket.handle, buf);
+/// Blocking read from the stream's socket (see os.sockRead).
+fn streamRead(io: std.Io, stream: Stream, buf: []u8) !usize {
+    return os.sockRead(io, stream, buf);
 }
 
-/// Write all bytes to the stream's socket fd, looping over partial writes.
-fn streamWriteAll(stream: Stream, bytes: []const u8) !void {
-    var i: usize = 0;
-    while (i < bytes.len) {
-        const rc = std.c.write(stream.socket.handle, bytes[i..].ptr, bytes.len - i);
-        if (rc <= 0) return error.WriteFailed;
-        i += @intCast(rc);
-    }
+/// Write all bytes to the stream's socket (see os.sockWriteAll).
+fn streamWriteAll(io: std.Io, stream: Stream, bytes: []const u8) !void {
+    return os.sockWriteAll(io, stream, bytes);
 }
 
 /// Resolve a host + port and open a blocking TCP stream. Handles the local
@@ -81,7 +76,7 @@ const ws_magic_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 /// Generate a random 4-byte masking key.
 pub fn generateMaskingKey() [4]u8 {
     var key: [4]u8 = undefined;
-    std.c.arc4random_buf(&key, key.len);
+    os.randomBytes(&key);
     return key;
 }
 
@@ -112,7 +107,7 @@ pub fn computeAcceptKey(client_key: []const u8) [28]u8 {
 /// Used as Sec-WebSocket-Key in the upgrade handshake.
 pub fn generateClientKey() [24]u8 {
     var nonce: [16]u8 = undefined;
-    std.c.arc4random_buf(&nonce, nonce.len);
+    os.randomBytes(&nonce);
     var result: [24]u8 = undefined;
     _ = std.base64.standard.Encoder.encode(&result, &nonce);
     return result;
@@ -332,13 +327,13 @@ pub const WebSocket = struct {
                 "\r\n",
             .{ path, host, port, &client_key },
         );
-        try streamWriteAll(stream, request);
+        try streamWriteAll(self.io, stream, request);
 
         // Read HTTP response headers
         var resp_buf: [4096]u8 = undefined;
         var resp_len: usize = 0;
         while (resp_len < resp_buf.len) {
-            const n = try streamRead(stream, resp_buf[resp_len..]);
+            const n = try streamRead(self.io, stream, resp_buf[resp_len..]);
             if (n == 0) return error.ConnectionClosed;
             resp_len += n;
             // Check for end of headers
@@ -393,7 +388,7 @@ pub const WebSocket = struct {
             }
 
             var read_buf: [8192]u8 = undefined;
-            const n = try streamRead(stream, &read_buf);
+            const n = try streamRead(self.io, stream, &read_buf);
             if (n == 0) return error.ConnectionClosed;
             try self.rbuf.appendSlice(self.allocator, read_buf[0..n]);
         }
@@ -434,7 +429,7 @@ pub const WebSocket = struct {
                 var close_buf: [14]u8 = undefined; // 2 header + 4 mask + up to 8 payload
                 const close_frame = encodeFrame(&close_buf, .close, &.{}, true) catch null;
                 if (close_frame) |frame| {
-                    streamWriteAll(stream, frame) catch {};
+                    streamWriteAll(self.io, stream, frame) catch {};
                 }
             }
             stream.close(self.io);
@@ -455,7 +450,7 @@ pub const WebSocket = struct {
         defer self.allocator.free(buf);
 
         const frame_bytes = try encodeFrame(buf, opcode, payload, true);
-        try streamWriteAll(stream, frame_bytes);
+        try streamWriteAll(self.io, stream, frame_bytes);
     }
 };
 
@@ -711,38 +706,50 @@ fn testEofAfter(prefix: []const u8) !void {
     sock.deinit();
 }
 
+// The following tests drive readFrame over a real socketpair, which is
+// POSIX-only (Windows has no AF_UNIX socketpair with raw fds); the comptime
+// guard prunes them — and the TestPair/testEofAfter helpers they reference — on
+// Windows, where readFrame is covered by the e2e suite instead.
+
 test "peer closes before any frame bytes (idle cached CDP connection)" {
-    try testEofAfter("");
+    if (builtin.os.tag != .windows) try testEofAfter("");
 }
 
 test "peer closes mid-frame (large base64 response cut off)" {
     // 0x81 = FIN|text, 0x7f = 64-bit length follows; claim 1 MiB, send 4 bytes.
-    try testEofAfter(&[_]u8{ 0x81, 0x7f, 0, 0, 0, 0, 0, 0x10, 0, 0, 'A', 'A', 'A', 'A' });
+    if (builtin.os.tag != .windows)
+        try testEofAfter(&[_]u8{ 0x81, 0x7f, 0, 0, 0, 0, 0, 0x10, 0, 0, 'A', 'A', 'A', 'A' });
 }
 
 test "two frames delivered in one read: second must not be dropped" {
-    // Chrome routinely coalesces an event + a response into one TCP segment.
-    var p: TestPair = undefined;
-    try p.init(&[_]u8{ 0x81, 3, 'o', 'n', 'e', 0x81, 3, 't', 'w', 'o' });
-    defer p.deinit();
-    const a = try p.sock.readFrame();
-    defer if (a.owned_payload) |b| std.testing.allocator.free(b);
-    try std.testing.expectEqualStrings("one", a.frame.payload);
-    const b = try p.sock.readFrame();
-    defer if (b.owned_payload) |x| std.testing.allocator.free(x);
-    try std.testing.expectEqualStrings("two", b.frame.payload);
+    if (builtin.os.tag != .windows) {
+        // Chrome routinely coalesces an event + a response into one TCP segment.
+        var p: TestPair = undefined;
+        try p.init(&[_]u8{ 0x81, 3, 'o', 'n', 'e', 0x81, 3, 't', 'w', 'o' });
+        defer p.deinit();
+        const a = try p.sock.readFrame();
+        defer if (a.owned_payload) |b| std.testing.allocator.free(b);
+        try std.testing.expectEqualStrings("one", a.frame.payload);
+        const b = try p.sock.readFrame();
+        defer if (b.owned_payload) |x| std.testing.allocator.free(x);
+        try std.testing.expectEqualStrings("two", b.frame.payload);
+    }
 }
 
 test "reserved opcode is an error, not a safety panic" {
-    var p: TestPair = undefined;
-    try p.init(&[_]u8{ 0x83, 0 });
-    defer p.deinit();
-    try std.testing.expectError(error.InvalidOpcode, p.sock.readFrame());
+    if (builtin.os.tag != .windows) {
+        var p: TestPair = undefined;
+        try p.init(&[_]u8{ 0x83, 0 });
+        defer p.deinit();
+        try std.testing.expectError(error.InvalidOpcode, p.sock.readFrame());
+    }
 }
 
 test "64-bit length near maxInt is an error, not an overflow panic" {
-    var p: TestPair = undefined;
-    try p.init(&[_]u8{ 0x81, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0 });
-    defer p.deinit();
-    try std.testing.expectError(error.FrameTooLarge, p.sock.readFrame());
+    if (builtin.os.tag != .windows) {
+        var p: TestPair = undefined;
+        try p.init(&[_]u8{ 0x81, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0 });
+        defer p.deinit();
+        try std.testing.expectError(error.FrameTooLarge, p.sock.readFrame());
+    }
 }

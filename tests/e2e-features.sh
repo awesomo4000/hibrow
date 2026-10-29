@@ -10,9 +10,18 @@
 set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 HIBROW="$REPO/zig-out/bin/hibrow"
-FRAMES="file://$REPO/evals/skill/frames/top.html"
-SHADOW="file://$REPO/evals/skill/frames/shadow.html"
-MEDIA="file://$REPO/evals/skill/frames/media.html"
+[ -x "$HIBROW" ] || HIBROW="$HIBROW.exe"   # Windows build produces hibrow.exe
+
+# Browsers need a real file: URL. Under Git Bash the repo path is /c/..., which
+# no Windows browser resolves; cygpath -m rewrites it to C:/... form. Elsewhere
+# the repo path is already absolute and usable as-is.
+fileurl() {
+    if command -v cygpath >/dev/null 2>&1; then printf 'file:///%s' "$(cygpath -m "$REPO/$1")"
+    else printf 'file://%s' "$REPO/$1"; fi
+}
+FRAMES="$(fileurl evals/skill/frames/top.html)"
+SHADOW="$(fileurl evals/skill/frames/shadow.html)"
+MEDIA="$(fileurl evals/skill/frames/media.html)"
 PASS=0; FAIL=0
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
@@ -29,16 +38,21 @@ is_png()   { if [ -f "$2" ] && file "$2" | grep -q "PNG image"; then ok "$1"; el
 [ -x "$HIBROW" ] || { echo "$(r ERROR): build first (zig build) — $HIBROW missing"; exit 1; }
 
 # Browser detection is cross-platform: macOS keeps browsers in /Applications,
-# Linux puts them on PATH under various names. hibrow itself finds them the same
-# way (app bundle on macOS, PATH search on Linux), so we just gate whether to run.
+# Linux puts them on PATH under various names, Windows installs them under
+# Program Files. hibrow itself finds them the same way per platform, so here we
+# just gate whether to run.
 on_path() { for n in "$@"; do command -v "$n" >/dev/null 2>&1 && return 0; done; return 1; }
 have_chrome() {
     [ -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ] ||
     [ -x "/Applications/Chromium.app/Contents/MacOS/Chromium" ] ||
+    [ -x "/c/Program Files/Google/Chrome/Application/chrome.exe" ] ||
+    [ -x "/c/Program Files (x86)/Google/Chrome/Application/chrome.exe" ] ||
     on_path google-chrome google-chrome-stable chromium chromium-browser
 }
 have_firefox() {
     [ -x "/Applications/Firefox.app/Contents/MacOS/firefox" ] ||
+    [ -x "/c/Program Files/Mozilla Firefox/firefox.exe" ] ||
+    [ -x "/c/Program Files (x86)/Mozilla Firefox/firefox.exe" ] ||
     on_path firefox
 }
 

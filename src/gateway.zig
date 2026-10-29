@@ -10,6 +10,7 @@
 ///!
 ///! Wire format: line-delimited JSON-RPC 2.0 (each message ends with '\n').
 const std = @import("std");
+const builtin = @import("builtin");
 const mem = std.mem;
 const posix = std.posix;
 const json = std.json;
@@ -17,9 +18,7 @@ const protocol = @import("protocol.zig");
 const browser_mod = @import("browser.zig");
 const cdp = @import("cdp.zig");
 const marionette_mod = @import("marionette.zig");
-
-/// Default socket directory pattern.
-const socket_dir_prefix = "/tmp/hibrow-";
+const os = @import("os.zig");
 
 /// Socket filename within the per-user directory.
 const socket_filename = "gateway.sock";
@@ -30,39 +29,29 @@ const pid_filename = "gateway.pid";
 /// Read buffer size for socket I/O.
 const read_buf_size = 8192;
 
-/// The 0.16 network stream type.
+/// The network stream type.
 const Stream = std.Io.net.Stream;
 
-/// Wrap an existing (blocking) socket fd as a Stream. The Io backend creates
-/// blocking sockets, so raw posix read/write on the fd is safe and matches the
-/// pre-0.16 `Stream.read/writeAll` semantics.
+/// Wrap an existing (blocking) socket fd as a Stream. Used only by the POSIX
+/// socketpair tests below.
 fn streamFromFd(fd: posix.fd_t) Stream {
     return .{ .socket = .{ .handle = fd, .address = .{ .ip4 = .loopback(0) } } };
 }
 
-/// Raw blocking read from the stream's socket fd.
-fn streamRead(stream: Stream, buf: []u8) !usize {
-    return posix.read(stream.socket.handle, buf);
+/// Blocking read from the stream's socket (see os.sockRead).
+fn streamRead(io: std.Io, stream: Stream, buf: []u8) !usize {
+    return os.sockRead(io, stream, buf);
 }
 
-/// Write all bytes to the stream's socket fd, looping over partial writes.
-fn streamWriteAll(stream: Stream, bytes: []const u8) !void {
-    var i: usize = 0;
-    while (i < bytes.len) {
-        const rc = std.c.write(stream.socket.handle, bytes[i..].ptr, bytes.len - i);
-        if (rc <= 0) return error.WriteFailed;
-        i += @intCast(rc);
-    }
+/// Write all bytes to the stream's socket (see os.sockWriteAll).
+fn streamWriteAll(io: std.Io, stream: Stream, bytes: []const u8) !void {
+    return os.sockWriteAll(io, stream, bytes);
 }
 
-/// Sleep for the given number of milliseconds. Zig 0.16 removed
-/// `std.Thread.sleep`; use libc `nanosleep` directly (macOS links libc).
+/// Sleep for the given number of milliseconds. Kept as a thin re-export so
+/// existing callers (and `hibrow.gateway.sleepMs`) keep working.
 pub fn sleepMs(ms: u64) void {
-    const ts: std.c.timespec = .{
-        .sec = @intCast(ms / 1000),
-        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
-    };
-    _ = std.c.nanosleep(&ts, null);
+    os.sleepMs(ms);
 }
 
 // ---------------------------------------------------------------------------
@@ -137,10 +126,10 @@ pub const Client = struct {
         defer self.allocator.free(req_bytes);
 
         // Send
-        try streamWriteAll(self.stream, req_bytes);
+        try streamWriteAll(self.io, self.stream, req_bytes);
 
         // Read response line
-        const line = try readLine(self.allocator, self.stream);
+        const line = try readLine(self.allocator, self.io, self.stream);
         errdefer self.allocator.free(line);
 
         // Parse the response
@@ -273,31 +262,31 @@ pub const Server = struct {
     fn handleConnection(self: *Server, stream: Stream) void {
         defer stream.close(self.io);
 
-        const line = readLine(self.allocator, stream) catch return;
+        const line = readLine(self.allocator, self.io, stream) catch return;
         defer self.allocator.free(line);
         if (line.len == 0) return;
 
         // Parse JSON
         var parsed = protocol.parseMessage(self.allocator, line) catch {
-            sendErrorResponse(self.allocator, stream, .null, .parse_error, "Parse error") catch {};
+            sendErrorResponse(self.allocator, self.io, stream, .null, .parse_error, "Parse error") catch {};
             return;
         };
         defer parsed.deinit();
 
         // Extract request
         const req = protocol.extractRequest(parsed.value()) catch {
-            sendErrorResponse(self.allocator, stream, .null, .invalid_request, "Invalid request") catch {};
+            sendErrorResponse(self.allocator, self.io, stream, .null, .invalid_request, "Invalid request") catch {};
             return;
         };
 
         // Dispatch to handler
         const response_bytes = self.dispatch(req) catch |err| {
-            sendErrorResponse(self.allocator, stream, req.id, .internal_error, @errorName(err)) catch {};
+            sendErrorResponse(self.allocator, self.io, stream, req.id, .internal_error, @errorName(err)) catch {};
             return;
         };
         defer self.allocator.free(response_bytes);
 
-        streamWriteAll(stream, response_bytes) catch {};
+        streamWriteAll(self.io, stream, response_bytes) catch {};
     }
 
     /// Dispatch a JSON-RPC request to the appropriate handler.
@@ -1127,20 +1116,21 @@ pub const Server = struct {
 
 /// Get the socket directory path for the current user.
 pub fn getSocketDir(allocator: mem.Allocator) ![]u8 {
-    const uid = std.c.getuid();
-    return std.fmt.allocPrint(allocator, "{s}{d}", .{ socket_dir_prefix, uid });
+    return os.runtimeDir(allocator);
 }
 
 /// Get the full socket path.
 pub fn getSocketPath(allocator: mem.Allocator) ![]u8 {
-    const uid = std.c.getuid();
-    return std.fmt.allocPrint(allocator, "{s}{d}/{s}", .{ socket_dir_prefix, uid, socket_filename });
+    const dir = try os.runtimeDir(allocator);
+    defer allocator.free(dir);
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, socket_filename });
 }
 
 /// Get the PID file path.
 pub fn getPidFilePath(allocator: mem.Allocator) ![]u8 {
-    const uid = std.c.getuid();
-    return std.fmt.allocPrint(allocator, "{s}{d}/{s}", .{ socket_dir_prefix, uid, pid_filename });
+    const dir = try os.runtimeDir(allocator);
+    defer allocator.free(dir);
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, pid_filename });
 }
 
 // ---------------------------------------------------------------------------
@@ -1162,7 +1152,7 @@ pub fn autoStartDaemon(io: std.Io) !void {
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
-        .pgid = 0,
+        .pgid = os.new_process_group,
     });
     _ = &child;
     // Don't wait — let the daemon run independently.
@@ -1180,13 +1170,13 @@ fn connectToSocket(io: std.Io, path: []const u8) !Stream {
 
 /// Read a newline-delimited line from a stream.
 /// Returns allocated slice (caller owns). Does not include the newline.
-fn readLine(allocator: mem.Allocator, stream: Stream) ![]u8 {
+fn readLine(allocator: mem.Allocator, io: std.Io, stream: Stream) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
 
     var read_buf: [read_buf_size]u8 = undefined;
     while (true) {
-        const n = try streamRead(stream, &read_buf);
+        const n = try streamRead(io, stream, &read_buf);
         if (n == 0) break; // EOF
 
         // Look for newline in what we just read
@@ -1204,6 +1194,7 @@ fn readLine(allocator: mem.Allocator, stream: Stream) ![]u8 {
 /// Send a JSON-RPC error response directly to a stream.
 fn sendErrorResponse(
     allocator: mem.Allocator,
+    io: std.Io,
     stream: Stream,
     id: json.Value,
     code: protocol.ErrorCode,
@@ -1212,7 +1203,7 @@ fn sendErrorResponse(
     const resp = protocol.makeErrorResponse(id, code, message);
     const bytes = try resp.encode(allocator);
     defer allocator.free(bytes);
-    try streamWriteAll(stream, bytes);
+    try streamWriteAll(io, stream, bytes);
 }
 
 /// Write a PID file into the socket directory.
@@ -1225,7 +1216,7 @@ fn writePidFile(allocator: mem.Allocator, io: std.Io, sock_dir: []const u8) !voi
 
     var buf: [64]u8 = undefined;
     var writer = file.writer(io, &buf);
-    try writer.interface.print("{d}\n", .{std.c.getpid()});
+    try writer.interface.print("{d}\n", .{os.getpid()});
     try writer.interface.flush();
 }
 
@@ -1314,14 +1305,17 @@ fn findPageTarget(targets: []const cdp.Target) ?[]const u8 {
 test "socket path constants are sensible" {
     try std.testing.expectEqualStrings("gateway.sock", socket_filename);
     try std.testing.expectEqualStrings("gateway.pid", pid_filename);
-    try std.testing.expectEqualStrings("/tmp/hibrow-", socket_dir_prefix);
 }
 
-test "getSocketDir contains uid" {
+test "getSocketDir is a per-user hibrow directory" {
     const allocator = std.testing.allocator;
     const dir = try getSocketDir(allocator);
     defer allocator.free(dir);
-    try std.testing.expect(mem.startsWith(u8, dir, "/tmp/hibrow-"));
+    if (builtin.os.tag == .windows) {
+        try std.testing.expect(mem.endsWith(u8, dir, "hibrow"));
+    } else {
+        try std.testing.expect(mem.startsWith(u8, dir, "/tmp/hibrow-"));
+    }
 }
 
 test "getSocketPath contains socket filename" {
@@ -1329,7 +1323,6 @@ test "getSocketPath contains socket filename" {
     const path = try getSocketPath(allocator);
     defer allocator.free(path);
     try std.testing.expect(mem.endsWith(u8, path, "/gateway.sock"));
-    try std.testing.expect(mem.startsWith(u8, path, "/tmp/hibrow-"));
 }
 
 test "getPidFilePath contains pid filename" {
@@ -1445,54 +1438,61 @@ test "Server evictConnection on empty cache is safe" {
 }
 
 test "readLine reads up to newline" {
-    // Use a socket pair (Stream methods require socket fds on some platforms)
-    var fds: [2]posix.fd_t = undefined;
-    const rc = std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
-    if (rc != 0) return error.SocketPairFailed;
+    // POSIX-only: uses socketpair + raw fds. Windows exercises readLine over a
+    // real AF_UNIX socket in the e2e suite instead.
+    if (builtin.os.tag != .windows) {
+        var fds: [2]posix.fd_t = undefined;
+        const rc = std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+        if (rc != 0) return error.SocketPairFailed;
 
-    const read_stream = streamFromFd(fds[0]);
-    const write_fd = fds[1];
+        const read_stream = streamFromFd(fds[0]);
+        const write_fd = fds[1];
 
-    // Write test data with newline
-    const test_data = "{\"jsonrpc\":\"2.0\",\"method\":\"test\",\"id\":1}\n";
-    _ = std.c.write(write_fd, test_data.ptr, test_data.len);
-    _ = std.c.close(write_fd);
+        // Write test data with newline
+        const test_data = "{\"jsonrpc\":\"2.0\",\"method\":\"test\",\"id\":1}\n";
+        _ = std.c.write(write_fd, test_data.ptr, test_data.len);
+        _ = std.c.close(write_fd);
 
-    const allocator = std.testing.allocator;
-    const line = try readLine(allocator, read_stream);
-    defer allocator.free(line);
-    defer _ = std.c.close(fds[0]);
+        const allocator = std.testing.allocator;
+        const line = try readLine(allocator, undefined, read_stream);
+        defer allocator.free(line);
+        defer _ = std.c.close(fds[0]);
 
-    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"method\":\"test\",\"id\":1}", line);
+        try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"method\":\"test\",\"id\":1}", line);
+    }
 }
 
 test "readLine handles EOF without newline" {
-    var fds: [2]posix.fd_t = undefined;
-    const rc = std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
-    if (rc != 0) return error.SocketPairFailed;
+    if (builtin.os.tag != .windows) {
+        var fds: [2]posix.fd_t = undefined;
+        const rc = std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+        if (rc != 0) return error.SocketPairFailed;
 
-    const read_stream = streamFromFd(fds[0]);
-    const write_fd = fds[1];
+        const read_stream = streamFromFd(fds[0]);
+        const write_fd = fds[1];
 
-    // Write data without newline, then close
-    const partial = "partial data";
-    _ = std.c.write(write_fd, partial.ptr, partial.len);
-    _ = std.c.close(write_fd);
+        // Write data without newline, then close
+        const partial = "partial data";
+        _ = std.c.write(write_fd, partial.ptr, partial.len);
+        _ = std.c.close(write_fd);
 
-    const allocator = std.testing.allocator;
-    const line = try readLine(allocator, read_stream);
-    defer allocator.free(line);
-    defer _ = std.c.close(fds[0]);
+        const allocator = std.testing.allocator;
+        const line = try readLine(allocator, undefined, read_stream);
+        defer allocator.free(line);
+        defer _ = std.c.close(fds[0]);
 
-    try std.testing.expectEqualStrings("partial data", line);
+        try std.testing.expectEqualStrings("partial data", line);
+    }
 }
 
 test "Unix socket round-trip" {
+    // POSIX-only socket path (/tmp); Windows IPC is covered by the e2e suite.
+    if (builtin.os.tag == .windows) return;
     const allocator = std.testing.allocator;
 
     // Use a unique socket path to avoid collisions between parallel test runs
     var path_buf: [128]u8 = undefined;
-    const sock_path = try std.fmt.bufPrint(&path_buf, "/tmp/hibrow-test-{d}.sock", .{std.c.getpid()});
+    const sock_path = try std.fmt.bufPrint(&path_buf, "/tmp/hibrow-test-{d}.sock", .{os.getpid()});
 
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
@@ -1524,10 +1524,10 @@ test "Unix socket round-trip" {
     };
     const req_bytes = try req.encode(allocator);
     defer allocator.free(req_bytes);
-    try streamWriteAll(client_stream, req_bytes);
+    try streamWriteAll(io, client_stream, req_bytes);
 
     // Server reads the request
-    const line = try readLine(allocator, server_stream);
+    const line = try readLine(allocator, io, server_stream);
     defer allocator.free(line);
 
     // Verify the request was received correctly
@@ -1541,10 +1541,10 @@ test "Unix socket round-trip" {
     const resp = protocol.makeResponse(decoded.id, .{ .string = "ok" });
     const resp_bytes = try resp.encode(allocator);
     defer allocator.free(resp_bytes);
-    try streamWriteAll(server_stream, resp_bytes);
+    try streamWriteAll(io, server_stream, resp_bytes);
 
     // Client reads the response
-    const resp_line = try readLine(allocator, client_stream);
+    const resp_line = try readLine(allocator, io, client_stream);
     defer allocator.free(resp_line);
 
     var resp_parsed = try protocol.parseMessage(allocator, resp_line);
@@ -1622,37 +1622,40 @@ test "Server dispatch handles gateway.shutdown" {
 }
 
 test "sendErrorResponse produces valid response" {
-    const allocator = std.testing.allocator;
+    // POSIX-only: uses socketpair + raw fds.
+    if (builtin.os.tag != .windows) {
+        const allocator = std.testing.allocator;
 
-    // Use a Unix socket pair (Stream uses sendmsg, which requires sockets)
-    var fds: [2]posix.fd_t = undefined;
-    const rc = std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
-    if (rc != 0) return error.SocketPairFailed;
+        // Use a Unix socket pair (Stream uses sendmsg, which requires sockets)
+        var fds: [2]posix.fd_t = undefined;
+        const rc = std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+        if (rc != 0) return error.SocketPairFailed;
 
-    const write_stream = streamFromFd(fds[1]);
-    const read_fd = fds[0];
+        const write_stream = streamFromFd(fds[1]);
+        const read_fd = fds[0];
 
-    try sendErrorResponse(allocator, write_stream, .{ .integer = 42 }, .parse_error, "bad json");
-    _ = std.c.close(fds[1]);
+        try sendErrorResponse(allocator, undefined, write_stream, .{ .integer = 42 }, .parse_error, "bad json");
+        _ = std.c.close(fds[1]);
 
-    // Read from the socket
-    var read_buf: [4096]u8 = undefined;
-    var total: usize = 0;
-    while (true) {
-        const n = try posix.read(read_fd, read_buf[total..]);
-        if (n == 0) break;
-        total += n;
+        // Read from the socket
+        var read_buf: [4096]u8 = undefined;
+        var total: usize = 0;
+        while (true) {
+            const n = try posix.read(read_fd, read_buf[total..]);
+            if (n == 0) break;
+            total += n;
+        }
+        _ = std.c.close(read_fd);
+
+        // Parse and verify
+        var parsed = try protocol.parseMessage(allocator, read_buf[0..total]);
+        defer parsed.deinit();
+        const obj = parsed.value().object;
+        try std.testing.expectEqual(@as(i64, 42), obj.get("id").?.integer);
+        const err_obj = obj.get("error").?.object;
+        try std.testing.expectEqual(@as(i64, -32700), err_obj.get("code").?.integer);
+        try std.testing.expectEqualStrings("bad json", err_obj.get("message").?.string);
     }
-    _ = std.c.close(read_fd);
-
-    // Parse and verify
-    var parsed = try protocol.parseMessage(allocator, read_buf[0..total]);
-    defer parsed.deinit();
-    const obj = parsed.value().object;
-    try std.testing.expectEqual(@as(i64, 42), obj.get("id").?.integer);
-    const err_obj = obj.get("error").?.object;
-    try std.testing.expectEqual(@as(i64, -32700), err_obj.get("code").?.integer);
-    try std.testing.expectEqualStrings("bad json", err_obj.get("message").?.string);
 }
 
 test "Client struct layout" {
