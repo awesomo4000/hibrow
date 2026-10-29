@@ -64,9 +64,10 @@ run_browser() {
     "$HIBROW" launch "$P" --browser "$browser" --headless >/dev/null 2>&1 || { no "launch $browser" "launch failed"; return; }
     ok "launch $browser --headless"
 
-    # --- session listing ---
+    # --- session listing + daemon status ---
     contains "ls lists the session" "$("$HIBROW" ls "$P" 2>&1 | tr -d '\n ')" "\"profile\":\"$P\""
     contains "ls reports browser"   "$("$HIBROW" ls "$P" 2>&1 | tr -d '\n ')" "\"browser_type\":\"$browser\""
+    contains "gateway status"       "$("$HIBROW" gateway status 2>&1)" "running"
 
     # --- core: nav + eval ---
     "$HIBROW" nav "$P" "$FRAMES" >/dev/null 2>&1; sleep 2
@@ -84,6 +85,16 @@ run_browser() {
     "$HIBROW" eval "$P" 'window.__g = btoa("GRABBED-BYTES")' >/dev/null 2>&1
     "$HIBROW" grab "$P" 'window.__g' -o "$tmpdir/grab.bin" >/dev/null 2>&1
     eq "grab writes decoded bytes" "$(cat "$tmpdir/grab.bin" 2>/dev/null)" "GRABBED-BYTES"
+
+    # --- frame tree / plain click / eval from file+stdin / wait --gone ---
+    contains "frame list --tree"   "$("$HIBROW" frame list "$P" --tree 2>&1 | tr -d ' ')" '\[0/0\]'
+    "$HIBROW" click "$P" '#tbtn' >/dev/null 2>&1
+    eq "click top-level element"   "$("$HIBROW" eval "$P" 'window.__tc' 2>&1)" "1"
+    printf '6*7\n' > "$tmpdir/eval.js"
+    eq "eval -f file"              "$("$HIBROW" eval "$P" -f "$tmpdir/eval.js" 2>&1)" "42"
+    eq "eval -f- stdin"            "$(printf '%s' '"io-"+"stdin"' | "$HIBROW" eval "$P" -f- 2>&1)" '"io-stdin"'
+    "$HIBROW" eval "$P" "var d=document.createElement('div');d.id='ephemeral';document.body.appendChild(d);setTimeout(function(){d.remove();},800);'made'" >/dev/null 2>&1
+    eq "wait --gone"               "$("$HIBROW" wait "$P" '#ephemeral' --gone --timeout 5 2>&1)" "true"
 
     # --- frames ---
     contains "frame list shows nested" "$("$HIBROW" frame list "$P" 2>&1 | tr -d '\n ')" '"path":"0/0"'
@@ -115,6 +126,9 @@ run_browser() {
     "$HIBROW" nav "$P" "$MEDIA" >/dev/null 2>&1; sleep 1
     contains "media list captions" "$("$HIBROW" media list "$P" 2>&1 | tr -d '\n ')" '"captions"'
     contains "media mute"          "$("$HIBROW" media mute "$P" 2>&1 | tr -d '\n ')" '"muted"'
+    contains "media unmute"        "$("$HIBROW" media unmute "$P" 2>&1 | tr -d '\n ')" '"muted":false'
+    contains "media play"          "$("$HIBROW" media play "$P" 2>&1 | tr -d '\n ')" '"tag":"audio"'
+    contains "media pause"         "$("$HIBROW" media pause "$P" 2>&1 | tr -d '\n ')" '"paused":true'
 
     # --- tab lifecycle: new / switch / close (count-based; indices reshuffle) ---
     ntabs() { "$HIBROW" tab list "$P" 2>&1 | grep -o '"index"' | wc -l | tr -d ' '; }
