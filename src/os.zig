@@ -82,6 +82,16 @@ pub fn runtimeDir(allocator: std.mem.Allocator) ![]u8 {
     return std.fmt.allocPrint(allocator, "/tmp/hibrow-{d}", .{uid});
 }
 
+/// The current user's home directory. POSIX uses HOME; Windows prefers
+/// USERPROFILE (the standard there) and falls back to HOME for shells like Git
+/// Bash that export it. Caller owns the returned path; errors if none is set.
+pub fn homeDir(allocator: std.mem.Allocator) ![]u8 {
+    if (is_windows) {
+        if (try envOwned(allocator, "USERPROFILE")) |p| return p;
+    }
+    return (try envOwned(allocator, "HOME")) orelse error.NoHomeDir;
+}
+
 /// Current process id.
 pub fn getpid() Pid {
     if (is_windows) return @intCast(std.os.windows.GetCurrentProcessId());

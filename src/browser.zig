@@ -536,7 +536,7 @@ pub fn getProfileDir(allocator: mem.Allocator, profile: []const u8) ![]u8 {
 // ---------------------------------------------------------------------------
 
 fn getHomeDir(allocator: mem.Allocator) ![]u8 {
-    return (try getEnvOwned(allocator, "HOME")) orelse error.NoHomeDir;
+    return os.homeDir(allocator);
 }
 
 fn ensureDirExists(io: std.Io, path: []const u8) !void {

@@ -2,9 +2,25 @@
 
 All notable changes to hibrow will be documented in this file.
 
-## [Unreleased] - 03/12/2026
+## [Unreleased] - 10/29/2026
 
 ### Added
+- Cross-platform support: hibrow now runs on macOS, Linux, and Windows with an identical command surface. OS-specific code is contained behind `src/os.zig` (small shims) and `src/os_windows.zig` (Win32), so the rest of the codebase stays platform-neutral
+- Firefox support over the Marionette protocol, alongside Chrome over CDP; `launch --browser chrome|firefox`
+- Linux browser discovery via `/proc/<pid>/cmdline`, and executable lookup on `PATH`
+- Windows browser discovery via the process PEB command line (toolhelp snapshot), and executable lookup via the App Paths registry
+- `os.homeDir` resolves the user home from `USERPROFILE` (with a `HOME` fallback) on Windows and `HOME` elsewhere
+- `tests/e2e-features.sh` runs the full dual-browser feature suite on all three platforms (Windows under Git Bash), driven uniformly by `mise run e2e`
+
+### Changed
+- Build and language updated to Zig 0.17.0 (`minimum_zig_version = "0.17.0"`)
+- Gateway socket I/O routed through `os.sockRead` / `os.sockWriteAll` so the transport is shared across platforms
+- Browser process discovery and the home-directory lookup moved behind the `os` shims
+
+### Fixed
+- WebSocket `readFrame` double-free when the peer closes the connection mid-read
+
+### Added (earlier, macOS)
 - `src/process.zig` — macOS process enumeration via `proc_listpids` + `sysctl(KERN_PROCARGS2)` for discovering Chrome browsers from process args
 - Process-based browser discovery: finds `--remote-debugging-port` and `--user-data-dir` directly from running Chrome process command lines
 - E2E results display: test results now render in the browser with pass/fail counts, individual test list, and 10s auto-close countdown (click to close early)
