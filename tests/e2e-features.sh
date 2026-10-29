@@ -64,10 +64,26 @@ run_browser() {
     "$HIBROW" launch "$P" --browser "$browser" --headless >/dev/null 2>&1 || { no "launch $browser" "launch failed"; return; }
     ok "launch $browser --headless"
 
+    # --- session listing ---
+    contains "ls lists the session" "$("$HIBROW" ls "$P" 2>&1 | tr -d '\n ')" "\"profile\":\"$P\""
+    contains "ls reports browser"   "$("$HIBROW" ls "$P" 2>&1 | tr -d '\n ')" "\"browser_type\":\"$browser\""
+
     # --- core: nav + eval ---
     "$HIBROW" nav "$P" "$FRAMES" >/dev/null 2>&1; sleep 2
     eq "eval returns value"        "$("$HIBROW" eval "$P" '1+1' 2>&1)" "2"
     eq "eval reads top DOM"        "$("$HIBROW" eval "$P" "document.querySelector('#top').innerText" 2>&1)" '"TOP"'
+    contains "url reports location" "$("$HIBROW" url "$P" 2>&1)" "frames/top.html"
+
+    # --- push: plain input + window variable ---
+    "$HIBROW" push "$P" '#pin' 'PUSHED-IN' >/dev/null 2>&1
+    eq "push sets input value"     "$("$HIBROW" eval "$P" "document.getElementById('pin').value" 2>&1)" '"PUSHED-IN"'
+    "$HIBROW" push "$P" 'window.__pv' 'PUSHED-VAR' >/dev/null 2>&1
+    eq "push sets window var"      "$("$HIBROW" eval "$P" 'window.__pv' 2>&1)" '"PUSHED-VAR"'
+
+    # --- grab: JS-mode base64 decoded to a file ---
+    "$HIBROW" eval "$P" 'window.__g = btoa("GRABBED-BYTES")' >/dev/null 2>&1
+    "$HIBROW" grab "$P" 'window.__g' -o "$tmpdir/grab.bin" >/dev/null 2>&1
+    eq "grab writes decoded bytes" "$(cat "$tmpdir/grab.bin" 2>/dev/null)" "GRABBED-BYTES"
 
     # --- frames ---
     contains "frame list shows nested" "$("$HIBROW" frame list "$P" 2>&1 | tr -d '\n ')" '"path":"0/0"'
@@ -99,6 +115,15 @@ run_browser() {
     "$HIBROW" nav "$P" "$MEDIA" >/dev/null 2>&1; sleep 1
     contains "media list captions" "$("$HIBROW" media list "$P" 2>&1 | tr -d '\n ')" '"captions"'
     contains "media mute"          "$("$HIBROW" media mute "$P" 2>&1 | tr -d '\n ')" '"muted"'
+
+    # --- tab lifecycle: new / switch / close (count-based; indices reshuffle) ---
+    ntabs() { "$HIBROW" tab list "$P" 2>&1 | grep -o '"index"' | wc -l | tr -d ' '; }
+    eq "tab count starts at 1"     "$(ntabs)" "1"
+    "$HIBROW" tab new "$P" >/dev/null 2>&1
+    eq "tab new adds a tab"        "$(ntabs)" "2"
+    contains "tab switch"          "$("$HIBROW" tab switch "$P:0" 2>&1)" "switched"
+    "$HIBROW" tab close "$P:0" >/dev/null 2>&1
+    eq "tab close removes a tab"   "$(ntabs)" "1"
 
     "$HIBROW" kill "$P" >/dev/null 2>&1
     "$HIBROW" gateway stop >/dev/null 2>&1
