@@ -34,7 +34,9 @@ fn tcpConnect(io: std.Io, host: []const u8, port: u16) !Stream {
         }
         return error.UnknownHostName;
     };
-    return addr.connect(io, .{ .mode = .stream });
+    const stream = try addr.connect(io, .{ .mode = .stream });
+    os.setTcpNoDelay(stream);
+    return stream;
 }
 
 /// WebSocket opcodes (RFC 6455 §5.2).

@@ -74,6 +74,7 @@ pub const Connection = struct {
     pub fn connect(self: *Connection, port: u16) !void {
         var addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
         self.stream = try addr.connect(self.io, .{ .mode = .stream });
+        os.setTcpNoDelay(self.stream.?);
 
         // Read handshake (Firefox sends it unprompted)
         _ = try self.readHandshake();

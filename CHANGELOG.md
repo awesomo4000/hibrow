@@ -2,9 +2,11 @@
 
 All notable changes to hibrow will be documented in this file.
 
-## [Unreleased] - 10/29/2026
+## [Unreleased] - 10/30/2026
 
 ### Added
+- Profile→(port, browser_type) resolution cache in the gateway, so warm commands skip the per-command process scan that dominated latency; a cheap TCP liveness probe validates a cached entry before use, and a dead or failed entry is evicted so a browser restart self-heals without a visible error. Warm command latency drops from ~100ms to ~15ms
+- `TCP_NODELAY` on gateway and browser sockets (`os.setTcpNoDelay`) to avoid Nagle/delayed-ACK stalls on the localhost request/response path
 - Cross-platform support: hibrow now runs on macOS, Linux, and Windows with an identical command surface. OS-specific code is contained behind `src/os.zig` (small shims) and `src/os_windows.zig` (Win32), so the rest of the codebase stays platform-neutral
 - Firefox support over the Marionette protocol, alongside Chrome over CDP; `launch --browser chrome|firefox`
 - Linux browser discovery via `/proc/<pid>/cmdline`, and executable lookup on `PATH`

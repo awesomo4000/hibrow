@@ -183,12 +183,19 @@ pub const Server = struct {
     running: bool = false,
     /// Cached CDP connections keyed by profile name (owned strings).
     connections: std.StringHashMap(ProfileConn),
+    /// Cached profile→(port, browser_type) resolutions keyed by profile name
+    /// (owned strings). Avoids re-scanning the process table on every command;
+    /// the scan is the dominant per-command cost. Validity is checked cheaply
+    /// before each use (see resolveBrowser) and the entry is dropped if the
+    /// browser is gone, so a restart self-heals without a visible failure.
+    resolutions: std.StringHashMap(BrowserInfo),
 
     pub fn init(allocator: mem.Allocator, io: std.Io) Server {
         return .{
             .allocator = allocator,
             .io = io,
             .connections = std.StringHashMap(ProfileConn).init(allocator),
+            .resolutions = std.StringHashMap(BrowserInfo).init(allocator),
         };
     }
 
@@ -200,6 +207,11 @@ pub const Server = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.connections.deinit();
+
+        // Free resolution cache keys
+        var rit = self.resolutions.keyIterator();
+        while (rit.next()) |key| self.allocator.free(key.*);
+        self.resolutions.deinit();
 
         if (self.listener) |*l| l.deinit(self.io);
         if (self.socket_path) |p| {
@@ -360,9 +372,9 @@ pub const Server = struct {
             return &pc.conn;
         }
 
-        // Not cached — look up port via process scan
-        const resolved_port = browser_mod.lookupPort(self.allocator, self.io, profile) catch null orelse
-            return null;
+        // Not cached — resolve the port (resolution cache first, scan on miss)
+        const info = (self.resolveBrowser(profile) catch null) orelse return null;
+        const resolved_port = info.port;
 
         // Discover targets via HTTP
         const targets = cdp.discoverTargets(self.allocator, self.io, resolved_port) catch return null;
@@ -404,6 +416,58 @@ pub const Server = struct {
         }
     }
 
+    /// Drop a cached port/type resolution for a profile. Leaves any live
+    /// connection alone (use evict() to drop both).
+    fn evictResolution(self: *Server, profile: []const u8) void {
+        if (self.resolutions.fetchRemove(profile)) |kv| self.allocator.free(kv.key);
+    }
+
+    /// Forget everything cached for a profile — the live socket and the
+    /// port/type resolution. Used on kill and whenever an operation against the
+    /// cache fails, since a failure can mean the browser is gone.
+    fn evict(self: *Server, profile: []const u8) void {
+        self.evictConnection(profile);
+        self.evictResolution(profile);
+    }
+
+    /// Cheap liveness check: can we open a TCP connection to the debug port on
+    /// loopback? A dead listener (browser crashed or was replaced) refuses fast,
+    /// so this costs well under a millisecond and lets resolveBrowser validate a
+    /// cached entry before trusting it — far cheaper than the process scan it
+    /// replaces. It does not prove the listener is still the same browser; a
+    /// stale socket that survives is caught by the operation failing and
+    /// evicting.
+    fn portAlive(self: *Server, port: u16) bool {
+        const addr = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
+        const stream = addr.connect(self.io, .{ .mode = .stream }) catch return false;
+        stream.close(self.io);
+        return true;
+    }
+
+    /// Resolve a profile to its browser's debug port and type, consulting the
+    /// resolution cache first and scanning the process table only on a miss (or
+    /// when a cached entry fails its liveness check). Every hot-path handler
+    /// goes through here instead of calling findBrowserInfo directly, which is
+    /// what keeps the ~100ms scan off warm commands.
+    fn resolveBrowser(self: *Server, profile: []const u8) !?BrowserInfo {
+        if (self.resolutions.get(profile)) |info| {
+            if (self.portAlive(info.port)) return info;
+            // Listener gone — drop the stale resolution and its dead socket,
+            // then fall through to a fresh scan so the caller never sees it.
+            self.evict(profile);
+        }
+
+        const info = (try findBrowserInfo(self.allocator, self.io, profile)) orelse return null;
+
+        // Cache for next time. A cache-put failure is non-fatal: we still
+        // return the resolution, the next command just scans again.
+        const key = self.allocator.dupe(u8, profile) catch return info;
+        self.resolutions.put(key, info) catch {
+            self.allocator.free(key);
+        };
+        return info;
+    }
+
     /// Serialize a Browser struct to a JSON object value.
     fn browserToJson(self: *Server, b: browser_mod.Browser) !json.ObjectMap {
         var obj: json.ObjectMap = .empty;
@@ -438,6 +502,10 @@ pub const Server = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.connections.clearRetainingCapacity();
+
+        var rit = self.resolutions.keyIterator();
+        while (rit.next()) |key| self.allocator.free(key.*);
+        self.resolutions.clearRetainingCapacity();
 
         // Shut down after encoding the response so the client gets the reply.
         self.running = false;
@@ -513,7 +581,7 @@ pub const Server = struct {
         // Optional frame path: "1,0,0" / "#outer/#inner" — eval inside a nested frame.
         const frame = extractStringParam(params, "frame");
 
-        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
+        const info = try self.resolveBrowser(profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
         switch (info.browser_type) {
@@ -540,7 +608,7 @@ pub const Server = struct {
                     conn.evalInFrame(f, expression)
                 else
                     conn.eval(expression)) catch {
-                    self.evictConnection(profile);
+                    self.evict(profile);
                     return self.fail(id, .cdp_error, "Eval failed");
                 };
                 if (eval_result.exception) |exc| {
@@ -556,7 +624,7 @@ pub const Server = struct {
         const profile = extractStringParam(params, "profile") orelse
             return self.fail(id, .invalid_params, "Missing 'profile' parameter");
 
-        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
+        const info = try self.resolveBrowser(profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
         switch (info.browser_type) {
@@ -573,7 +641,7 @@ pub const Server = struct {
                 const conn = self.getConnection(profile) orelse
                     return self.fail(id, .browser_not_found, "Browser not found");
                 const frames = conn.frameList() catch {
-                    self.evictConnection(profile);
+                    self.evict(profile);
                     return self.fail(id, .cdp_error, "frame list failed");
                 };
                 return self.ok(id, frames);
@@ -588,7 +656,7 @@ pub const Server = struct {
             return self.fail(id, .invalid_params, "Missing 'selector' parameter");
         const frame = extractStringParam(params, "frame");
 
-        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
+        const info = try self.resolveBrowser(profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
         switch (info.browser_type) {
@@ -607,7 +675,7 @@ pub const Server = struct {
                 const conn = self.getConnection(profile) orelse
                     return self.fail(id, .browser_not_found, "Browser not found");
                 (if (frame) |f| conn.clickInFrame(f, selector) else conn.click(selector)) catch {
-                    self.evictConnection(profile);
+                    self.evict(profile);
                     return self.fail(id, .cdp_error, "Click failed (element not found?)");
                 };
                 return self.ok(id, .{ .string = "clicked" });
@@ -630,7 +698,7 @@ pub const Server = struct {
         const check = try std.fmt.allocPrint(self.allocator, "!!document.querySelector({s})", .{sel_json});
         defer self.allocator.free(check);
 
-        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
+        const info = try self.resolveBrowser(profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
         const interval: u64 = 200;
@@ -673,7 +741,7 @@ pub const Server = struct {
         const url = extractStringParam(params, "url") orelse
             return self.fail(id, .invalid_params, "Missing 'url' parameter");
 
-        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
+        const info = try self.resolveBrowser(profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
         switch (info.browser_type) {
@@ -689,7 +757,7 @@ pub const Server = struct {
                 const conn = self.getConnection(profile) orelse
                     return self.fail(id, .browser_not_found, "Browser not found");
                 conn.navigate(url) catch {
-                    self.evictConnection(profile);
+                    self.evict(profile);
                     return self.fail(id, .cdp_error, "Navigate failed");
                 };
             },
@@ -725,7 +793,7 @@ pub const Server = struct {
         const profile = extractStringParam(params, "profile") orelse
             return self.fail(id, .invalid_params, "Missing 'profile' parameter");
 
-        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
+        const info = try self.resolveBrowser(profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
         switch (info.browser_type) {
@@ -755,8 +823,8 @@ pub const Server = struct {
             },
         }
 
-        // Evict cached page connection for this profile
-        self.evictConnection(profile);
+        // Browser is gone — forget the live socket and the port/type resolution
+        self.evict(profile);
 
         return self.ok(id, .{ .string = "killed" });
     }
@@ -765,7 +833,7 @@ pub const Server = struct {
         const profile = extractStringParam(params, "profile") orelse
             return self.fail(id, .invalid_params, "Missing 'profile' parameter");
 
-        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
+        const info = try self.resolveBrowser(profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
         switch (info.browser_type) {
@@ -783,7 +851,7 @@ pub const Server = struct {
                 const conn = self.getConnection(profile) orelse
                     return self.fail(id, .browser_not_found, "Browser not found");
                 const url_str = conn.getUrl() catch {
-                    self.evictConnection(profile);
+                    self.evict(profile);
                     return self.fail(id, .cdp_error, "Could not get URL");
                 };
                 defer self.allocator.free(url_str);
@@ -804,7 +872,7 @@ pub const Server = struct {
     };
 
     fn getPageTargets(self: *Server, profile: []const u8) !?PageTargetsResult {
-        const port = (try findBrowserInfo(self.allocator, self.io, profile) orelse return null).port;
+        const port = (try self.resolveBrowser(profile) orelse return null).port;
 
         const all_targets = cdp.discoverTargets(self.allocator, self.io, port) catch return null;
         defer cdp.freeTargets(self.allocator, all_targets);
@@ -850,7 +918,7 @@ pub const Server = struct {
         const profile = extractStringParam(params, "profile") orelse
             return self.fail(id, .invalid_params, "Missing 'profile' parameter");
 
-        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
+        const info = try self.resolveBrowser(profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
         switch (info.browser_type) {
@@ -906,7 +974,7 @@ pub const Server = struct {
         const profile = extractStringParam(params, "profile") orelse
             return self.fail(id, .invalid_params, "Missing 'profile' parameter");
 
-        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
+        const info = try self.resolveBrowser(profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
         const url = extractStringParam(params, "url");
@@ -963,7 +1031,7 @@ pub const Server = struct {
         if (tab_idx < 0) return self.fail(id, .invalid_params, "Tab index must be non-negative");
         const idx: usize = @intCast(tab_idx);
 
-        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
+        const info = try self.resolveBrowser(profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
         switch (info.browser_type) {
@@ -1013,7 +1081,7 @@ pub const Server = struct {
             return self.fail(id, .invalid_params, "Missing 'profile' parameter");
         const frame = extractStringParam(params, "frame");
 
-        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
+        const info = try self.resolveBrowser(profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
         switch (info.browser_type) {
@@ -1048,7 +1116,7 @@ pub const Server = struct {
                 const conn = self.getConnection(profile) orelse
                     return self.fail(id, .browser_not_found, "Browser not found");
                 const b64 = (if (frame) |f| conn.screenshotFrame(f) else conn.takeScreenshot()) catch {
-                    self.evictConnection(profile);
+                    self.evict(profile);
                     return self.fail(id, .cdp_error, "Screenshot failed");
                 };
                 defer self.allocator.free(b64);
@@ -1066,7 +1134,7 @@ pub const Server = struct {
         if (tab_idx < 0) return self.fail(id, .invalid_params, "Tab index must be non-negative");
         const idx: usize = @intCast(tab_idx);
 
-        const info = try findBrowserInfo(self.allocator, self.io, profile) orelse
+        const info = try self.resolveBrowser(profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
         switch (info.browser_type) {
@@ -1435,6 +1503,28 @@ test "Server evictConnection on empty cache is safe" {
     defer server.deinit();
     // Should not crash or leak
     server.evictConnection("nonexistent");
+}
+
+test "Server resolution cache put/evict frees keys" {
+    const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    var server = Server.init(allocator, threaded.io());
+    defer server.deinit();
+
+    // Seed a resolution directly (bypasses the process scan) with an owned key,
+    // the same way resolveBrowser does, and confirm evict paths free it without
+    // leaking. The testing allocator fails the test on any leak.
+    const key = try allocator.dupe(u8, "work");
+    try server.resolutions.put(key, .{ .port = 9222, .browser_type = .chrome });
+
+    // evictResolution drops only the resolution.
+    server.evictResolution("work");
+    try std.testing.expect(server.resolutions.get("work") == null);
+
+    // evict() and both evictors are safe on an absent profile.
+    server.evict("nonexistent");
+    server.evictResolution("nonexistent");
 }
 
 test "readLine reads up to newline" {

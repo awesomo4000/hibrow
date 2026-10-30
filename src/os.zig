@@ -32,6 +32,7 @@ const win = if (is_windows) struct {
     const w = std.os.windows;
     extern "kernel32" fn Sleep(dwMilliseconds: w.DWORD) callconv(.winapi) void;
     extern "kernel32" fn GetProcessId(Process: w.HANDLE) callconv(.winapi) w.DWORD;
+    extern "ws2_32" fn setsockopt(s: w.HANDLE, level: c_int, optname: c_int, optval: [*]const u8, optlen: c_int) callconv(.winapi) c_int;
 } else struct {};
 
 /// Numeric PID of a spawned child. On POSIX `child.id` is already the pid; on
@@ -145,4 +146,18 @@ pub fn sockWriteAll(io: std.Io, stream: Stream, bytes: []const u8) !void {
         if (rc <= 0) return error.WriteFailed;
         i += @intCast(rc);
     }
+}
+
+/// Disable Nagle's algorithm on a connected TCP socket. hibrow speaks a strict
+/// request/response protocol to a browser on localhost, where Nagle combined
+/// with delayed ACK stalls each round trip by tens of milliseconds. Best-effort:
+/// on failure the connection still works, only slower, so errors are ignored.
+pub fn setTcpNoDelay(stream: Stream) void {
+    const one = std.mem.toBytes(@as(c_int, 1));
+    if (is_windows) {
+        const w = std.os.windows;
+        _ = win.setsockopt(stream.socket.handle, w.ws2_32.IPPROTO.TCP, w.ws2_32.TCP.NODELAY, &one, @intCast(one.len));
+        return;
+    }
+    posix.setsockopt(stream.socket.handle, posix.IPPROTO.TCP, posix.TCP.NODELAY, &one) catch {};
 }
