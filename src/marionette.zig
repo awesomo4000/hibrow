@@ -234,6 +234,55 @@ pub const Connection = struct {
         return .{};
     }
 
+    /// Evaluate a Promise-returning expression asynchronously, resolving when the
+    /// Promise settles (WebDriver:ExecuteAsyncScript). Used by wait so Firefox
+    /// signals the instant the condition holds instead of us polling. Marionette's
+    /// script timeout is raised above the caller's deadline so the expression's
+    /// own page-side timeout settles first and we get a clean value rather than a
+    /// Marionette timeout error; a rejected Promise maps to false.
+    pub fn evalAsync(self: *Connection, expression: []const u8, timeout_ms: i64) !EvalResult {
+        {
+            var tp: json.ObjectMap = .empty;
+            defer tp.deinit(self.allocator);
+            try tp.put(self.allocator, "script", .{ .integer = timeout_ms + 2000 });
+            var tr = try self.send("WebDriver:SetTimeouts", .{ .object = tp });
+            tr.deinit();
+        }
+
+        const expr_json = try json.Stringify.valueAlloc(self.allocator, json.Value{ .string = expression }, .{});
+        defer self.allocator.free(expr_json);
+
+        // The async script receives its resolve callback as the last argument
+        // (Marionette convention); forward the settled value, mapping a rejection
+        // to false. Indirect eval runs the expression in global scope, matching eval().
+        const script = try std.fmt.allocPrint(
+            self.allocator,
+            "var cb=arguments[arguments.length-1];Promise.resolve((0,eval)({s})).then(function(v){{cb(v);}},function(e){{cb(false);}});",
+            .{expr_json},
+        );
+        defer self.allocator.free(script);
+
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
+        try params.put(self.allocator, "script", .{ .string = script });
+        var args_arr = json.Array.init(self.allocator);
+        defer args_arr.deinit();
+        try params.put(self.allocator, "args", .{ .array = args_arr });
+
+        var result = try self.send("WebDriver:ExecuteAsyncScript", .{ .object = params });
+        defer result.deinit();
+
+        if (result.err) |e| {
+            return .{ .exception = try self.allocator.dupe(u8, e) };
+        }
+        if (result.result == .object) {
+            if (result.result.object.get("value")) |val| {
+                return .{ .value = try cloneJsonValue(self.allocator, val) };
+            }
+        }
+        return .{};
+    }
+
     /// Switch into a child frame by index (Marionette SwitchToFrame id=<int>).
     pub fn switchToFrameIndex(self: *Connection, index: i64) !void {
         // Element-based: switch into the index-th <iframe>/<frame> in DOM order,

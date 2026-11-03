@@ -476,14 +476,33 @@ pub const Connection = struct {
         return self.parseEvalResult(cdp_result.result);
     }
 
+    /// Like eval, but awaits a Promise returned by the expression (CDP
+    /// awaitPromise): the response does not come back until the Promise settles,
+    /// and the resolved value is returned by value. Used by wait so the browser
+    /// signals the instant the condition holds instead of us polling. The
+    /// caller's expression must guarantee the Promise settles (e.g. a page-side
+    /// timeout), or this blocks until the context is torn down.
+    pub fn evalAwait(self: *Connection, expression: []const u8) !EvalResult {
+        var params_obj: json.ObjectMap = .empty;
+        defer params_obj.deinit(self.allocator);
+        try params_obj.put(self.allocator, "expression", .{ .string = expression });
+        try params_obj.put(self.allocator, "returnByValue", .{ .bool = true });
+        try params_obj.put(self.allocator, "awaitPromise", .{ .bool = true });
+
+        var cdp_result = try self.send("Runtime.evaluate", .{ .object = params_obj });
+        defer cdp_result.deinit();
+        return self.parseEvalResult(cdp_result.result);
+    }
+
     /// Evaluate JavaScript within a specific execution context (used for frames),
     /// optionally on an OOPIF session.
-    fn evalInContext(self: *Connection, context_id: i64, expression: []const u8, session: ?[]const u8) !EvalResult {
+    fn evalInContext(self: *Connection, context_id: i64, expression: []const u8, session: ?[]const u8, await_promise: bool) !EvalResult {
         var params_obj: json.ObjectMap = .empty;
         defer params_obj.deinit(self.allocator);
         try params_obj.put(self.allocator, "expression", .{ .string = expression });
         try params_obj.put(self.allocator, "returnByValue", .{ .bool = true });
         try params_obj.put(self.allocator, "contextId", .{ .integer = context_id });
+        if (await_promise) try params_obj.put(self.allocator, "awaitPromise", .{ .bool = true });
 
         var cdp_result = try self.sendSession("Runtime.evaluate", .{ .object = params_obj }, session);
         defer cdp_result.deinit();
@@ -519,7 +538,7 @@ pub const Connection = struct {
         const expr = try std.fmt.allocPrint(self.allocator, "(function(){{var t=document.querySelector({s});var l=[].slice.call(document.querySelectorAll('iframe,frame'));return l.indexOf(t);}})()", .{sel_json});
         defer self.allocator.free(expr);
 
-        const res = try self.evalInContext(ctx, expr, session);
+        const res = try self.evalInContext(ctx, expr, session, false);
         if (res.exception) |e| {
             self.allocator.free(e);
             return error.FrameNotFound;
@@ -625,7 +644,16 @@ pub const Connection = struct {
         var target = try self.resolveFrameTarget(frame_path);
         defer target.deinit(self.allocator);
         const ctx = try self.createIsolatedWorld(target.frame_id, target.session);
-        return self.evalInContext(ctx, expression, target.session);
+        return self.evalInContext(ctx, expression, target.session, false);
+    }
+
+    /// Like evalAwait, but scoped to a nested frame (see evalAwait, evalInFrame).
+    /// Used by wait so a frame-scoped condition resolves the instant it holds.
+    pub fn evalAwaitInFrame(self: *Connection, frame_path: []const u8, expression: []const u8) !EvalResult {
+        var target = try self.resolveFrameTarget(frame_path);
+        defer target.deinit(self.allocator);
+        const ctx = try self.createIsolatedWorld(target.frame_id, target.session);
+        return self.evalInContext(ctx, expression, target.session, true);
     }
 
     /// Dispatch a trusted (isTrusted) left click at top-level viewport (x,y) via
@@ -671,7 +699,7 @@ pub const Connection = struct {
         const ctx = try self.createIsolatedWorld(target.frame_id, target.session);
         const expr = try deepRectExpr(self.allocator, selector);
         defer self.allocator.free(expr);
-        const r = try self.evalInContext(ctx, expr, target.session);
+        const r = try self.evalInContext(ctx, expr, target.session, false);
         const rect = rectFromValue(r.value) orelse return error.ElementNotFound;
         try self.dispatchClickAt(foff.x + rect.x + rect.w / 2, foff.y + rect.y + rect.h / 2);
     }
@@ -760,7 +788,7 @@ pub const Connection = struct {
         if (self.createIsolatedWorld(parent_frame_id, parent_session)) |ctx| {
             const sexpr = try std.fmt.allocPrint(self.allocator, "(function(){{var e=document.querySelectorAll('iframe,frame')[{d}];return e?(e.id?('#'+e.id):(e.name?('[name=\"'+e.name+'\"]'):'')):'';}})()", .{dom_index});
             defer self.allocator.free(sexpr);
-            if (self.evalInContext(ctx, sexpr, parent_session)) |sr| {
+            if (self.evalInContext(ctx, sexpr, parent_session, false)) |sr| {
                 if (sr.value == .string) {
                     self.allocator.free(selector);
                     selector = try self.allocator.dupe(u8, sr.value.string);
@@ -771,7 +799,7 @@ pub const Connection = struct {
         var title = try self.allocator.dupe(u8, "");
         if (child_frame_id) |cid| {
             if (self.createIsolatedWorld(cid, child_session)) |ctx| {
-                if (self.evalInContext(ctx, "document.title", child_session)) |tr| {
+                if (self.evalInContext(ctx, "document.title", child_session, false)) |tr| {
                     if (tr.value == .string) {
                         self.allocator.free(title);
                         title = try self.allocator.dupe(u8, tr.value.string);
@@ -937,7 +965,7 @@ pub const Connection = struct {
             const ctx = try self.createIsolatedWorld(current_id, current_session);
             const rect_expr = try std.fmt.allocPrint(self.allocator, "(function(){{var e=document.querySelectorAll('iframe,frame')[{d}];if(!e)return[0,0,0,0];var r=e.getBoundingClientRect();return [r.left,r.top,r.width,r.height];}})()", .{index});
             defer self.allocator.free(rect_expr);
-            const rr = try self.evalInContext(ctx, rect_expr, current_session);
+            const rr = try self.evalInContext(ctx, rect_expr, current_session, false);
             if (rr.value == .array and rr.value.array.items.len >= 4) {
                 const items = rr.value.array.items;
                 acc_x += numOf(items[0], 0);

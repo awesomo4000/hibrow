@@ -693,16 +693,12 @@ pub const Server = struct {
         const gone = extractBoolParam(params, "gone") orelse false;
         const desired = !gone;
 
-        const sel_json = try json.Stringify.valueAlloc(self.allocator, json.Value{ .string = selector }, .{});
-        defer self.allocator.free(sel_json);
-        const check = try std.fmt.allocPrint(self.allocator, "!!document.querySelector({s})", .{sel_json});
-        defer self.allocator.free(check);
+        const wait_expr = try buildWaitExpr(self.allocator, selector, desired, timeout_ms);
+        defer self.allocator.free(wait_expr);
 
         const info = try self.resolveBrowser(profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
 
-        const interval: u64 = 200;
-        var elapsed: i64 = 0;
         switch (info.browser_type) {
             .firefox => {
                 var conn = marionette_mod.Connection.init(self.allocator, self.io);
@@ -711,28 +707,30 @@ pub const Server = struct {
                     return self.fail(id, .cdp_error, "Marionette connection failed");
                 if (frame) |f| conn.switchToFramePath(f) catch
                     return self.fail(id, .cdp_error, "Frame not found");
-                while (elapsed <= timeout_ms) {
-                    const res = conn.eval(check) catch break;
-                    const found = res.value == .bool and res.value.bool;
-                    if (found == desired) return self.ok(id, .{ .bool = true });
-                    sleepMs(interval);
-                    elapsed += interval;
-                }
-                return self.fail(id, .cdp_error, "Timeout waiting for selector");
+                const res = conn.evalAsync(wait_expr, timeout_ms) catch
+                    return self.fail(id, .cdp_error, "Wait failed");
+                return self.waitResult(id, res);
             },
             .chrome => {
                 const conn = self.getConnection(profile) orelse
                     return self.fail(id, .browser_not_found, "Browser not found");
-                while (elapsed <= timeout_ms) {
-                    const res = (if (frame) |f| conn.evalInFrame(f, check) else conn.eval(check)) catch break;
-                    const found = res.value == .bool and res.value.bool;
-                    if (found == desired) return self.ok(id, .{ .bool = true });
-                    sleepMs(interval);
-                    elapsed += interval;
-                }
-                return self.fail(id, .cdp_error, "Timeout waiting for selector");
+                const res = (if (frame) |f| conn.evalAwaitInFrame(f, wait_expr) else conn.evalAwait(wait_expr)) catch {
+                    self.evict(profile);
+                    return self.fail(id, .cdp_error, "Wait failed");
+                };
+                return self.waitResult(id, res);
             },
         }
+    }
+
+    /// Map a wait eval result to a response: the condition held (true) → ok,
+    /// anything else (page-side timeout returned false, or an exception) →
+    /// timeout failure. Generic over the Chrome and Firefox EvalResult types;
+    /// frees any exception string the result owns.
+    fn waitResult(self: *Server, id: json.Value, res: anytype) ![]u8 {
+        if (res.value == .bool and res.value.bool) return self.ok(id, .{ .bool = true });
+        if (res.exception) |exc| self.allocator.free(exc);
+        return self.fail(id, .cdp_error, "Timeout waiting for selector");
     }
 
     fn handleBrowserNavigate(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {
@@ -1320,6 +1318,26 @@ fn extractIntParam(params: ?json.Value, key: []const u8) ?i64 {
     const val = p.object.get(key) orelse return null;
     if (val != .integer) return null;
     return val.integer;
+}
+
+/// Build the JavaScript a wait evaluates: a Promise that resolves true the
+/// instant `document.querySelector(selector)` reaches the desired presence, and
+/// resolves false after `timeout_ms`. A MutationObserver drives the re-check, so
+/// the browser signals the moment the DOM changes instead of us polling. The
+/// page-side timeout guarantees the Promise always settles, so the awaiting
+/// connection never blocks past the deadline. Caller owns the returned string.
+fn buildWaitExpr(allocator: mem.Allocator, selector: []const u8, present: bool, timeout_ms: i64) ![]u8 {
+    const sel_json = try json.Stringify.valueAlloc(allocator, json.Value{ .string = selector }, .{});
+    defer allocator.free(sel_json);
+    const want = if (present) "true" else "false";
+    return std.fmt.allocPrint(allocator, "(function(){{return new Promise(function(resolve){{" ++
+        "var want={s};" ++
+        "function hit(){{return (!!document.querySelector({s}))===want;}}" ++
+        "if(hit()){{resolve(true);return;}}" ++
+        "var t;var obs=new MutationObserver(function(){{if(hit()){{obs.disconnect();clearTimeout(t);resolve(true);}}}});" ++
+        "obs.observe(document.documentElement||document,{{childList:true,subtree:true,attributes:true}});" ++
+        "t=setTimeout(function(){{obs.disconnect();resolve(false);}},{d});" ++
+        "}});}})()", .{ want, sel_json, timeout_ms });
 }
 
 /// Find a browser's CDP port by scanning running processes for the given profile.

@@ -4,6 +4,9 @@ All notable changes to hibrow will be documented in this file.
 
 ## [Unreleased] - 10/30/2026
 
+### Changed
+- `wait` is now event-driven instead of polling. The browser evaluates a Promise backed by a `MutationObserver` that resolves the instant the selector reaches the desired presence (with a page-side timeout fallback), consumed via CDP `awaitPromise` on Chrome and `WebDriver:ExecuteAsyncScript` on Firefox. The gateway blocks on a single round trip rather than re-evaluating every 200ms, so `wait` returns the moment the DOM changes and right at the deadline on a genuine timeout
+
 ### Added
 - Profile→(port, browser_type) resolution cache in the gateway, so warm commands skip the per-command process scan that dominated latency; a cheap TCP liveness probe validates a cached entry before use, and a dead or failed entry is evicted so a browser restart self-heals without a visible error. Warm command latency drops from ~100ms to ~15ms
 - `TCP_NODELAY` on gateway and browser sockets (`os.setTcpNoDelay`) to avoid Nagle/delayed-ACK stalls on the localhost request/response path
