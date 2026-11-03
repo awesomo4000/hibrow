@@ -5,6 +5,7 @@ All notable changes to hibrow will be documented in this file.
 ## [Unreleased] - 10/30/2026
 
 ### Changed
+- `nav` now waits for the page to load before returning. On Chrome, after `Page.navigate` commits (the new document's context is already current), it awaits the document `load` event — which also covers subframes — with a 30s page-side safety bound so a stuck page cannot wedge the connection; Firefox already blocked on load via `WebDriver:Navigate`. Callers no longer need a fixed sleep after navigating: the feature e2e suite dropped its post-`nav` sleeps and now runs in ~12s (was ~28s)
 - `wait` is now event-driven instead of polling. The browser evaluates a Promise backed by a `MutationObserver` that resolves the instant the selector reaches the desired presence (with a page-side timeout fallback), consumed via CDP `awaitPromise` on Chrome and `WebDriver:ExecuteAsyncScript` on Firefox. The gateway blocks on a single round trip rather than re-evaluating every 200ms, so `wait` returns the moment the DOM changes and right at the deadline on a genuine timeout
 
 ### Added

@@ -70,7 +70,7 @@ run_browser() {
     contains "gateway status"       "$("$HIBROW" gateway status 2>&1)" "running"
 
     # --- core: nav + eval ---
-    "$HIBROW" nav "$P" "$FRAMES" >/dev/null 2>&1; sleep 2
+    "$HIBROW" nav "$P" "$FRAMES" >/dev/null 2>&1   # nav waits for load; no sleep needed
     eq "eval returns value"        "$("$HIBROW" eval "$P" '1+1' 2>&1)" "2"
     eq "eval reads top DOM"        "$("$HIBROW" eval "$P" "document.querySelector('#top').innerText" 2>&1)" '"TOP"'
     contains "url reports location" "$("$HIBROW" url "$P" 2>&1)" "frames/top.html"
@@ -115,7 +115,7 @@ run_browser() {
     contains "tab list"            "$("$HIBROW" tab list "$P" 2>&1 | tr -d '\n ')" '"index":0'
 
     # --- shadow DOM: text + trusted >>> click ---
-    "$HIBROW" nav "$P" "$SHADOW" >/dev/null 2>&1; sleep 2
+    "$HIBROW" nav "$P" "$SHADOW" >/dev/null 2>&1
     contains "text pierces shadow" "$("$HIBROW" text "$P" 2>&1)" "NESTED-SHADOW-TEXT"
     "$HIBROW" click "$P" '#host >>> #sbtn' >/dev/null 2>&1
     eq "shadow >>> click"          "$("$HIBROW" eval "$P" "document.getElementById('result').textContent" 2>&1)" '"SHADOW-CLICKED"'
@@ -123,7 +123,7 @@ run_browser() {
     eq "nested shadow click"       "$("$HIBROW" eval "$P" "document.getElementById('result').textContent" 2>&1)" '"NESTED-CLICKED"'
 
     # --- media ---
-    "$HIBROW" nav "$P" "$MEDIA" >/dev/null 2>&1; sleep 1
+    "$HIBROW" nav "$P" "$MEDIA" >/dev/null 2>&1
     contains "media list captions" "$("$HIBROW" media list "$P" 2>&1 | tr -d '\n ')" '"captions"'
     contains "media mute"          "$("$HIBROW" media mute "$P" 2>&1 | tr -d '\n ')" '"muted"'
     contains "media unmute"        "$("$HIBROW" media unmute "$P" 2>&1 | tr -d '\n ')" '"muted":false'

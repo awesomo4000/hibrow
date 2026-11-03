@@ -818,14 +818,32 @@ pub const Connection = struct {
         try arr.append(.{ .object = obj });
     }
 
-    /// Navigate the connected target to a URL.
+    /// Navigate the connected target to a URL and wait for the new page to load.
+    ///
+    /// Page.navigate returns once the navigation has committed — the new
+    /// document's execution context is already current and still loading — so we
+    /// await its load here rather than making callers guess with a fixed sleep.
+    /// The top document's `load` event fires only after subframes have loaded,
+    /// so this also covers iframe content. A page-side timeout bounds the wait:
+    /// a page that never fires load resolves after it and returns, so a slow or
+    /// stuck page cannot wedge the connection. The load-wait is best-effort — the
+    /// navigation has already been issued — so a torn-down context is not an error.
     pub fn navigate(self: *Connection, url: []const u8) !void {
         var params_obj: json.ObjectMap = .empty;
         defer params_obj.deinit(self.allocator);
         try params_obj.put(self.allocator, "url", .{ .string = url });
 
         var cdp_result = try self.send("Page.navigate", .{ .object = params_obj });
-        defer cdp_result.deinit();
+        cdp_result.deinit();
+
+        // Resolve on the new document's load, or after 30s as a safety bound.
+        const load_wait = "new Promise(function(r){" ++
+            "if(document.readyState==='complete'){r(true);return;}" ++
+            "var t=setTimeout(function(){r(true);},30000);" ++
+            "addEventListener('load',function(){clearTimeout(t);r(true);},{once:true});" ++
+            "})";
+        const res = self.evalAwait(load_wait) catch return;
+        if (res.exception) |e| self.allocator.free(e);
     }
 
     /// Send Browser.close to gracefully shut down the browser.
