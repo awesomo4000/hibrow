@@ -1,0 +1,30 @@
+<!doctype html><meta charset="utf-8"><title>playback lab</title>
+<h1>playback lab</h1>
+<!-- A real, multi-second clip built in-page so the timeline actually advances
+     under playback. Muted + autoplay so a headless browser can start it without
+     a user gesture; the CLI can also drive play/pause/seek against #pb. -->
+<audio id="pb" muted autoplay></audio>
+<pre id="log">booting</pre>
+<script>
+// Build a WAV data URI of `seconds` of a quiet tone at `freq` Hz. 8 kHz mono,
+// 16-bit PCM — small enough to inline, long enough that currentTime moves.
+function makeWav(seconds, freq) {
+  var rate = 8000, n = Math.floor(rate * seconds);
+  var buf = new ArrayBuffer(44 + n * 2), dv = new DataView(buf);
+  function str(o, s) { for (var i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); }
+  str(0, 'RIFF'); dv.setUint32(4, 36 + n * 2, true); str(8, 'WAVE');
+  str(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true);
+  dv.setUint16(22, 1, true); dv.setUint32(24, rate, true); dv.setUint32(28, rate * 2, true);
+  dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+  str(36, 'data'); dv.setUint32(40, n * 2, true);
+  for (var i = 0; i < n; i++) dv.setInt16(44 + i * 2, Math.sin(i * freq * 2 * Math.PI / rate) * 6000, true);
+  var bytes = new Uint8Array(buf), bin = '';
+  for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return 'data:audio/wav;base64,' + btoa(bin);
+}
+var pb = document.getElementById('pb');
+pb.src = makeWav(3, 440);
+function note(e) { document.getElementById('log').textContent = e + '@' + pb.currentTime.toFixed(2); }
+pb.addEventListener('playing', function () { note('playing'); });
+pb.addEventListener('ended', function () { note('ended'); });
+</script>

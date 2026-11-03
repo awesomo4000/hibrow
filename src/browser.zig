@@ -224,6 +224,10 @@ fn launchChrome(allocator: mem.Allocator, io: std.Io, options: LaunchOptions) !B
     try argv_list.append(allocator, "--no-default-browser-check");
     try argv_list.append(allocator, "--password-store=basic");
     try argv_list.append(allocator, "--use-mock-keychain");
+    // Let automation drive media: without this, Chrome's autoplay policy treats
+    // a scripted element.play() as gesture-less and keeps playback paused, so
+    // `media play` and muted autoplay would silently no-op under automation.
+    try argv_list.append(allocator, "--autoplay-policy=no-user-gesture-required");
 
     // Optional proxy args
     if (options.proxy) |proxy| {

@@ -22,6 +22,7 @@ fileurl() {
 FRAMES="$(fileurl evals/skill/frames/top.html)"
 SHADOW="$(fileurl evals/skill/frames/shadow.html)"
 MEDIA="$(fileurl evals/skill/frames/media.html)"
+PLAYBACK="$(fileurl evals/skill/frames/playback.html)"
 PASS=0; FAIL=0
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
@@ -32,6 +33,7 @@ ok()  { PASS=$((PASS+1)); echo "  $(g PASS) $1"; }
 no()  { FAIL=$((FAIL+1)); echo "  $(r FAIL) $1 — got: [${2:-}]"; }
 
 eq()       { if [ "$2" = "$3" ]; then ok "$1"; else no "$1" "$2"; fi; }
+gt()       { if awk "BEGIN{exit !($2 > $3)}" 2>/dev/null; then ok "$1"; else no "$1" "$2 not > $3"; fi; }
 contains() { if printf '%s' "$2" | grep -q -- "$3"; then ok "$1"; else no "$1" "$2"; fi; }
 is_png()   { if [ -f "$2" ] && file "$2" | grep -q "PNG image"; then ok "$1"; else no "$1" "no png"; fi; }
 
@@ -129,6 +131,21 @@ run_browser() {
     contains "media unmute"        "$("$HIBROW" media unmute "$P" 2>&1 | tr -d '\n ')" '"muted":false'
     contains "media play"          "$("$HIBROW" media play "$P" 2>&1 | tr -d '\n ')" '"tag":"audio"'
     contains "media pause"         "$("$HIBROW" media pause "$P" 2>&1 | tr -d '\n ')" '"paused":true'
+
+    # --- real playback: muted autoplay, timeline advances, wait-ended via seek ---
+    # A multi-second tone built in-page (evals/skill/frames/playback.html) so the
+    # clock actually moves. These prove playback happens, not just that the
+    # commands return the right shape.
+    "$HIBROW" nav "$P" "$PLAYBACK" >/dev/null 2>&1
+    eq "muted autoplay is playing"  "$("$HIBROW" eval "$P" "var e=document.getElementById('pb');(!e.paused)+','+e.muted" 2>&1)" '"true,true"'
+    "$HIBROW" eval "$P" "document.getElementById('pb').currentTime=0;'ok'" >/dev/null 2>&1
+    "$HIBROW" media play "$P" '#pb' >/dev/null 2>&1
+    pt0="$("$HIBROW" eval "$P" "document.getElementById('pb').currentTime" 2>&1)"
+    sleep 1
+    pt1="$("$HIBROW" eval "$P" "document.getElementById('pb').currentTime" 2>&1)"
+    gt "playback advances currentTime" "$pt1" "$pt0"
+    "$HIBROW" eval "$P" "var e=document.getElementById('pb');e.currentTime=e.duration-0.2;e.play();'ok'" >/dev/null 2>&1
+    contains "wait-ended after seek" "$("$HIBROW" media wait-ended "$P" '#pb' --timeout 10 2>&1 | tr -d '\n ')" '"ended":true'
 
     # --- tab lifecycle: new / switch / close (count-based; indices reshuffle) ---
     ntabs() { "$HIBROW" tab list "$P" 2>&1 | grep -o '"index"' | wc -l | tr -d ' '; }

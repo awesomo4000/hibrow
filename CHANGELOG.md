@@ -24,6 +24,7 @@ All notable changes to hibrow will be documented in this file.
 - Browser process discovery and the home-directory lookup moved behind the `os` shims
 
 ### Fixed
+- `media play` and muted autoplay now actually play on Chrome. Chrome launches with `--autoplay-policy=no-user-gesture-required`, so a scripted `element.play()` is no longer treated as gesture-less and left paused; previously `media play` returned normally but the timeline never advanced under automation (Firefox already played). The feature e2e suite now proves real playback — muted autoplay running, `currentTime` advancing while playing, and `wait-ended` firing after a seek to the end — against a multi-second in-page tone
 - WebSocket `readFrame` double-free when the peer closes the connection mid-read
 
 ### Added (earlier, macOS)
