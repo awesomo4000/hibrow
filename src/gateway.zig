@@ -563,6 +563,7 @@ pub const Server = struct {
             .proxy = extractStringParam(params, "proxy"),
             .proxy_dns = extractBoolParam(params, "proxy_dns") orelse false,
             .headless = extractBoolParam(params, "headless") orelse false,
+            .allow_autoplay = extractBoolParam(params, "allow_autoplay") orelse false,
             .browser_type = browser_type,
         }) catch |err|
             return self.fail(id, .browser_launch_failed, @errorName(err));

@@ -68,6 +68,12 @@ pub const LaunchOptions = struct {
     /// Per-launch: applies to this browser instance only, and only when it is
     /// actually spawned (discovery of an already-running instance ignores it).
     headless: bool = false,
+    /// Allow media to play without a user gesture (Chrome:
+    /// --autoplay-policy=no-user-gesture-required). Lets `media play`, a
+    /// scripted element.play(), and page `autoplay` actually start — otherwise
+    /// Chrome keeps them paused under automation. Applies headless or not.
+    /// Firefox already permits muted autoplay, so this is a no-op there.
+    allow_autoplay: bool = false,
     /// Browser engine to launch.
     browser_type: BrowserType = .chrome,
 };
@@ -224,10 +230,13 @@ fn launchChrome(allocator: mem.Allocator, io: std.Io, options: LaunchOptions) !B
     try argv_list.append(allocator, "--no-default-browser-check");
     try argv_list.append(allocator, "--password-store=basic");
     try argv_list.append(allocator, "--use-mock-keychain");
-    // Let automation drive media: without this, Chrome's autoplay policy treats
-    // a scripted element.play() as gesture-less and keeps playback paused, so
-    // `media play` and muted autoplay would silently no-op under automation.
-    try argv_list.append(allocator, "--autoplay-policy=no-user-gesture-required");
+    // Opt-in only: without this, Chrome's autoplay policy treats a scripted
+    // element.play() as gesture-less and keeps playback paused, so `media play`
+    // and page autoplay silently no-op. Left off by default so a launched
+    // session does not start media on its own; --allow-autoplay turns it on.
+    if (options.allow_autoplay) {
+        try argv_list.append(allocator, "--autoplay-policy=no-user-gesture-required");
+    }
 
     // Optional proxy args
     if (options.proxy) |proxy| {

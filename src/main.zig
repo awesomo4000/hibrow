@@ -19,7 +19,7 @@ const usage =
     \\Usage: hibrow <command> [options]
     \\
     \\Commands:
-    \\  launch <profile> [--browser chrome|firefox|ff] [--headless] [--proxy <url>] [--proxy-dns]
+    \\  launch <profile> [--browser chrome|firefox|ff] [--headless] [--allow-autoplay] [--proxy <url>] [--proxy-dns]
     \\      Launch a new browser with the given profile name.
     \\
     \\  ls [profile]
@@ -220,6 +220,7 @@ fn cmdLaunch(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
     var proxy: ?[]const u8 = null;
     var proxy_dns = false;
     var headless = false;
+    var allow_autoplay = false;
     var browser_type: hibrow.browser.BrowserType = .chrome;
     while (args.next()) |arg| {
         if (mem.eql(u8, arg, "--proxy")) {
@@ -231,6 +232,8 @@ fn cmdLaunch(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
             proxy_dns = true;
         } else if (mem.eql(u8, arg, "--headless")) {
             headless = true;
+        } else if (mem.eql(u8, arg, "--allow-autoplay")) {
+            allow_autoplay = true;
         } else if (mem.eql(u8, arg, "--browser")) {
             const bt_str = args.next() orelse {
                 writeStderr("Error: --browser requires an argument (chrome, firefox, ff)\n", .{});
@@ -256,6 +259,7 @@ fn cmdLaunch(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
         .proxy = proxy,
         .proxy_dns = proxy_dns,
         .headless = headless,
+        .allow_autoplay = allow_autoplay,
         .browser_type = browser_type,
     }) catch |err| {
         writeStderr("Error: launch failed: {s}\n", .{@errorName(err)});

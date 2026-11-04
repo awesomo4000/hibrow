@@ -9,6 +9,7 @@ All notable changes to hibrow will be documented in this file.
 - `wait` is now event-driven instead of polling. The browser evaluates a Promise backed by a `MutationObserver` that resolves the instant the selector reaches the desired presence (with a page-side timeout fallback), consumed via CDP `awaitPromise` on Chrome and `WebDriver:ExecuteAsyncScript` on Firefox. The gateway blocks on a single round trip rather than re-evaluating every 200ms, so `wait` returns the moment the DOM changes and right at the deadline on a genuine timeout
 
 ### Added
+- `launch --allow-autoplay` lets media play without a user gesture. On Chrome this passes `--autoplay-policy=no-user-gesture-required`, so `media play`, a scripted `element.play()`, and page `autoplay` actually start instead of staying paused under automation; it works headless or not, and is a no-op on Firefox (which already permits muted autoplay). Off by default, so an ordinary launched session never starts media on its own. The feature e2e suite launches with this flag and proves real playback — autoplay running, `currentTime` advancing while playing, and `wait-ended` firing after a seek to the end — against a multi-second in-page tone
 - Profile→(port, browser_type) resolution cache in the gateway, so warm commands skip the per-command process scan that dominated latency; a cheap TCP liveness probe validates a cached entry before use, and a dead or failed entry is evicted so a browser restart self-heals without a visible error. Warm command latency drops from ~100ms to ~15ms
 - `TCP_NODELAY` on gateway and browser sockets (`os.setTcpNoDelay`) to avoid Nagle/delayed-ACK stalls on the localhost request/response path
 - Cross-platform support: hibrow now runs on macOS, Linux, and Windows with an identical command surface. OS-specific code is contained behind `src/os.zig` (small shims) and `src/os_windows.zig` (Win32), so the rest of the codebase stays platform-neutral
@@ -24,7 +25,6 @@ All notable changes to hibrow will be documented in this file.
 - Browser process discovery and the home-directory lookup moved behind the `os` shims
 
 ### Fixed
-- `media play` and muted autoplay now actually play on Chrome. Chrome launches with `--autoplay-policy=no-user-gesture-required`, so a scripted `element.play()` is no longer treated as gesture-less and left paused; previously `media play` returned normally but the timeline never advanced under automation (Firefox already played). The feature e2e suite now proves real playback — muted autoplay running, `currentTime` advancing while playing, and `wait-ended` firing after a seek to the end — against a multi-second in-page tone
 - WebSocket `readFrame` double-free when the peer closes the connection mid-read
 
 ### Added (earlier, macOS)

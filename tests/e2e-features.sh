@@ -63,7 +63,9 @@ run_browser() {
     echo; echo "========== $browser =========="
     "$HIBROW" gateway stop >/dev/null 2>&1; sleep 1
 
-    "$HIBROW" launch "$P" --browser "$browser" --headless >/dev/null 2>&1 || { no "launch $browser" "launch failed"; return; }
+    # --allow-autoplay so the real-playback block below can start media without
+    # a user gesture (Chrome blocks scripted play otherwise; no-op on Firefox).
+    "$HIBROW" launch "$P" --browser "$browser" --headless --allow-autoplay >/dev/null 2>&1 || { no "launch $browser" "launch failed"; return; }
     ok "launch $browser --headless"
 
     # --- session listing + daemon status ---

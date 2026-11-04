@@ -69,6 +69,9 @@ pub const Client = struct {
         if (opts.headless) {
             try params.put(self.allocator, "headless", .{ .bool = true });
         }
+        if (opts.allow_autoplay) {
+            try params.put(self.allocator, "allow_autoplay", .{ .bool = true });
+        }
         if (opts.browser_type != .chrome) {
             try params.put(self.allocator, "browser_type", .{ .string = opts.browser_type.toString() });
         }
@@ -204,6 +207,7 @@ pub const LaunchOpts = struct {
     proxy: ?[]const u8 = null,
     proxy_dns: bool = false,
     headless: bool = false,
+    allow_autoplay: bool = false,
     browser_type: browser.BrowserType = .chrome,
 };
 
