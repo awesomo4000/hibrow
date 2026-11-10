@@ -30,6 +30,11 @@ run = "zig build test"
 
 [tasks.e2e]
 description = "Run the dual-browser (Chrome + Firefox) e2e feature tests"
+# Build first so the suite never runs against a stale binary. zig build is
+# incremental, so this is near-instant when nothing changed. The suite itself
+# stops any running gateway before each browser run, so the daemon is always
+# restarted from this freshly built binary rather than a lingering old one.
+depends = ["build"]
 run = "./tests/e2e-features.sh"
 
 [tasks.run]
