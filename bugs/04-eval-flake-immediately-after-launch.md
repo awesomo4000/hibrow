@@ -5,8 +5,9 @@
 **Date:** 11/10/2026
 **Severity:** Medium — the feature e2e suite is flaky; real scripts that launch and
 immediately drive a browser hit it too
-**Status:** Largely fixed (11/10/2026) — flaky suite runs dropped from ~1-in-2 to ~1-in-14;
-a rare client↔gateway residual remains (see below)
+**Status:** Largely fixed (11/10/2026) — flaky suite runs dropped from ~1-in-2 to ~1-in-12;
+the residual was re-diagnosed (frame/element readiness + one rare transport EOF), not the
+client↔gateway bug first guessed (see below)
 **Affected commands:** `eval`, `push`, `wait`, `text`, `click` — the first few commands
 after `launch` + `nav`, on both Chrome and Firefox
 
@@ -85,16 +86,40 @@ Two distinct causes were found and fixed; a third, rarer one remains.
 Measured on macOS: flaky full-suite runs went from roughly 5-6 of 12 (before) to **1 of
 14** (after).
 
-### Remaining (rarer) residual
+### Remaining residual — investigated, re-diagnosed
 
-The one failure still seen (~1 in 14 runs) is `Error: eval failed: UnexpectedEndOfInput`
-from the **client**, not the browser: the `eval failed:` prefix is the CLI wrapper around a
-Zig error from `client.eval` reading the gateway's reply, i.e. the gateway closed the
-client connection mid-response. That is the client↔gateway transport, a different layer
-from the CDP/Marionette caches this bug was about, so it is tracked here as the open tail
-of BUG-004 rather than fixed with the above. Next step: find where a handler can return
-before a complete response is written to the client socket (or where the framed read can
-end early), and make the gateway always write one complete response per request.
+After the two fixes the suite still flakes ~1 run in 12-14. An earlier guess — that the
+gateway closes the client connection mid-response — was **investigated and disproven**. The
+gateway's connection handler was instrumented to log every failure branch (failed
+request-read, empty request line, failed response-write) and the daemon's stderr captured
+across 24 real suite runs (with restarts) plus a persistent-gateway run. Findings:
+
+- **The gateway transport is clean.** Zero failure-branch logs across all 24 runs. The
+  gateway always read a request and wrote a complete response; it never closed early. So
+  the residual is *not* a client↔gateway bug, and "make the gateway always write one
+  complete response" was the wrong target.
+- **Most of the residual is frame/element readiness, surfaced by the test's own shape.**
+  The e2e fixtures `g.html` and `shadow.html` both start their state node as the literal
+  text `idle`. The failing checks (`click in frame`, `shadow >>> click`) run `click`
+  (discarding its output) then `eval` the state node. `click`/`clickInFrame` correctly
+  return `error.ElementNotFound` when the target is not present yet (a nested frame subtree
+  or shadow tree that has not finished loading), but the suite throws that away, so the
+  follow-up `eval` reads the unchanged initial `idle`. In other words these are clicks that
+  legitimately failed because the element was not ready, not wrong values from a desync.
+- **A rare genuine transport EOF remains unexplained.** One run in 24 showed `tab switch …
+  UnexpectedEndOfInput` with **no** gateway-side log — client read EOF although the gateway
+  recorded no failure. Single occurrence, mechanism not yet pinned.
+
+Next steps, in priority order:
+
+1. **Make `click` wait for its target** (bounded), like `wait` does, instead of failing
+   immediately when the element/frame is not ready — this removes the dominant residual and
+   is a real robustness win for scripts, not just the suite. (Design decision: `click`
+   currently fails fast; a wait changes that contract.)
+2. Separately, have the e2e not discard `click` output, so a failed click is reported as a
+   click failure rather than as a confusing stale-value read downstream.
+3. Chase the rare `tab switch` EOF with more instrumented runs if it recurs; one data point
+   is not enough to locate it.
 
 ### Verification
 
