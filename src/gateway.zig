@@ -407,6 +407,23 @@ pub const Server = struct {
         return &self.connections.getPtr(profile).?.conn;
     }
 
+    /// Run a CDP operation against the cached chrome connection, reconnecting
+    /// once if the cached socket has gone stale. Chrome can close a target's
+    /// websocket between commands (a tab closing, an idle teardown), leaving the
+    /// cached connection dead; the first use then fails with EOF
+    /// (`UnexpectedEndOfInput`). Rather than surface that as a command failure,
+    /// evict and retry once on a fresh connection. A second failure propagates.
+    /// `error.BrowserNotFound` means the browser could not be resolved at all.
+    fn chromeOp(self: *Server, profile: []const u8, ctx: OpCtx, comptime op: anytype) !OpPayload(@TypeOf(op)) {
+        const conn1 = self.getConnection(profile) orelse return error.BrowserNotFound;
+        if (op(conn1, ctx)) |r| return r else |_| self.evict(profile);
+        const conn2 = self.getConnection(profile) orelse return error.BrowserNotFound;
+        return op(conn2, ctx) catch |e| {
+            self.evict(profile);
+            return e;
+        };
+    }
+
     /// Evict a cached connection for a profile, closing the WebSocket.
     fn evictConnection(self: *Server, profile: []const u8) void {
         if (self.connections.fetchRemove(profile)) |kv| {
@@ -648,14 +665,9 @@ pub const Server = struct {
                 return self.ok(id, eval_result.value);
             },
             .chrome => {
-                const conn = self.getConnection(profile) orelse
-                    return self.fail(id, .browser_not_found, "Browser not found");
-                const eval_result = (if (frame) |f|
-                    conn.evalInFrame(f, expression)
-                else
-                    conn.eval(expression)) catch {
-                    self.evict(profile);
-                    return self.fail(id, .cdp_error, "Eval failed");
+                const eval_result = self.chromeOp(profile, .{ .expr = expression, .frame = frame }, opEval) catch |e| switch (e) {
+                    error.BrowserNotFound => return self.fail(id, .browser_not_found, "Browser not found"),
+                    else => return self.fail(id, .cdp_error, "Eval failed"),
                 };
                 if (eval_result.exception) |exc| {
                     defer self.allocator.free(exc);
@@ -684,11 +696,9 @@ pub const Server = struct {
                 return self.ok(id, frames);
             },
             .chrome => {
-                const conn = self.getConnection(profile) orelse
-                    return self.fail(id, .browser_not_found, "Browser not found");
-                const frames = conn.frameList() catch {
-                    self.evict(profile);
-                    return self.fail(id, .cdp_error, "frame list failed");
+                const frames = self.chromeOp(profile, .{}, opFrames) catch |e| switch (e) {
+                    error.BrowserNotFound => return self.fail(id, .browser_not_found, "Browser not found"),
+                    else => return self.fail(id, .cdp_error, "frame list failed"),
                 };
                 return self.ok(id, frames);
             },
@@ -718,11 +728,9 @@ pub const Server = struct {
                 return self.ok(id, .{ .string = "clicked" });
             },
             .chrome => {
-                const conn = self.getConnection(profile) orelse
-                    return self.fail(id, .browser_not_found, "Browser not found");
-                (if (frame) |f| conn.clickInFrame(f, selector) else conn.click(selector)) catch {
-                    self.evict(profile);
-                    return self.fail(id, .cdp_error, "Click failed (element not found?)");
+                self.chromeOp(profile, .{ .selector = selector, .frame = frame }, opClick) catch |e| switch (e) {
+                    error.BrowserNotFound => return self.fail(id, .browser_not_found, "Browser not found"),
+                    else => return self.fail(id, .cdp_error, "Click failed (element not found?)"),
                 };
                 return self.ok(id, .{ .string = "clicked" });
             },
@@ -758,11 +766,9 @@ pub const Server = struct {
                 return self.waitResult(id, res);
             },
             .chrome => {
-                const conn = self.getConnection(profile) orelse
-                    return self.fail(id, .browser_not_found, "Browser not found");
-                const res = (if (frame) |f| conn.evalAwaitInFrame(f, wait_expr) else conn.evalAwait(wait_expr)) catch {
-                    self.evict(profile);
-                    return self.fail(id, .cdp_error, "Wait failed");
+                const res = self.chromeOp(profile, .{ .expr = wait_expr, .frame = frame }, opWait) catch |e| switch (e) {
+                    error.BrowserNotFound => return self.fail(id, .browser_not_found, "Browser not found"),
+                    else => return self.fail(id, .cdp_error, "Wait failed"),
                 };
                 return self.waitResult(id, res);
             },
@@ -798,11 +804,9 @@ pub const Server = struct {
                     return self.fail(id, .cdp_error, "Navigate failed");
             },
             .chrome => {
-                const conn = self.getConnection(profile) orelse
-                    return self.fail(id, .browser_not_found, "Browser not found");
-                conn.navigate(url) catch {
-                    self.evict(profile);
-                    return self.fail(id, .cdp_error, "Navigate failed");
+                self.chromeOp(profile, .{ .url = url }, opNavigate) catch |e| switch (e) {
+                    error.BrowserNotFound => return self.fail(id, .browser_not_found, "Browser not found"),
+                    else => return self.fail(id, .cdp_error, "Navigate failed"),
                 };
             },
         }
@@ -916,11 +920,9 @@ pub const Server = struct {
                 return self.ok(id, .{ .string = url_str });
             },
             .chrome => {
-                const conn = self.getConnection(profile) orelse
-                    return self.fail(id, .browser_not_found, "Browser not found");
-                const url_str = conn.getUrl() catch {
-                    self.evict(profile);
-                    return self.fail(id, .cdp_error, "Could not get URL");
+                const url_str = self.chromeOp(profile, .{}, opUrl) catch |e| switch (e) {
+                    error.BrowserNotFound => return self.fail(id, .browser_not_found, "Browser not found"),
+                    else => return self.fail(id, .cdp_error, "Could not get URL"),
                 };
                 defer self.allocator.free(url_str);
                 return self.ok(id, .{ .string = url_str });
@@ -1181,11 +1183,9 @@ pub const Server = struct {
                 return self.ok(id, .{ .string = b64 });
             },
             .chrome => {
-                const conn = self.getConnection(profile) orelse
-                    return self.fail(id, .browser_not_found, "Browser not found");
-                const b64 = (if (frame) |f| conn.screenshotFrame(f) else conn.takeScreenshot()) catch {
-                    self.evict(profile);
-                    return self.fail(id, .cdp_error, "Screenshot failed");
+                const b64 = self.chromeOp(profile, .{ .frame = frame }, opScreenshot) catch |e| switch (e) {
+                    error.BrowserNotFound => return self.fail(id, .browser_not_found, "Browser not found"),
+                    else => return self.fail(id, .cdp_error, "Screenshot failed"),
                 };
                 defer self.allocator.free(b64);
                 return self.ok(id, .{ .string = b64 });
@@ -1415,6 +1415,46 @@ const BrowserInfo = struct {
     port: u16,
     browser_type: browser_mod.BrowserType,
 };
+
+/// Inputs any chrome connection op might need; each op reads only what it uses.
+/// An anonymous struct literal at the call site coerces to this, the unused
+/// fields taking their defaults.
+const OpCtx = struct {
+    expr: []const u8 = "",
+    selector: []const u8 = "",
+    url: []const u8 = "",
+    frame: ?[]const u8 = null,
+};
+
+/// Payload type T of an op with signature `fn (*cdp.Connection, OpCtx) !T`.
+fn OpPayload(comptime Op: type) type {
+    return @typeInfo(@typeInfo(Op).@"fn".return_type.?).error_union.payload;
+}
+
+// The chrome operations `chromeOp` can run with one stale-connection retry.
+fn opEval(conn: *cdp.Connection, ctx: OpCtx) !cdp.EvalResult {
+    return if (ctx.frame) |f| conn.evalInFrame(f, ctx.expr) else conn.eval(ctx.expr);
+}
+fn opWait(conn: *cdp.Connection, ctx: OpCtx) !cdp.EvalResult {
+    return if (ctx.frame) |f| conn.evalAwaitInFrame(f, ctx.expr) else conn.evalAwait(ctx.expr);
+}
+fn opFrames(conn: *cdp.Connection, ctx: OpCtx) !json.Value {
+    _ = ctx;
+    return conn.frameList();
+}
+fn opClick(conn: *cdp.Connection, ctx: OpCtx) !void {
+    return if (ctx.frame) |f| conn.clickInFrame(f, ctx.selector) else conn.click(ctx.selector);
+}
+fn opNavigate(conn: *cdp.Connection, ctx: OpCtx) !void {
+    return conn.navigate(ctx.url);
+}
+fn opUrl(conn: *cdp.Connection, ctx: OpCtx) ![]u8 {
+    _ = ctx;
+    return conn.getUrl();
+}
+fn opScreenshot(conn: *cdp.Connection, ctx: OpCtx) ![]const u8 {
+    return if (ctx.frame) |f| conn.screenshotFrame(f) else conn.takeScreenshot();
+}
 
 fn findBrowserInfo(allocator: mem.Allocator, io: std.Io, profile: []const u8) !?BrowserInfo {
     const browsers = try browser_mod.discover(allocator, io);

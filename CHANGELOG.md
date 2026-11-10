@@ -25,6 +25,15 @@ All notable changes to hibrow will be documented in this file.
 - Browser process discovery and the home-directory lookup moved behind the `os` shims
 
 ### Fixed
+- Commands issued right after `launch` are far more reliable, cutting the feature suite's
+  intermittent failures from roughly one run in two to about one in fourteen. Two causes:
+  (1) every Firefox command opened a fresh Marionette connection, and Marionette allows only
+  one session, so a not-yet-torn-down previous session made `NewSession` transiently fail —
+  `connect` now retries with a short backoff; (2) Chrome can close a target's websocket
+  between commands, and the gateway surfaced the first stale-socket `UnexpectedEndOfInput`
+  with no retry — all chrome connection ops now reconnect once on failure via a shared
+  `chromeOp` helper. (A rarer client↔gateway `UnexpectedEndOfInput` residual remains, tracked
+  in bugs/04.)
 - `kill` is now synchronous, fixing an intermittent failure where killing a profile and
   immediately relaunching it would fail with `Browser not found`. `Browser.close` / Marionette
   `quit` only *start* shutdown, so `kill` used to return while the browser was still alive and

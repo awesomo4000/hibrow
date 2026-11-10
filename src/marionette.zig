@@ -69,9 +69,39 @@ pub const Connection = struct {
         if (self.stream) |s| s.close(self.io);
     }
 
-    /// Connect to Firefox Marionette on the given port.
-    /// Reads the handshake and creates a session.
+    /// Connect to Firefox Marionette on the given port. Reads the handshake and
+    /// creates a session.
+    ///
+    /// Each gateway command opens a fresh connection, and Marionette allows only
+    /// one session at a time: if the previous command's socket has not finished
+    /// tearing its session down, `NewSession` (or the connect itself) transiently
+    /// fails. A single attempt surfaced that as "Marionette connection failed".
+    /// Retry a few times with a short backoff so the teardown can complete.
     pub fn connect(self: *Connection, port: u16) !void {
+        const max_attempts: u8 = 6;
+        var attempt: u8 = 0;
+        while (true) {
+            attempt += 1;
+            self.connectOnce(port) catch |err| {
+                // Drop any partial state before the next attempt.
+                if (self.session_id) |sid| {
+                    self.allocator.free(sid);
+                    self.session_id = null;
+                }
+                if (self.stream) |s| {
+                    s.close(self.io);
+                    self.stream = null;
+                }
+                if (attempt >= max_attempts) return err;
+                os.sleepMs(@as(u64, 40) * attempt);
+                continue;
+            };
+            return;
+        }
+    }
+
+    /// One connect attempt: TCP connect, handshake, session.
+    fn connectOnce(self: *Connection, port: u16) !void {
         var addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
         self.stream = try addr.connect(self.io, .{ .mode = .stream });
         os.setTcpNoDelay(self.stream.?);
