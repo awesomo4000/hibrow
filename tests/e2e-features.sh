@@ -12,6 +12,16 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 HIBROW="$REPO/zig-out/bin/hibrow"
 [ -x "$HIBROW" ] || HIBROW="$HIBROW.exe"   # Windows build produces hibrow.exe
 
+# `mise run e2e` builds first (zig is mise-managed and not on PATH here, so the
+# script cannot build itself). mise sets MISE_TASK_NAME when running a task — it
+# is empty on a direct ./tests/e2e-features.sh invocation, and stays empty even in
+# a mise-activated shell since only task execution sets it. Warn when standalone so
+# a stale binary cannot masquerade as a passing run.
+if [ -z "${MISE_TASK_NAME:-}" ]; then
+    printf '\033[33mnote:\033[0m not run via mise — testing the existing binary without rebuilding (%s).\n' "$HIBROW" >&2
+    printf '      run \x27mise run e2e\x27 to build first if you changed the source.\n' >&2
+fi
+
 # Browsers need a real file: URL. Under Git Bash the repo path is /c/..., which
 # no Windows browser resolves; cygpath -m rewrites it to C:/... form. Elsewhere
 # the repo path is already absolute and usable as-is.
