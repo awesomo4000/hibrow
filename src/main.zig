@@ -47,9 +47,10 @@ const usage =
     \\      Evaluate JavaScript inside a nested frame. Path is comma/slash-
     \\      separated frame indices and/or CSS selectors, e.g. 1,0,0 or #inner.
     \\
-    \\  click <profile[:tab]> <selector> [--frame <path>]
-    \\      Trusted click of an element (scrolls into view). Selector may pierce
-    \\      open shadow roots with >>> (e.g. "#host >>> .btn"). Frame via --frame.
+    \\  click <profile[:tab]> <selector> [--frame <path>] [--timeout <secs>]
+    \\      Trusted click of an element (scrolls into view). Waits up to --timeout
+    \\      (default 5s) for the element to appear. Selector may pierce open shadow
+    \\      roots with >>> (e.g. "#host >>> .btn"). Frame via --frame.
     \\
     \\  wait <profile[:tab]> <selector> [--frame <path>] [--timeout <secs>] [--gone]
     \\      Poll until a selector appears (or disappears with --gone). Default
@@ -354,12 +355,23 @@ fn cmdClick(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
 
     var selector: ?[]const u8 = null;
     var frame: ?[]const u8 = null;
+    var timeout_ms: i64 = 5000;
     while (args.next()) |a| {
         if (mem.eql(u8, a, "--frame")) {
             frame = args.next() orelse {
                 writeStderr("Error: --frame requires a selector or path\n", .{});
                 std.process.exit(1);
             };
+        } else if (mem.eql(u8, a, "--timeout")) {
+            const s = args.next() orelse {
+                writeStderr("Error: --timeout requires seconds\n", .{});
+                std.process.exit(1);
+            };
+            const secs = std.fmt.parseFloat(f64, s) catch {
+                writeStderr("Error: --timeout must be a number of seconds\n", .{});
+                std.process.exit(1);
+            };
+            timeout_ms = @intFromFloat(secs * 1000.0);
         } else {
             selector = a;
         }
@@ -375,7 +387,7 @@ fn cmdClick(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
     };
     defer client.disconnect();
 
-    var resp = client.click(profile, sel, frame) catch |err| {
+    var resp = client.click(profile, sel, frame, timeout_ms) catch |err| {
         writeStderr("Error: click failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };

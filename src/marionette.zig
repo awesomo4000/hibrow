@@ -454,7 +454,17 @@ pub const Connection = struct {
         return uuid;
     }
 
-    pub fn clickElement(self: *Connection, selector: []const u8) !void {
+    pub fn clickElement(self: *Connection, selector: []const u8, timeout_ms: i64) !void {
+        // Let FindElement (and the shadow-root hops) wait for the target instead
+        // of failing the instant it is missing — Marionette's native implicit
+        // wait, the Firefox equivalent of the Chrome rect-wait.
+        {
+            var tp: json.ObjectMap = .empty;
+            defer tp.deinit(self.allocator);
+            try tp.put(self.allocator, "implicit", .{ .integer = timeout_ms });
+            var tr = try self.send("WebDriver:SetTimeouts", .{ .object = tp });
+            tr.deinit();
+        }
         const uuid = try self.resolveElementUuid(selector);
         defer self.allocator.free(uuid);
 

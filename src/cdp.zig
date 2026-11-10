@@ -197,6 +197,28 @@ fn deepRectExpr(allocator: mem.Allocator, selector: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ prefix, sel_json, suffix });
 }
 
+/// Like deepRectExpr, but returns a Promise that resolves to the element's
+/// `[x,y,w,h]` rect once the selector (shadow-piercing with `>>>`) matches, or
+/// to null after `timeout_ms`. A MutationObserver fires the instant the element
+/// appears, so a click waits out a not-yet-ready frame/shadow subtree instead of
+/// failing immediately. Awaited via CDP awaitPromise, so there is no gateway-side
+/// polling; when the element is already present it resolves on the first check.
+fn deepRectWaitExpr(allocator: mem.Allocator, selector: []const u8, timeout_ms: i64) ![]u8 {
+    const sel_json = try json.Stringify.valueAlloc(allocator, json.Value{ .string = selector }, .{});
+    defer allocator.free(sel_json);
+    return std.fmt.allocPrint(allocator, "(function(){{return new Promise(function(resolve){{" ++
+        "var sel={s};" ++
+        "function rectOf(){{var parts=sel.split('>>>'),root=document,el=null;" ++
+        "for(var i=0;i<parts.length;i++){{el=root.querySelector(parts[i].trim());if(!el)return null;" ++
+        "if(i<parts.length-1){{if(!el.shadowRoot)return null;root=el.shadowRoot;}}}}" ++
+        "el.scrollIntoView({{block:'center'}});var r=el.getBoundingClientRect();return [r.left,r.top,r.width,r.height];}}" ++
+        "var hit=rectOf();if(hit){{resolve(hit);return;}}" ++
+        "var t;var obs=new MutationObserver(function(){{var h=rectOf();if(h){{obs.disconnect();clearTimeout(t);resolve(h);}}}});" ++
+        "obs.observe(document.documentElement||document,{{childList:true,subtree:true,attributes:true}});" ++
+        "t=setTimeout(function(){{obs.disconnect();resolve(null);}},{d});" ++
+        "}});}})()", .{ sel_json, timeout_ms });
+}
+
 /// Extract a [x,y,w,h] rect from a JSON array value, or null.
 fn rectFromValue(v: json.Value) ?Rect {
     if (v != .array or v.array.items.len < 4) return null;
@@ -681,10 +703,11 @@ pub const Connection = struct {
 
     /// Click the element matching `selector` (may pierce open shadow roots with
     /// `>>>`) in the top frame — a trusted input-level click.
-    pub fn click(self: *Connection, selector: []const u8) !void {
-        const expr = try deepRectExpr(self.allocator, selector);
+    pub fn click(self: *Connection, selector: []const u8, timeout_ms: i64) !void {
+        const expr = try deepRectWaitExpr(self.allocator, selector, timeout_ms);
         defer self.allocator.free(expr);
-        const r = try self.eval(expr);
+        const r = try self.evalAwait(expr);
+        if (r.exception) |e| self.allocator.free(e);
         const rect = rectFromValue(r.value) orelse return error.ElementNotFound;
         try self.dispatchClickAt(rect.x + rect.w / 2, rect.y + rect.h / 2);
     }
@@ -692,14 +715,15 @@ pub const Connection = struct {
     /// Click the element matching `selector` inside a nested frame — a trusted
     /// input-level click, dispatched at the element's top-level coordinates
     /// (frame offset + element rect), which also works for OOPIF frames.
-    pub fn clickInFrame(self: *Connection, frame_path: []const u8, selector: []const u8) !void {
+    pub fn clickInFrame(self: *Connection, frame_path: []const u8, selector: []const u8, timeout_ms: i64) !void {
         const foff = try self.resolveFrameRect(frame_path);
         var target = try self.resolveFrameTarget(frame_path);
         defer target.deinit(self.allocator);
         const ctx = try self.createIsolatedWorld(target.frame_id, target.session);
-        const expr = try deepRectExpr(self.allocator, selector);
+        const expr = try deepRectWaitExpr(self.allocator, selector, timeout_ms);
         defer self.allocator.free(expr);
-        const r = try self.evalInContext(ctx, expr, target.session, false);
+        const r = try self.evalInContext(ctx, expr, target.session, true);
+        if (r.exception) |e| self.allocator.free(e);
         const rect = rectFromValue(r.value) orelse return error.ElementNotFound;
         try self.dispatchClickAt(foff.x + rect.x + rect.w / 2, foff.y + rect.y + rect.h / 2);
     }

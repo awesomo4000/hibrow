@@ -24,6 +24,15 @@ All notable changes to hibrow will be documented in this file.
 - Gateway socket I/O routed through `os.sockRead` / `os.sockWriteAll` so the transport is shared across platforms
 - Browser process discovery and the home-directory lookup moved behind the `os` shims
 
+### Changed
+- `click` now waits for its target to appear (up to `--timeout`, default 5s) instead of failing
+  the instant it is missing — standard automation auto-waiting, so a click rides out a
+  not-yet-ready frame or shadow subtree. On Chrome it awaits a page-side MutationObserver that
+  resolves with the element's rect the moment it matches (no gateway polling, zero added latency
+  when the element is already present); on Firefox it uses Marionette's native implicit wait. The
+  stale-connection retry no longer re-runs a `click` that legitimately found nothing, so a genuine
+  miss still fails in one timeout, not two
+
 ### Fixed
 - Commands issued right after `launch` are far more reliable, cutting the feature suite's
   intermittent failures from roughly one run in two to about one in fourteen. Two causes:

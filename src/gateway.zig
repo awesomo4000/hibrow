@@ -416,7 +416,14 @@ pub const Server = struct {
     /// `error.BrowserNotFound` means the browser could not be resolved at all.
     fn chromeOp(self: *Server, profile: []const u8, ctx: OpCtx, comptime op: anytype) !OpPayload(@TypeOf(op)) {
         const conn1 = self.getConnection(profile) orelse return error.BrowserNotFound;
-        if (op(conn1, ctx)) |r| return r else |_| self.evict(profile);
+        if (op(conn1, ctx)) |r| return r else |e| {
+            // Only a stale/broken connection is worth a reconnect-and-retry. An
+            // application result like "element not found" will come back the same
+            // on a fresh connection, and for a waiting op (click) retrying would
+            // repeat the whole timeout — so surface those immediately.
+            if (!isTransientConnError(e)) return e;
+            self.evict(profile);
+        }
         const conn2 = self.getConnection(profile) orelse return error.BrowserNotFound;
         return op(conn2, ctx) catch |e| {
             self.evict(profile);
@@ -711,6 +718,9 @@ pub const Server = struct {
         const selector = extractStringParam(params, "selector") orelse
             return self.fail(id, .invalid_params, "Missing 'selector' parameter");
         const frame = extractStringParam(params, "frame");
+        // How long to wait for the target to appear before failing. Defaults to
+        // 5s so a click rides out a not-yet-ready frame/shadow subtree.
+        const timeout_ms: i64 = extractIntParam(params, "timeout_ms") orelse 5000;
 
         const info = try self.resolveBrowser(profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
@@ -723,12 +733,12 @@ pub const Server = struct {
                     return self.fail(id, .cdp_error, "Marionette connection failed");
                 if (frame) |f| conn.switchToFramePath(f) catch
                     return self.fail(id, .cdp_error, "Frame not found");
-                conn.clickElement(selector) catch
+                conn.clickElement(selector, timeout_ms) catch
                     return self.fail(id, .cdp_error, "Click failed (element not found?)");
                 return self.ok(id, .{ .string = "clicked" });
             },
             .chrome => {
-                self.chromeOp(profile, .{ .selector = selector, .frame = frame }, opClick) catch |e| switch (e) {
+                self.chromeOp(profile, .{ .selector = selector, .frame = frame, .timeout_ms = timeout_ms }, opClick) catch |e| switch (e) {
                     error.BrowserNotFound => return self.fail(id, .browser_not_found, "Browser not found"),
                     else => return self.fail(id, .cdp_error, "Click failed (element not found?)"),
                 };
@@ -1424,11 +1434,30 @@ const OpCtx = struct {
     selector: []const u8 = "",
     url: []const u8 = "",
     frame: ?[]const u8 = null,
+    timeout_ms: i64 = 5000,
 };
 
 /// Payload type T of an op with signature `fn (*cdp.Connection, OpCtx) !T`.
 fn OpPayload(comptime Op: type) type {
     return @typeInfo(@typeInfo(Op).@"fn".return_type.?).error_union.payload;
+}
+
+/// Whether an op error means the cached connection is broken (so a reconnect may
+/// help) rather than a real result from the browser. Only these are worth the
+/// chromeOp reconnect-and-retry; application errors like ElementNotFound are
+/// returned as-is so a waiting op is not run a second time for its full timeout.
+fn isTransientConnError(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectionClosed,
+        error.NotConnected,
+        error.ConnectionResetByPeer,
+        error.BrokenPipe,
+        error.EndOfStream,
+        error.UnexpectedEndOfInput,
+        error.WriteFailed,
+        => true,
+        else => false,
+    };
 }
 
 // The chrome operations `chromeOp` can run with one stale-connection retry.
@@ -1443,7 +1472,7 @@ fn opFrames(conn: *cdp.Connection, ctx: OpCtx) !json.Value {
     return conn.frameList();
 }
 fn opClick(conn: *cdp.Connection, ctx: OpCtx) !void {
-    return if (ctx.frame) |f| conn.clickInFrame(f, ctx.selector) else conn.click(ctx.selector);
+    return if (ctx.frame) |f| conn.clickInFrame(f, ctx.selector, ctx.timeout_ms) else conn.click(ctx.selector, ctx.timeout_ms);
 }
 fn opNavigate(conn: *cdp.Connection, ctx: OpCtx) !void {
     return conn.navigate(ctx.url);

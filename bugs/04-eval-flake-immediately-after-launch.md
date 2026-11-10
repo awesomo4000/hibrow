@@ -5,9 +5,10 @@
 **Date:** 11/10/2026
 **Severity:** Medium — the feature e2e suite is flaky; real scripts that launch and
 immediately drive a browser hit it too
-**Status:** Largely fixed (11/10/2026) — flaky suite runs dropped from ~1-in-2 to ~1-in-12;
-the residual was re-diagnosed (frame/element readiness + one rare transport EOF), not the
-client↔gateway bug first guessed (see below)
+**Status:** Largely fixed (11/10/2026) — flaky suite runs dropped from ~1-in-2 to ~1-in-18.
+Fixes: Marionette connect-retry, chrome stale-socket retry, and `click` auto-wait. The
+remaining residual is now tab lifecycle (`tab new`/`tab switch`), not click or transport
+(see below)
 **Affected commands:** `eval`, `push`, `wait`, `text`, `click` — the first few commands
 after `launch` + `nav`, on both Chrome and Firefox
 
@@ -112,14 +113,19 @@ across 24 real suite runs (with restarts) plus a persistent-gateway run. Finding
 
 Next steps, in priority order:
 
-1. **Make `click` wait for its target** (bounded), like `wait` does, instead of failing
-   immediately when the element/frame is not ready — this removes the dominant residual and
-   is a real robustness win for scripts, not just the suite. (Design decision: `click`
-   currently fails fast; a wait changes that contract.)
+1. **Make `click` wait for its target** — **done.** `click`/`clickInFrame` now wait up to
+   `--timeout` (default 5s) for the element: Chrome awaits a page-side MutationObserver that
+   resolves with the element's rect the instant it matches; Firefox uses Marionette's native
+   implicit wait. The `chromeOp` retry was also narrowed to transient connection errors so a
+   genuine miss fails in one timeout, not two. Measured effect: flaky suite runs dropped from
+   ~1-in-12 to ~1-in-18, and the frame/shadow `click` failures no longer appear.
 2. Separately, have the e2e not discard `click` output, so a failed click is reported as a
-   click failure rather than as a confusing stale-value read downstream.
-3. Chase the rare `tab switch` EOF with more instrumented runs if it recurs; one data point
-   is not enough to locate it.
+   click failure rather than as a confusing stale-value read downstream. (Still open.)
+3. **Remaining residual is now tab lifecycle, not click.** The failures still seen (~1 in 18)
+   are `tab new adds a tab` returning a count of 1 instead of 2, and the earlier rare `tab
+   switch … UnexpectedEndOfInput` — i.e. `tab.new`/`tab.switch` occasionally not taking
+   effect or racing the count read. Next: instrument the tab handlers (CDP `Target.createTarget`
+   / target-list timing) to see whether the new target is not yet listed when the count is read.
 
 ### Verification
 

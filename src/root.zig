@@ -97,12 +97,13 @@ pub const Client = struct {
     }
 
     /// Natively click an element (optionally inside a frame).
-    pub fn click(self: *Client, profile: []const u8, selector: []const u8, frame: ?[]const u8) !gateway.ParsedResponse {
+    pub fn click(self: *Client, profile: []const u8, selector: []const u8, frame: ?[]const u8, timeout_ms: i64) !gateway.ParsedResponse {
         var params: json.ObjectMap = .empty;
         defer params.deinit(self.allocator);
         try params.put(self.allocator, "profile", .{ .string = profile });
         try params.put(self.allocator, "selector", .{ .string = selector });
         if (frame) |f| try params.put(self.allocator, "frame", .{ .string = f });
+        try params.put(self.allocator, "timeout_ms", .{ .integer = timeout_ms });
         return self.gw.call("browser.click", .{ .object = params });
     }
 
