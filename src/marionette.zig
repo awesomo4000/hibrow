@@ -44,6 +44,22 @@ pub const MarionetteResult = struct {
     pub fn deinit(self: *MarionetteResult) void {
         self.parsed.deinit();
     }
+
+    /// The most informative error string available, duped into caller-owned memory.
+    /// Marionette's error object is {error, message, stacktrace}; `err` holds only the
+    /// category ("javascript error"), while `message` carries the real diagnostic
+    /// ("ReferenceError: foo is not defined"). Prefer `message`, fall back to the category.
+    pub fn errorMessage(self: *MarionetteResult, allocator: mem.Allocator) ![]u8 {
+        const category = self.err orelse "error";
+        if (self.result == .object) {
+            if (self.result.object.get("message")) |m| {
+                if (m == .string and m.string.len > 0) {
+                    return allocator.dupe(u8, m.string);
+                }
+            }
+        }
+        return allocator.dupe(u8, category);
+    }
 };
 
 /// Eval result matching cdp.EvalResult interface.
@@ -250,8 +266,8 @@ pub const Connection = struct {
         var result = try self.send("WebDriver:ExecuteScript", .{ .object = params });
         defer result.deinit();
 
-        if (result.err) |e| {
-            return .{ .exception = try self.allocator.dupe(u8, e) };
+        if (result.err) |_| {
+            return .{ .exception = try result.errorMessage(self.allocator) };
         }
 
         // Marionette returns {"value": <result>}
@@ -302,8 +318,8 @@ pub const Connection = struct {
         var result = try self.send("WebDriver:ExecuteAsyncScript", .{ .object = params });
         defer result.deinit();
 
-        if (result.err) |e| {
-            return .{ .exception = try self.allocator.dupe(u8, e) };
+        if (result.err) |_| {
+            return .{ .exception = try result.errorMessage(self.allocator) };
         }
         if (result.result == .object) {
             if (result.result.object.get("value")) |val| {

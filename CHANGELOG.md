@@ -34,6 +34,15 @@ All notable changes to hibrow will be documented in this file.
   miss still fails in one timeout, not two
 
 ### Fixed
+- `eval` now surfaces the actual error message instead of a bare category. A failing
+  expression used to return `Uncaught` (Chrome) or `javascript error` (Firefox) for every
+  error — a typo, a null-deref, and a syntax error were indistinguishable. Both engines
+  carry the real diagnostic in a secondary field that the parser ignored: Chrome in
+  `exceptionDetails.exception.description` / `.value` (only `.text`, always `"Uncaught"`,
+  was read), Firefox in the error object's `message` (only the `error` category was read).
+  Now `eval nonexistentVar123` reports `Uncaught ReferenceError: nonexistentVar123 is not
+  defined`, and thrown primitives (`throw 42`, `throw "oops"`) keep their value. The feature
+  e2e suite asserts this on both engines
 - Commands issued right after `launch` are far more reliable, cutting the feature suite's
   intermittent failures from roughly one run in two to about one in fourteen. Two causes:
   (1) every Firefox command opened a fresh Marionette connection, and Marionette allows only

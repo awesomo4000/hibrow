@@ -467,10 +467,39 @@ pub const Connection = struct {
             const result_obj = result.object;
             if (result_obj.get("exceptionDetails")) |exception| {
                 if (exception == .object) {
-                    if (exception.object.get("text")) |text| {
-                        if (text == .string) {
-                            return .{ .exception = try self.allocator.dupe(u8, text.string) };
+                    const ed = exception.object;
+                    // `text` is only the generic "Uncaught" prefix; the actual diagnostic
+                    // (e.g. "ReferenceError: foo is not defined") lives in
+                    // exception.description — present for thrown Errors and for thrown
+                    // primitives alike. Combine them the way the DevTools console does,
+                    // keeping just the first line of the description (dropping the stack).
+                    const prefix = if (ed.get("text")) |t|
+                        (if (t == .string) t.string else "Uncaught")
+                    else
+                        "Uncaught";
+                    if (ed.get("exception")) |exc| {
+                        if (exc == .object) {
+                            if (exc.object.get("description")) |desc| {
+                                if (desc == .string) {
+                                    const line = desc.string[0 .. mem.indexOfScalar(u8, desc.string, '\n') orelse desc.string.len];
+                                    return .{ .exception = try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ prefix, line }) };
+                                }
+                            }
+                            // A thrown primitive (e.g. `throw "oops"`) has a value but no
+                            // description — surface the value so it is not lost.
+                            if (exc.object.get("value")) |v| {
+                                if (v == .string) {
+                                    return .{ .exception = try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ prefix, v.string }) };
+                                }
+                                const vbytes = try json.Stringify.valueAlloc(self.allocator, v, .{});
+                                defer self.allocator.free(vbytes);
+                                return .{ .exception = try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ prefix, vbytes }) };
+                            }
                         }
+                    }
+                    // No rich exception object (rare): fall back to the bare text.
+                    if (ed.get("text")) |t| {
+                        if (t == .string) return .{ .exception = try self.allocator.dupe(u8, t.string) };
                     }
                 }
                 return .{ .exception = try self.allocator.dupe(u8, "Unknown exception") };

@@ -77,6 +77,10 @@ run_browser() {
     "$HIBROW" nav "$P" "$FRAMES" >/dev/null 2>&1   # nav waits for load; no sleep needed
     eq "eval returns value"        "$("$HIBROW" eval "$P" '1+1' 2>&1)" "2"
     eq "eval reads top DOM"        "$("$HIBROW" eval "$P" "document.querySelector('#top').innerText" 2>&1)" '"TOP"'
+    # A thrown error must surface its real message, not a bare category. Both engines
+    # include the error type and the offending identifier (chrome prefixes "Uncaught").
+    contains "eval surfaces error msg" "$("$HIBROW" eval "$P" 'nonexistentVar123' 2>&1)" "ReferenceError"
+    contains "eval error names ident"  "$("$HIBROW" eval "$P" 'nonexistentVar123' 2>&1)" "nonexistentVar123"
     contains "url reports location" "$("$HIBROW" url "$P" 2>&1)" "frames/top.html"
 
     # --- push: plain input + window variable ---
