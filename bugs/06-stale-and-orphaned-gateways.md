@@ -5,11 +5,13 @@
 **Date:** 11/10/2026
 **Severity:** Medium. After a rebuild or upgrade, commands silently run the old gateway
 code, so fixed bugs appear unfixed. Orphaned daemons pile up and are never reclaimed.
-**Status:** Partially fixed (11/10/2026). The stale-gateway half is addressed: the CLI now
-warns (on stderr, once per invocation) when the running gateway was built from a different
-hibrow binary than the CLI. Warn-only by deliberate choice — the gateway keeps running and
-keeps its browsers; the user decides whether to restart it. The orphaned-gateway half
-(socket-steal race) is still open — see "Remaining" below.
+**Status:** Fixed (11/10/2026). Two parts:
+- **Stale gateway** — the CLI warns (on stderr, once per invocation) when the running gateway
+  was built from a different hibrow binary than the CLI. Warn-only by deliberate choice: the
+  gateway keeps running and keeps its browsers; the user decides whether to restart it.
+- **Orphaned gateways** — a serving daemon now holds an exclusive advisory lock on
+  `gateway.lock` for its lifetime, so at most one daemon ever owns the socket; losers of the
+  startup race exit cleanly instead of stealing the socket. See "Fix applied" below.
 **Affected commands:** every command that goes through the gateway; `gateway serve`
 (auto-start)
 
@@ -76,21 +78,32 @@ Implemented differently from the round-trip sketch below, and simpler:
    exactly what must not happen. The note tells the user to run `hibrow gateway stop` if they
    want the new build; the choice stays theirs.
 
-### Remaining — orphaned gateways (socket-steal race), still open
+### Fix applied — orphaned gateways (singleton lock)
 
-The sketch below for this half still stands:
+`serve` now takes an exclusive advisory lock (`std.Io.Dir.createFileAbsolute` with
+`lock = .exclusive, lock_nonblocking = true`) on `gateway.lock` in the runtime dir before
+it touches the socket, and holds it (the open `File`) for the daemon's lifetime. The OS
+releases the lock when the process closes the file or exits — even on a crash — so a dead
+daemon never blocks the next one.
 
-1. **Never steal a live socket.** In `serve`, before deleting the socket file, try to
-   connect to it. If something answers, exit with "gateway already running (pid N)"
-   instead of unlinking it. To close the race between two daemons starting at once, take
-   an exclusive lock (`flock`) on a lock file in the runtime directory. Hold it for the
-   daemon's lifetime, and only delete or bind the socket while holding it. The loser of
-   the race exits, and its client connects to the winner.
+- **Lock acquired:** we are the sole owner. Any socket file present is a dead daemon's
+  leftover, so removing it cannot steal a live socket. Bind and serve.
+- **Lock held by someone else** (`error.WouldBlock`): a daemon already owns the socket.
+  `serve` returns `error.GatewayAlreadyRunning` without deleting anything; `gateway serve`
+  prints "gateway already running" and exits 0. A lost auto-start race ends here, and the
+  client connects to the winner.
 
-2. **Make `gateway stop` find stragglers.** Optionally have `gateway status` or
-   `gateway stop --all` report or stop other `hibrow gateway serve` processes for this
-   user that are not the one bound to the socket. With (1) in place none should exist,
-   but this cleans up ones left by older builds.
+Two subtleties that had to be right:
+- `self.socket_path` is assigned **only after** the lock is won. A loser must not own the
+  path, or its `deinit` would delete the live winner's socket file and wedge it (daemon
+  alive, no socket, holding the lock — found in testing).
+- The client's auto-start poll re-forks `gateway serve` about once a second while waiting,
+  so a fork that lost the race to a daemon that was *shutting down* (its lock briefly held)
+  is retried once the lock frees, instead of giving up with `GatewayStartFailed`.
+
+Still optional, not done: a `gateway stop --all` to reap stragglers left by builds from
+before this fix. With the lock in place no new orphans are created, so this is only cleanup
+for pre-existing ones (a reboot or manual kill also clears them).
 
 ### Verification
 
@@ -106,14 +119,20 @@ mise run build && cp zig-out/bin/hibrow /tmp/hibB      # build B (different buil
 /tmp/hibA eval p "1+1"                                  # no note (same build)
 ```
 
-Orphaned gateways (remaining):
+Orphaned gateways (done):
 
 ```bash
 # 1. No orphans from concurrent auto-start
 hibrow gateway stop
-for i in $(seq 1 8); do hibrow ls >/dev/null & done; wait
+for i in $(seq 1 10); do hibrow ls >/dev/null & done; wait
 pgrep -f "hibrow gateway serve" | wc -l            # expect 1
 
-# 2. Manual second serve refuses
-hibrow gateway serve; echo $?                      # non-zero, "already running"
+# 2. Manual second serve refuses cleanly
+hibrow gateway serve                               # prints "gateway already running", exits 0
+
+# 3. A hard-killed daemon leaves a stale lock; the next command still starts
+kill -9 "$(pgrep -f 'hibrow gateway serve')"; hibrow ls >/dev/null   # works (new daemon)
+
+# 4. Rapid stop/launch cycles never wedge
+for i in $(seq 1 15); do hibrow gateway stop; hibrow ls >/dev/null; done   # all succeed, 1 daemon
 ```

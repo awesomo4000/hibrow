@@ -35,6 +35,7 @@ All notable changes to hibrow will be documented in this file.
   miss still fails in one timeout, not two
 
 ### Fixed
+- Gateway daemons no longer orphan each other. `gateway serve` used to unconditionally delete the socket file before binding, so two daemons starting at once (two commands both auto-starting one, a manual `gateway serve`, a transient connect failure) would have the second steal the socket path while the first kept running unreachable — orphans that pile up until reboot. A serving daemon now holds an exclusive advisory lock on `gateway.lock` for its lifetime (released on exit, even a crash), so at most one owns the socket; a daemon that loses the startup race exits cleanly with "gateway already running" instead of stealing the socket, and the client connects to the winner. A hard-killed daemon leaves only a stale lock that the next daemon reclaims
 - `eval` now surfaces the actual error message instead of a bare category. A failing
   expression used to return `Uncaught` (Chrome) or `javascript error` (Firefox) for every
   error — a typo, a null-deref, and a syntax error were indistinguishable. Both engines

@@ -1220,6 +1220,12 @@ fn cmdGateway(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
         var server = hibrow.gateway.Server.init(allocator, g_io);
         defer server.deinit();
         server.serve() catch |err| {
+            if (err == error.GatewayAlreadyRunning) {
+                // Another daemon already owns the socket — not an error. The common
+                // path here is a lost auto-start race; the client uses the winner.
+                writeStderr("gateway already running\n", .{});
+                return;
+            }
             writeStderr("Error: gateway serve failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };

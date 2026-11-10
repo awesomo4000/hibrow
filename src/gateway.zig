@@ -47,6 +47,9 @@ const socket_filename = "gateway.sock";
 /// PID filename within the per-user directory.
 const pid_filename = "gateway.pid";
 
+/// Singleton lock filename within the per-user directory.
+const lock_filename = "gateway.lock";
+
 /// Read buffer size for socket I/O.
 const read_buf_size = 8192;
 
@@ -116,13 +119,18 @@ pub const Client = struct {
         // Auto-start daemon and retry
         try autoStartDaemon(io);
 
-        // Poll for the socket to appear (up to 5 seconds)
+        // Poll for the socket to appear (up to 5 seconds).
         var attempts: u32 = 0;
         while (attempts < 50) : (attempts += 1) {
             sleepMs(100);
             if (connectToSocket(io, socket_path)) |stream| {
                 return .{ .allocator = allocator, .io = io, .stream = stream };
             } else |_| {}
+            // Re-attempt auto-start roughly every second: our first fork may have
+            // lost a race to a daemon that was shutting down (its singleton lock
+            // briefly held) and then exited on WouldBlock, so no socket appears.
+            // Once the lock frees, a later fork becomes the daemon.
+            if (attempts % 10 == 9) autoStartDaemon(io) catch {};
         }
 
         return error.GatewayStartFailed;
@@ -214,6 +222,10 @@ pub const Server = struct {
     io: std.Io,
     listener: ?std.Io.net.Server = null,
     socket_path: ?[]u8 = null,
+    /// Exclusive lock held for the daemon's lifetime; released on close/exit so a
+    /// dead daemon never blocks the next. Its path is kept to free on deinit.
+    lock_file: ?std.Io.File = null,
+    lock_path: ?[]u8 = null,
     running: bool = false,
     /// Cached CDP connections keyed by profile name (owned strings).
     connections: std.StringHashMap(ProfileConn),
@@ -253,12 +265,19 @@ pub const Server = struct {
             std.Io.Dir.deleteFileAbsolute(self.io, p) catch {};
             self.allocator.free(p);
         }
+        // Release the singleton lock (closing the file drops the lock). Leave the
+        // lock file in place — deleting it could race a daemon that just opened it.
+        if (self.lock_file) |*f| f.close(self.io);
+        if (self.lock_path) |p| self.allocator.free(p);
     }
 
     /// Start listening and serving requests. Blocks until shutdown() is called.
     pub fn serve(self: *Server) !void {
+        // Keep the socket path local until we actually own the lock. If we do NOT
+        // own it (another daemon is running), self.socket_path must stay null, or
+        // deinit would delete the live owner's socket file and wedge it.
         const sock_path = try getSocketPath(self.allocator);
-        self.socket_path = sock_path;
+        errdefer if (self.socket_path == null) self.allocator.free(sock_path);
 
         // Ensure socket directory exists
         const sock_dir = try getSocketDir(self.allocator);
@@ -267,7 +286,26 @@ pub const Server = struct {
             if (err != error.PathAlreadyExists) return err;
         };
 
-        // Remove stale socket file if it exists
+        // Acquire the singleton lock before touching the socket. Exactly one daemon
+        // can hold this exclusive advisory lock; it is released when this process
+        // closes the file or exits (even on a crash), so a dead daemon never blocks
+        // the next one. If another daemon holds it, we are not the owner — return
+        // without unlinking its socket, which is how orphaned daemons used to happen.
+        const lock_path = try getLockPath(self.allocator);
+        self.lock_path = lock_path;
+        self.lock_file = std.Io.Dir.createFileAbsolute(self.io, lock_path, .{
+            .truncate = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        }) catch |err| switch (err) {
+            error.WouldBlock => return error.GatewayAlreadyRunning,
+            else => return err,
+        };
+
+        // We own the singleton now; take ownership of the socket path so cleanup
+        // deletes it, and remove any stale file (a prior daemon's leftover) — which
+        // cannot steal a live daemon's socket, since no other daemon holds the lock.
+        self.socket_path = sock_path;
         std.Io.Dir.deleteFileAbsolute(self.io, sock_path) catch {};
 
         // Write PID file
@@ -1313,6 +1351,14 @@ pub fn getPidFilePath(allocator: mem.Allocator) ![]u8 {
     const dir = try os.runtimeDir(allocator);
     defer allocator.free(dir);
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, pid_filename });
+}
+
+/// Get the singleton lock-file path. A serving daemon holds an exclusive advisory
+/// lock on this file for its lifetime, so at most one daemon owns the socket.
+pub fn getLockPath(allocator: mem.Allocator) ![]u8 {
+    const dir = try os.runtimeDir(allocator);
+    defer allocator.free(dir);
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, lock_filename });
 }
 
 // ---------------------------------------------------------------------------
