@@ -19,6 +19,27 @@ const browser_mod = @import("browser.zig");
 const cdp = @import("cdp.zig");
 const marionette_mod = @import("marionette.zig");
 const os = @import("os.zig");
+const build_info = @import("build_info");
+
+/// This binary's build fingerprint (a hash of its source, computed in build.zig). The
+/// daemon and CLI are the same binary, so a rebuild or upgrade changes this value. Used
+/// to warn when a running gateway differs from the binary now on disk.
+pub const build_id = build_info.build_id;
+
+/// Print a one-line note to stderr when the running gateway was built from a
+/// different hibrow binary than this CLI. Warn-only by design: the gateway keeps
+/// running (and keeps its browsers) — the user decides whether to restart it. The
+/// note goes to stderr so it never contaminates command output an agent parses.
+fn warnVersionSkew(daemon_build: []const u8) void {
+    _ = daemon_build;
+    std.debug.print(
+        "note: the running hibrow gateway was built from a different hibrow binary than this " ++
+        "CLI (it predates a rebuild or upgrade). It keeps serving its old behavior until " ++
+        "restarted. Run 'hibrow gateway stop' to load the current version; your browsers " ++
+        "stay open.\n",
+        .{},
+    );
+}
 
 /// Socket filename within the per-user directory.
 const socket_filename = "gateway.sock";
@@ -65,6 +86,9 @@ pub const Client = struct {
     stream: Stream,
     /// Monotonically increasing request ID.
     next_id: u64 = 1,
+    /// Set once a version-skew warning has been printed, so a process that makes
+    /// several calls warns at most once.
+    warned: bool = false,
 
     /// Connect to the gateway daemon. Tries the socket directly, and if
     /// connection fails, attempts to auto-start the daemon and retry.
@@ -139,6 +163,16 @@ pub const Client = struct {
         // Check for error response
         const val = parsed.value();
         if (val == .object) {
+            if (!self.warned) {
+                if (val.object.get("gw")) |gw_val| {
+                    if (gw_val == .string and gw_val.string.len > 0 and
+                        !mem.eql(u8, gw_val.string, build_id))
+                    {
+                        self.warned = true;
+                        warnVersionSkew(gw_val.string);
+                    }
+                }
+            }
             if (val.object.get("error")) |err_val| {
                 // Return the error info wrapped in ParsedResponse
                 return .{ .parsed = parsed, .result = err_val, .is_error = true };
@@ -355,12 +389,14 @@ pub const Server = struct {
     // -----------------------------------------------------------------------
 
     fn ok(self: *Server, id: json.Value, result: json.Value) ![]u8 {
-        const resp = protocol.makeResponse(id, result);
+        var resp = protocol.makeResponse(id, result);
+        resp.gw = build_id;
         return resp.encode(self.allocator);
     }
 
     fn fail(self: *Server, id: json.Value, code: protocol.ErrorCode, message: []const u8) []u8 {
-        const resp = protocol.makeErrorResponse(id, code, message);
+        var resp = protocol.makeErrorResponse(id, code, message);
+        resp.gw = build_id;
         return resp.encode(self.allocator) catch &.{};
     }
 

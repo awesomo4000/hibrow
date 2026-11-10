@@ -50,6 +50,10 @@ pub const Response = struct {
     jsonrpc: []const u8 = jsonrpc_version,
     result: json.Value = .null,
     id: json.Value,
+    /// Daemon build fingerprint (a hash of its source). Lets the CLI warn when the
+    /// running gateway differs from the binary on disk. Empty when the responder does
+    /// not set it (e.g. low-level transport errors).
+    gw: []const u8 = "",
 
     /// Serialize this response to a JSON string (with trailing newline).
     pub fn encode(self: Response, allocator: mem.Allocator) ![]u8 {
@@ -69,6 +73,8 @@ pub const ErrorResponse = struct {
     jsonrpc: []const u8 = jsonrpc_version,
     @"error": ErrorDetail,
     id: json.Value,
+    /// See Response.gw.
+    gw: []const u8 = "",
 
     /// Serialize this error response to a JSON string (with trailing newline).
     pub fn encode(self: ErrorResponse, allocator: mem.Allocator) ![]u8 {
