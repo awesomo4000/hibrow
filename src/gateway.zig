@@ -468,6 +468,45 @@ pub const Server = struct {
         return info;
     }
 
+    /// Is a browser for this profile actually usable right now? True only when
+    /// the process scan finds it AND its debug port answers. A dying instance
+    /// whose port has closed (but whose renderer/crashpad processes still carry
+    /// the profile in their command line) counts as gone — which is exactly what
+    /// a kill waits for and what a relaunch must not mistake for "already
+    /// running". On a scan error we assume still-running so a waiter keeps
+    /// waiting rather than declaring a premature exit.
+    fn stillRunning(self: *Server, profile: []const u8) bool {
+        const info = findBrowserInfo(self.allocator, self.io, profile) catch return true;
+        if (info) |i| return self.portAlive(i.port);
+        return false;
+    }
+
+    /// Block until no usable browser remains for the profile, or the timeout
+    /// elapses. Returns true if it is gone. Polls cheaply (a sub-ms port probe
+    /// behind each scan), so a browser that exits in a second returns in about a
+    /// second.
+    fn waitForGone(self: *Server, profile: []const u8, timeout_ms: u64) bool {
+        var waited: u64 = 0;
+        while (waited < timeout_ms) : (waited += 100) {
+            if (!self.stillRunning(profile)) return true;
+            sleepMs(100);
+        }
+        return !self.stillRunning(profile);
+    }
+
+    /// Collect the OS pids of every process whose command line names this
+    /// profile (browser plus its children). Caller frees. Empty slice if none.
+    fn profilePids(self: *Server, profile: []const u8) ![]os.Pid {
+        const browsers = try browser_mod.discover(self.allocator, self.io);
+        defer browser_mod.freeBrowsers(self.allocator, browsers);
+        for (browsers) |b| {
+            if (mem.eql(u8, b.profile, profile)) {
+                return self.allocator.dupe(os.Pid, b.pids);
+            }
+        }
+        return self.allocator.alloc(os.Pid, 0);
+    }
+
     /// Serialize a Browser struct to a JSON object value.
     fn browserToJson(self: *Server, b: browser_mod.Browser) !json.ObjectMap {
         var obj: json.ObjectMap = .empty;
@@ -544,18 +583,24 @@ pub const Server = struct {
         else
             browser_mod.BrowserType.chrome;
 
-        // Already running? Check via process scan.
-        const existing_info = try findBrowserInfo(self.allocator, self.io, profile);
-
-        if (existing_info) |ei| {
-            const ep = ei.port;
-            var obj: json.ObjectMap = .empty;
-            defer obj.deinit(self.allocator);
-            try obj.put(self.allocator, "profile", .{ .string = profile });
-            try obj.put(self.allocator, "port", .{ .integer = @intCast(ep) });
-            try obj.put(self.allocator, "already_running", .{ .bool = true });
-            try obj.put(self.allocator, "browser_type", .{ .string = browser_type.toString() });
-            return self.ok(id, .{ .object = obj });
+        // Already running? Check via process scan — but only reuse an instance
+        // whose debug port actually answers. A process that lingers after a kill
+        // (or that crashed) can still appear in the scan with a port that no
+        // longer listens; reusing it hands back a dead port and the next command
+        // fails. When the port is dead, drop any stale resolution, wait briefly
+        // for the zombie to clear, and fall through to a fresh launch.
+        if (try findBrowserInfo(self.allocator, self.io, profile)) |ei| {
+            if (self.portAlive(ei.port)) {
+                var obj: json.ObjectMap = .empty;
+                defer obj.deinit(self.allocator);
+                try obj.put(self.allocator, "profile", .{ .string = profile });
+                try obj.put(self.allocator, "port", .{ .integer = @intCast(ei.port) });
+                try obj.put(self.allocator, "already_running", .{ .bool = true });
+                try obj.put(self.allocator, "browser_type", .{ .string = browser_type.toString() });
+                return self.ok(id, .{ .object = obj });
+            }
+            self.evict(profile);
+            _ = self.waitForGone(profile, 3_000);
         }
 
         const b = browser_mod.launch(self.allocator, self.io, .{
@@ -822,10 +867,34 @@ pub const Server = struct {
             },
         }
 
-        // Browser is gone — forget the live socket and the port/type resolution
+        // Browser.close / quit only *start* shutdown — the process keeps running
+        // for a moment (renderers, GPU, profile writes) and holds the profile's
+        // singleton lock until it truly exits. Returning now would let an
+        // immediate relaunch see the dying instance and reuse its about-to-close
+        // port. So wait for it to actually go, and force it if it will not.
+        var exited = self.waitForGone(profile, 10_000);
+        var forced = false;
+        if (!exited) {
+            forced = true;
+            const pids = self.profilePids(profile) catch &[_]os.Pid{};
+            defer if (pids.len > 0) self.allocator.free(pids);
+            for (pids) |p| os.terminateProcess(p, false); // SIGTERM
+            exited = self.waitForGone(profile, 3_000);
+            if (!exited) {
+                for (pids) |p| os.terminateProcess(p, true); // SIGKILL
+                exited = self.waitForGone(profile, 3_000);
+            }
+        }
+
+        // Forget the live socket and the port/type resolution.
         self.evict(profile);
 
-        return self.ok(id, .{ .string = "killed" });
+        var obj: json.ObjectMap = .empty;
+        defer obj.deinit(self.allocator);
+        try obj.put(self.allocator, "killed", .{ .bool = true });
+        try obj.put(self.allocator, "exited", .{ .bool = exited });
+        try obj.put(self.allocator, "forced", .{ .bool = forced });
+        return self.ok(id, .{ .object = obj });
     }
 
     fn handleBrowserUrl(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {

@@ -25,6 +25,15 @@ All notable changes to hibrow will be documented in this file.
 - Browser process discovery and the home-directory lookup moved behind the `os` shims
 
 ### Fixed
+- `kill` is now synchronous, fixing an intermittent failure where killing a profile and
+  immediately relaunching it would fail with `Browser not found`. `Browser.close` / Marionette
+  `quit` only *start* shutdown, so `kill` used to return while the browser was still alive and
+  holding its debug port and singleton lock; a relaunch would then see the dying instance and
+  hand back its about-to-close port. `kill` now waits for the browser to actually exit (bounded,
+  then SIGTERM/SIGKILL as a fallback) before replying, and reports `{killed, exited, forced}`.
+  `launch` also no longer reuses a found-but-dead instance — it only treats a browser as already
+  running when its debug port answers. Measured on macOS: a kill→relaunch→nav loop went from 8/15
+  failures to 0/20 (Chrome), 0/10 (alternating headless/windowed), 0/12 (Firefox)
 - WebSocket `readFrame` double-free when the peer closes the connection mid-read
 
 ### Added (earlier, macOS)

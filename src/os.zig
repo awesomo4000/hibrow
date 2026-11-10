@@ -32,6 +32,8 @@ const win = if (is_windows) struct {
     const w = std.os.windows;
     extern "kernel32" fn Sleep(dwMilliseconds: w.DWORD) callconv(.winapi) void;
     extern "kernel32" fn GetProcessId(Process: w.HANDLE) callconv(.winapi) w.DWORD;
+    extern "kernel32" fn OpenProcess(dwDesiredAccess: w.DWORD, bInheritHandle: c_int, dwProcessId: w.DWORD) callconv(.winapi) ?w.HANDLE;
+    extern "kernel32" fn TerminateProcess(hProcess: w.HANDLE, uExitCode: c_uint) callconv(.winapi) c_int;
     extern "ws2_32" fn setsockopt(s: w.HANDLE, level: c_int, optname: c_int, optval: [*]const u8, optlen: c_int) callconv(.winapi) c_int;
 } else struct {};
 
@@ -41,6 +43,28 @@ pub fn childPid(child: std.process.Child) Pid {
     const id = child.id.?;
     if (is_windows) return @intCast(win.GetProcessId(id));
     return @intCast(id);
+}
+
+/// Ask the OS to end a process by pid. `force` picks SIGKILL over SIGTERM on
+/// POSIX; Windows has only the hard terminate, so `force` is ignored there. A
+/// process that is already gone (or that we may not signal) is not an error —
+/// callers use this best-effort while waiting for a browser to exit.
+pub fn terminateProcess(pid: Pid, force: bool) void {
+    if (is_windows) {
+        const w = std.os.windows;
+        const PROCESS_TERMINATE: w.DWORD = 0x0001;
+        const h = win.OpenProcess(PROCESS_TERMINATE, 0, @intCast(pid)) orelse return;
+        defer w.CloseHandle(h);
+        _ = win.TerminateProcess(h, 1);
+    } else {
+        // posix.SIG.* is an enum on some targets and an int on others; pass the
+        // constant straight to kill (two calls) so each target's own type fits.
+        if (force) {
+            posix.kill(@intCast(pid), posix.SIG.KILL) catch {};
+        } else {
+            posix.kill(@intCast(pid), posix.SIG.TERM) catch {};
+        }
+    }
 }
 
 var rng_state: std.Random.DefaultPrng = undefined;
