@@ -38,12 +38,13 @@ first command — you never manage it.
 ## Core commands
 
 ```bash
-hibrow launch <profile> [--browser chrome|firefox] [--headless]  # start a session
+hibrow launch <profile> [--browser chrome|firefox] [--headless] [--allow-autoplay] [--proxy <url>]
 hibrow ls [profile]                                  # list sessions / details (JSON)
 hibrow nav <profile[:tab]> <url>                     # navigate
 hibrow url <profile[:tab]>                            # print current URL
 hibrow eval <profile[:tab]> "<js>" | -f <file> | -f- # run JS, return JSON
 hibrow push <profile[:tab]> <target> <text> | -f <f> # set an input value / window var
+hibrow console <profile[:tab]>                        # stream console output from the tab
 hibrow screenshot <profile[:tab]> -o <file.png>      # save a PNG
 hibrow grab <profile> <url-or-js> -o <file>          # download binary/large data
 hibrow tab list|new|close|switch <profile[:tab]>     # manage tabs
@@ -304,6 +305,25 @@ the action** (click, in-app navigation, refresh the data) so it flows through yo
 wrapped `fetch`/`XHR`. For truly first-paint requests, capture then
 `hibrow nav` the SPA route again (client-side) rather than a full reload.
 
+## Console output
+
+`hibrow console <profile[:tab]>` streams the tab's console (`console.log`/`warn`/
+`error`) and uncaught page errors as they happen — the quickest way to see what a
+page is logging without wrapping anything yourself. It runs until interrupted, so
+read it with a timeout or in the background when you only want a window of output:
+
+```bash
+hibrow console work                    # stream live (Ctrl-C to stop)
+
+# Capture a few seconds around an action:
+hibrow console work > console.log &    # start streaming in the background
+hibrow click work "#submit"            # do the thing that logs
+sleep 2; kill %1                       # stop; inspect console.log
+```
+
+Use `console` to watch what the page already logs; use the `fetch`/`XHR` capture
+snippets above when you need the request/response bodies, not just log lines.
+
 ## Instrumenting React (gotchas)
 
 React makes page instrumentation tricky. Key gotchas:
@@ -504,9 +524,11 @@ hibrow media wait-ended work "#player" --timeout 600   # poll until the media en
 
 Notes:
 - **Autoplay policy** blocks programmatic `play()` for unmuted media without a
-  user gesture (the "`video.play()` did nothing" case). For a gated player,
-  **`hibrow click`** the play button (a trusted click) instead, then use the
-  media commands to inspect/await it.
+  user gesture (the "`video.play()` did nothing" case). Two fixes: launch the
+  profile with **`--allow-autoplay`** so `media play` / `element.play()` / page
+  `autoplay` start without a gesture (Chrome; no-op on Firefox), or, for a single
+  gated player in an ordinary session, **`hibrow click`** the play button (a
+  trusted click) instead — then use the media commands to inspect/await it.
 - `media list` reports each element's **caption tracks** — handy for summarizing
   training videos.
 - After a carousel/tab switch, re-run `media list` to get the resulting state
@@ -540,6 +562,21 @@ Notes:
   profile's data dir is shared across modes, so the pattern is: launch
   **visible**, log in once, `kill`, then relaunch the **same profile
   `--headless`** — you are still logged in, now automating with no window.
+
+## Routing through a proxy
+
+Launch a Chrome profile whose traffic goes through a proxy with `--proxy <url>`
+(Chrome only — Firefox launches ignore it). For a SOCKS5 proxy, add `--proxy-dns`
+so DNS is resolved at the proxy too, instead of leaking local lookups:
+
+```bash
+hibrow launch work --proxy "http://127.0.0.1:8080"
+hibrow launch work --proxy "socks5://127.0.0.1:1080" --proxy-dns   # DNS via the proxy
+```
+
+Like `--headless`, this is set once at spawn — it applies to that instance only,
+and is a no-op if the profile is already running. `kill` and relaunch to change
+it.
 
 ## Chrome vs Firefox
 
