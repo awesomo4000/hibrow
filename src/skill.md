@@ -617,6 +617,27 @@ driven over the DevTools Protocol, Firefox over Marionette. Behavior is the same
 for `nav`/`eval`/`screenshot`/`grab`. Firefox full-page screenshots fall back to
 viewport if the page exceeds its canvas limit.
 
+## Windows shells (cmd / PowerShell)
+
+hibrow runs the same from Git Bash, cmd, and PowerShell — the binary parses its
+own arguments. What differs is how each shell quotes the JS you pass to `eval`.
+
+- **Windows PowerShell 5.1** (the default `powershell.exe`) **strips embedded
+  double quotes** from an inline argument before the program ever sees them — its
+  native-argument-passing bug. So `hibrow eval p --await
+  'Promise.resolve(document.querySelector("body"))'` arrives as
+  `...querySelector(body)` and fails with `ReferenceError: body is not defined`.
+  This is not a hibrow bug and cannot be fixed in hibrow (the quotes are gone
+  before hibrow starts). It affects any `eval`, not just `--await`. Avoid it by
+  **running JS from a file** — `-f script.js` or piping via `-f-` — which bypasses
+  shell quoting entirely (the standing recommendation anyway). Or use PowerShell
+  7.3+ (`pwsh`), which passes quotes correctly.
+- **cmd** has no such bug: wrap the JS in `"..."` and escape inner quotes as `\"`.
+- **Scripting gotcha:** in a PowerShell script, do **not** pipe the first hibrow
+  command (the one that auto-starts the gateway) through `| Out-Null`. The gateway
+  daemon inherits the pipe's write handle and PowerShell blocks forever waiting for
+  it to close. Let the command print, or redirect to a file (`> $null`).
+
 ## Troubleshooting
 
 - **Empty/null eval result** — the element/data isn't there yet (SPA still
