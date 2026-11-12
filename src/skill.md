@@ -20,8 +20,10 @@ first command — you never manage it.
    e.g. `work:2`.
 2. **`eval` returns real JSON**, serialized by value. A string comes back quoted
    (`"Hacker News"`); objects/arrays come back as JSON. Pipe to `jq`.
-3. **`eval` is synchronous — it does NOT await promises.** For anything async
-   (fetch, timers), store the result on a `window.*` variable and poll it.
+3. **`eval --await` settles a promise in one command; plain `eval` does not.**
+   Add `--await` to wait for a returned promise/thenable and print its resolved
+   value (see "Awaiting async work"). Without it, `eval` is synchronous and a
+   promise comes back unsettled.
 4. **Don't `eval` huge strings.** For anything bigger than a few KB of binary or
    text, use `grab` (handles fetch + chunking for you).
 5. **Prefer running JS from a file** (`-f file.js`) over cramming complex JS into
@@ -131,9 +133,39 @@ redirect away from `/login`, an avatar/user-menu element, or an auth cookie
 (`document.cookie.includes("session")`). After this, the session persists, so
 future runs against the same profile are already logged in.
 
-## Async: store-and-poll
+## Awaiting async work
 
-`eval` won't wait for a promise. Kick it off, stash the result on `window`, poll.
+**Preferred: `eval --await`.** Add `--await` and `eval` waits for a returned
+promise or thenable to settle, then prints its resolved value — one command, no
+page globals, no polling. Return the promise as the last expression (an async IIFE
+is the idiom):
+
+```bash
+hibrow eval work --await 'fetch("/api/data").then(r => r.json())' | jq .
+
+hibrow eval work --await '
+(async () => {
+  const r = await fetch("/api/data");
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return await r.json();
+})()
+'
+```
+
+- A plain (non-promise) value returns immediately, so `--await` is safe to leave on.
+- `--timeout <secs>` bounds the wait (default 30s). On timeout the command exits
+  nonzero with `{"error":{"type":"timeout",...}}` on stderr and the session stays
+  usable — the page's own JS/network keep running, the timeout just stops waiting.
+- A rejected promise or a thrown error exits nonzero with a structured diagnostic
+  on stderr (`type` is `javascript`, `timeout`, or `context-loss`); stdout stays
+  clean, so a success result always pipes straight into `jq`. Non-`Error`
+  rejections (`Promise.reject("nope")`) keep their value.
+- Composes with `-f`, `-f-`, `<profile>:<tab>`, and `--frame`. Top-level `await` is
+  not supported — wrap in an async IIFE as above.
+
+**Fallback: store-and-poll.** For fire-and-forget work, or several overlapping
+async operations you want to start and check independently, stash results on
+`window` and poll:
 
 ```bash
 hibrow eval work '

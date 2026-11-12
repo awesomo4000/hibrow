@@ -88,6 +88,21 @@ pub const Client = struct {
         return self.gw.call("browser.eval", .{ .object = params });
     }
 
+    /// Like eval, but awaits a returned promise or thenable and bounds the wait at
+    /// `timeout_ms` (settled page-side, so a never-settling promise cannot wedge
+    /// the connection). On failure the response error code distinguishes a JS
+    /// error, a timeout (eval_timeout), and a lost context (context_lost).
+    pub fn evalAwait(self: *Client, profile: []const u8, expression: []const u8, frame: ?[]const u8, timeout_ms: i64) !gateway.ParsedResponse {
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
+        try params.put(self.allocator, "profile", .{ .string = profile });
+        try params.put(self.allocator, "expression", .{ .string = expression });
+        if (frame) |f| try params.put(self.allocator, "frame", .{ .string = f });
+        try params.put(self.allocator, "await", .{ .bool = true });
+        try params.put(self.allocator, "timeout_ms", .{ .integer = timeout_ms });
+        return self.gw.call("browser.eval", .{ .object = params });
+    }
+
     /// List the (nested) frames in the named profile's page.
     pub fn frames(self: *Client, profile: []const u8) !gateway.ParsedResponse {
         var params: json.ObjectMap = .empty;

@@ -724,9 +724,14 @@ pub const Server = struct {
             return self.fail(id, .invalid_params, "Missing 'expression' parameter");
         // Optional frame path: "1,0,0" / "#outer/#inner" — eval inside a nested frame.
         const frame = extractStringParam(params, "frame");
+        // `eval --await`: await a returned promise, bounded by timeout_ms.
+        const want_await = extractBoolParam(params, "await") orelse false;
+        const timeout_ms: i64 = extractIntParam(params, "timeout_ms") orelse 30000;
 
         const info = try self.resolveBrowser(profile) orelse
             return self.fail(id, .browser_not_found, "Browser not found");
+
+        if (want_await) return self.handleBrowserEvalAwait(id, profile, expression, frame, timeout_ms, info);
 
         switch (info.browser_type) {
             .firefox => {
@@ -757,6 +762,63 @@ pub const Server = struct {
                 return self.ok(id, eval_result.value);
             },
         }
+    }
+
+    /// `eval --await`: run the user's code and settle a returned promise, bounded
+    /// page-side by timeout_ms (see cdp.buildAwaitScript). The settled outcome
+    /// comes back in a `{__hibrow:...}` envelope that finishAwait classifies into
+    /// a value, a JS error, or a timeout. Deliberately does NOT retry the user's
+    /// script on a dropped connection — re-running could repeat a mutation — so a
+    /// mid-await disconnect becomes a context-loss error.
+    fn handleBrowserEvalAwait(self: *Server, id: json.Value, profile: []const u8, expression: []const u8, frame: ?[]const u8, timeout_ms: i64, info: BrowserInfo) ![]u8 {
+        switch (info.browser_type) {
+            .firefox => {
+                var conn = marionette_mod.Connection.init(self.allocator, self.io);
+                defer conn.deinit();
+                conn.connect(info.port) catch
+                    return self.fail(id, .cdp_error, "Marionette connection failed");
+                const eval_result = (if (frame) |f|
+                    conn.evalAwaitTimeoutInFrame(f, expression, timeout_ms)
+                else
+                    conn.evalAwaitTimeout(expression, timeout_ms)) catch
+                    return self.fail(id, .context_lost, "execution context lost during eval --await");
+                return self.finishAwait(id, eval_result.exception, eval_result.value);
+            },
+            .chrome => {
+                // Warm the cached socket first: Chrome idly closes a target's
+                // websocket between commands, and that stale-socket reconnect is
+                // the one retry we allow. It must happen BEFORE the user's script
+                // runs, because the await itself is never retried (it may have
+                // mutated page state). A trivial eval reconnects a dead socket.
+                _ = self.chromeOp(profile, .{ .expr = "0" }, opEval) catch |e| switch (e) {
+                    error.BrowserNotFound => return self.fail(id, .browser_not_found, "Browser not found"),
+                    else => {}, // non-connection failure: let the real call report it
+                };
+                const conn = self.getConnection(profile) orelse
+                    return self.fail(id, .browser_not_found, "Browser not found");
+                const eval_result = opEvalAwait(conn, .{ .expr = expression, .frame = frame, .timeout_ms = timeout_ms }) catch {
+                    self.evict(profile);
+                    return self.fail(id, .context_lost, "execution context lost during eval --await");
+                };
+                return self.finishAwait(id, eval_result.exception, eval_result.value);
+            },
+        }
+    }
+
+    /// Turn an await envelope (or a context-loss exception) into a response.
+    fn finishAwait(self: *Server, id: json.Value, exception: ?[]const u8, value: json.Value) ![]u8 {
+        if (exception) |exc| {
+            defer self.allocator.free(exc);
+            // With script errors captured inside the envelope, a raw exception
+            // here means the context went away before the envelope could resolve.
+            return self.fail(id, .context_lost, exc);
+        }
+        return switch (classifyAwaitEnvelope(value)) {
+            .ok => |v| self.ok(id, v),
+            .timeout => self.fail(id, .eval_timeout, "eval --await timed out; the script may still be running in the page"),
+            .js_error => |m| self.fail(id, .cdp_error, m),
+            .malformed => self.fail(id, .cdp_error, "malformed eval --await result"),
+        };
     }
 
     fn handleBrowserFrames(self: *Server, id: json.Value, params: ?json.Value) ![]u8 {
@@ -1548,6 +1610,31 @@ fn opEval(conn: *cdp.Connection, ctx: OpCtx) !cdp.EvalResult {
 }
 fn opWait(conn: *cdp.Connection, ctx: OpCtx) !cdp.EvalResult {
     return if (ctx.frame) |f| conn.evalAwaitInFrame(f, ctx.expr) else conn.evalAwait(ctx.expr);
+}
+fn opEvalAwait(conn: *cdp.Connection, ctx: OpCtx) !cdp.EvalResult {
+    return if (ctx.frame) |f| conn.evalAwaitTimeoutInFrame(f, ctx.expr, ctx.timeout_ms) else conn.evalAwaitTimeout(ctx.expr, ctx.timeout_ms);
+}
+
+/// The classified outcome of an `eval --await` envelope (see cdp.buildAwaitScript).
+const AwaitOutcome = union(enum) {
+    ok: json.Value, // resolved value (borrows from the envelope)
+    js_error: []const u8, // thrown/rejected; message borrows from the envelope
+    timeout, // the page-side timer won the race
+    malformed, // not a recognizable envelope (should not happen)
+};
+
+/// Classify a settled await envelope by its `__hibrow` tag.
+fn classifyAwaitEnvelope(env: json.Value) AwaitOutcome {
+    if (env != .object) return .malformed;
+    const tag = env.object.get("__hibrow") orelse return .malformed;
+    if (tag != .string) return .malformed;
+    if (std.mem.eql(u8, tag.string, "ok")) return .{ .ok = env.object.get("value") orelse .null };
+    if (std.mem.eql(u8, tag.string, "timeout")) return .timeout;
+    if (std.mem.eql(u8, tag.string, "err")) {
+        const m = env.object.get("message") orelse .null;
+        return .{ .js_error = if (m == .string) m.string else "eval --await rejected" };
+    }
+    return .malformed;
 }
 fn opFrames(conn: *cdp.Connection, ctx: OpCtx) !json.Value {
     _ = ctx;

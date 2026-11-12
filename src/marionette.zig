@@ -329,6 +329,64 @@ pub const Connection = struct {
         return .{};
     }
 
+    /// Public `eval --await` on Firefox. Unlike evalAsync (which maps every
+    /// rejection to false for `wait`), this preserves the real outcome: the
+    /// settled value, a thrown/rejected error with its message, or a timeout —
+    /// each delivered in a `{__hibrow:...}` envelope the gateway classifies. The
+    /// user's code runs inside a promise chain so a synchronous throw is captured
+    /// too, and a page-side timer races it so a never-settling promise still
+    /// returns. The Marionette script timeout is set above the page timer as a
+    /// backstop; the page timer is the primary bound.
+    pub fn evalAwaitTimeout(self: *Connection, expression: []const u8, timeout_ms: i64) !EvalResult {
+        {
+            var tp: json.ObjectMap = .empty;
+            defer tp.deinit(self.allocator);
+            try tp.put(self.allocator, "script", .{ .integer = timeout_ms + 2000 });
+            var tr = try self.send("WebDriver:SetTimeouts", .{ .object = tp });
+            tr.deinit();
+        }
+
+        const expr_json = try json.Stringify.valueAlloc(self.allocator, json.Value{ .string = expression }, .{});
+        defer self.allocator.free(expr_json);
+
+        // Callback form of the shared envelope (see cdp.buildAwaitScript): the
+        // async script receives its resolve callback as the last argument.
+        const script = try std.fmt.allocPrint(
+            self.allocator,
+            "var cb=arguments[arguments.length-1];var u=Promise.resolve().then(function(){{return (0,eval)({s});}});var t=new Promise(function(r){{setTimeout(function(){{r({{__hibrow:\"timeout\"}});}},{d});}});Promise.race([u.then(function(v){{return {{__hibrow:\"ok\",value:v}};}},function(e){{var h=(e&&typeof e===\"object\"&&\"message\" in e)?((e.name||\"Error\")+\": \"+e.message):String(e);var s=(e&&e.stack)?String(e.stack):\"\";return {{__hibrow:\"err\",message:s?(s.indexOf(h)===0?s:h+String.fromCharCode(10)+s):h}};}}),t]).then(function(env){{cb(env);}});",
+            .{ expr_json, timeout_ms },
+        );
+        defer self.allocator.free(script);
+
+        var params: json.ObjectMap = .empty;
+        defer params.deinit(self.allocator);
+        try params.put(self.allocator, "script", .{ .string = script });
+        var args_arr = json.Array.init(self.allocator);
+        defer args_arr.deinit();
+        try params.put(self.allocator, "args", .{ .array = args_arr });
+
+        var result = try self.send("WebDriver:ExecuteAsyncScript", .{ .object = params });
+        defer result.deinit();
+
+        if (result.err) |_| {
+            return .{ .exception = try result.errorMessage(self.allocator) };
+        }
+        if (result.result == .object) {
+            if (result.result.object.get("value")) |val| {
+                return .{ .value = try cloneJsonValue(self.allocator, val) };
+            }
+        }
+        return .{};
+    }
+
+    /// `eval --await` scoped to a nested frame (switch into the frame, then await).
+    /// The frame switch lives on this (per-command) connection and is torn down
+    /// with it, so there is no need to switch back.
+    pub fn evalAwaitTimeoutInFrame(self: *Connection, frame_path: []const u8, expression: []const u8, timeout_ms: i64) !EvalResult {
+        try self.switchToFramePath(frame_path);
+        return self.evalAwaitTimeout(expression, timeout_ms);
+    }
+
     /// Switch into a child frame by index (Marionette SwitchToFrame id=<int>).
     pub fn switchToFrameIndex(self: *Connection, index: i64) !void {
         // Element-based: switch into the index-th <iframe>/<frame> in DOM order,

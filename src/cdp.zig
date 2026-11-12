@@ -52,6 +52,27 @@ pub const WsUrl = struct {
     path: []const u8,
 };
 
+/// Build the page-side wrapper for `eval --await`. The user's code runs inside a
+/// promise chain (so a synchronous throw is captured, not lost), is raced against
+/// a page-side timer, and the settled outcome is packaged in a self-describing
+/// envelope the gateway classifies:
+///   {__hibrow:"ok", value}      — resolved value (by value)
+///   {__hibrow:"err", message}   — thrown/rejected; message is the stack or String(e)
+///   {__hibrow:"timeout"}        — the timer won the race
+/// The timer settling the race page-side is what keeps a never-settling promise
+/// from blocking the connection. `(0,eval)(<string>)` runs the user's code as an
+/// indirect eval in global scope, so multi-statement bodies yield their completion
+/// value exactly as a plain `eval` does. Caller owns the returned script.
+fn buildAwaitScript(allocator: mem.Allocator, expression: []const u8, timeout_ms: i64) ![]u8 {
+    const expr_json = try json.Stringify.valueAlloc(allocator, json.Value{ .string = expression }, .{});
+    defer allocator.free(expr_json);
+    return std.fmt.allocPrint(
+        allocator,
+        "(function(){{var u=Promise.resolve().then(function(){{return (0,eval)({s});}});var t=new Promise(function(r){{setTimeout(function(){{r({{__hibrow:\"timeout\"}});}},{d});}});return Promise.race([u.then(function(v){{return {{__hibrow:\"ok\",value:v}};}},function(e){{var h=(e&&typeof e===\"object\"&&\"message\" in e)?((e.name||\"Error\")+\": \"+e.message):String(e);var s=(e&&e.stack)?String(e.stack):\"\";return {{__hibrow:\"err\",message:s?(s.indexOf(h)===0?s:h+String.fromCharCode(10)+s):h}};}}),t]);}})()",
+        .{ expr_json, timeout_ms },
+    );
+}
+
 /// Parse a ws:// URL into host, port, path components.
 /// The returned slices borrow from the input url.
 pub fn parseWsUrl(url: []const u8) !WsUrl {
@@ -705,6 +726,39 @@ pub const Connection = struct {
         defer target.deinit(self.allocator);
         const ctx = try self.createIsolatedWorld(target.frame_id, target.session);
         return self.evalInContext(ctx, expression, target.session, true);
+    }
+
+    /// Public `eval --await`: run the user's code, await a returned promise or
+    /// thenable, and bound the wait page-side so a never-settling promise can
+    /// never wedge the connection. The user code is raced against a page-side
+    /// timer and the settled result is wrapped in a `{__hibrow:...}` envelope
+    /// (see buildAwaitScript) that the caller classifies into ok/err/timeout.
+    /// A genuine `.exception` here means the context was torn down before the
+    /// envelope could resolve (navigation / frame removal), not a script error —
+    /// script errors are captured inside the envelope.
+    pub fn evalAwaitTimeout(self: *Connection, expression: []const u8, timeout_ms: i64) !EvalResult {
+        const wrapped = try buildAwaitScript(self.allocator, expression, timeout_ms);
+        defer self.allocator.free(wrapped);
+
+        var params_obj: json.ObjectMap = .empty;
+        defer params_obj.deinit(self.allocator);
+        try params_obj.put(self.allocator, "expression", .{ .string = wrapped });
+        try params_obj.put(self.allocator, "returnByValue", .{ .bool = true });
+        try params_obj.put(self.allocator, "awaitPromise", .{ .bool = true });
+
+        var cdp_result = try self.send("Runtime.evaluate", .{ .object = params_obj });
+        defer cdp_result.deinit();
+        return self.parseEvalResult(cdp_result.result);
+    }
+
+    /// `eval --await` scoped to a nested frame (see evalAwaitTimeout, evalInFrame).
+    pub fn evalAwaitTimeoutInFrame(self: *Connection, frame_path: []const u8, expression: []const u8, timeout_ms: i64) !EvalResult {
+        const wrapped = try buildAwaitScript(self.allocator, expression, timeout_ms);
+        defer self.allocator.free(wrapped);
+        var target = try self.resolveFrameTarget(frame_path);
+        defer target.deinit(self.allocator);
+        const ctx = try self.createIsolatedWorld(target.frame_id, target.session);
+        return self.evalInContext(ctx, wrapped, target.session, true);
     }
 
     /// Dispatch a trusted (isTrusted) left click at top-level viewport (x,y) via

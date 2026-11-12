@@ -30,6 +30,11 @@ pub const ErrorCode = enum(i32) {
     browser_launch_failed = -32001,
     /// Application-defined error: CDP connection failed.
     cdp_error = -32002,
+    /// Application-defined error: an awaited eval did not settle in time.
+    eval_timeout = -32003,
+    /// Application-defined error: the execution context was lost mid-eval
+    /// (the page navigated or the target frame was removed before settlement).
+    context_lost = -32004,
 };
 
 /// A JSON-RPC 2.0 request.

@@ -28,8 +28,11 @@ const usage =
     \\  nav <profile[:tab]> <url>
     \\      Navigate a browser tab to a URL.
     \\
-    \\  eval <profile[:tab]> "<js>" | -f <file> | -f-
-    \\      Evaluate JavaScript in a browser tab.
+    \\  eval <profile[:tab]> [--await] [--timeout <secs>] "<js>" | -f <file> | -f-
+    \\      Evaluate JavaScript in a browser tab. With --await, wait for a returned
+    \\      promise to settle and print its resolved value (default --timeout 30s);
+    \\      a rejection, error, or timeout exits nonzero with a JSON diagnostic on
+    \\      stderr. Without --await, eval is synchronous and does not await promises.
     \\
     \\  kill <profile>
     \\      Gracefully close a browser (profile is preserved).
@@ -746,6 +749,8 @@ fn cmdEval(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
     var expr_arg: ?[]const u8 = null;
     var from_file: ?[]const u8 = null;
     var from_stdin = false;
+    var want_await = false;
+    var timeout_ms: i64 = 30000; // --await default: 30s
 
     while (args.next()) |a| {
         if (mem.eql(u8, a, "--frame")) {
@@ -753,6 +758,18 @@ fn cmdEval(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
                 writeStderr("Error: --frame requires a selector or path (e.g. 0/0 or #inner)\n", .{});
                 std.process.exit(1);
             };
+        } else if (mem.eql(u8, a, "--await")) {
+            want_await = true;
+        } else if (mem.eql(u8, a, "--timeout")) {
+            const s = args.next() orelse {
+                writeStderr("Error: --timeout requires seconds\n", .{});
+                std.process.exit(1);
+            };
+            const secs = std.fmt.parseFloat(f64, s) catch {
+                writeStderr("Error: --timeout must be a number of seconds\n", .{});
+                std.process.exit(1);
+            };
+            timeout_ms = @intFromFloat(secs * 1000.0);
         } else if (mem.eql(u8, a, "-f")) {
             from_file = args.next() orelse {
                 writeStderr("Error: -f requires a filename\n", .{});
@@ -793,17 +810,63 @@ fn cmdEval(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {
     };
     defer client.disconnect();
 
-    var resp = client.eval(profile, expression, frame) catch |err| {
+    var resp = (if (want_await)
+        client.evalAwait(profile, expression, frame, timeout_ms)
+    else
+        client.eval(profile, expression, frame)) catch |err| {
         writeStderr("Error: eval failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
     defer resp.deinit();
 
     if (resp.is_error) {
-        printError(allocator, resp.result);
+        if (want_await) printAwaitError(allocator, resp.result) else printError(allocator, resp.result);
         std.process.exit(1);
     }
     printJsonValue(allocator, resp.result);
+}
+
+/// Emit a structured `{"error":{type,message,stack}}` diagnostic on stderr for a
+/// failed `eval --await`. The gateway error code maps to a category; a message
+/// that carries a stack (Error.stack is "Name: msg\n  at ...") is split so the
+/// first line is the message and the whole string is the stack.
+fn printAwaitError(allocator: mem.Allocator, err_val: json.Value) void {
+    var type_str: []const u8 = "javascript";
+    var message: []const u8 = "eval --await failed";
+    var has_stack = false;
+
+    if (err_val == .object) {
+        if (err_val.object.get("code")) |code| {
+            if (code == .integer) type_str = switch (code.integer) {
+                -32003 => "timeout",
+                -32004 => "context-loss",
+                else => "javascript",
+            };
+        }
+        if (err_val.object.get("message")) |m| {
+            if (m == .string) message = m.string;
+        }
+    }
+
+    const nl = mem.indexOfScalar(u8, message, '\n');
+    const first_line = message[0 .. nl orelse message.len];
+    has_stack = nl != null;
+
+    var root: json.ObjectMap = .empty;
+    defer root.deinit(allocator);
+    var err_obj: json.ObjectMap = .empty;
+    defer err_obj.deinit(allocator);
+    err_obj.put(allocator, "type", .{ .string = type_str }) catch {};
+    err_obj.put(allocator, "message", .{ .string = first_line }) catch {};
+    err_obj.put(allocator, "stack", if (has_stack) json.Value{ .string = message } else .null) catch {};
+    root.put(allocator, "error", .{ .object = err_obj }) catch {};
+
+    const bytes = json.Stringify.valueAlloc(allocator, json.Value{ .object = root }, .{}) catch {
+        writeStderr("Error: {s}\n", .{message});
+        return;
+    };
+    defer allocator.free(bytes);
+    writeStderr("{s}\n", .{bytes});
 }
 
 fn cmdKill(allocator: mem.Allocator, args: *std.process.Args.Iterator) void {

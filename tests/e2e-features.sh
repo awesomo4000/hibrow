@@ -120,6 +120,20 @@ run_browser() {
     eq "eval --frame nested"       "$("$HIBROW" eval "$P" --frame 0/0 "document.querySelector('#g').innerText" 2>&1)" '"GRANDCHILD"'
     eq "eval --frame selector"     "$("$HIBROW" eval "$P" --frame '#fa/#fg' "document.querySelector('#g').innerText" 2>&1)" '"GRANDCHILD"'
 
+    # --- eval --await: settle a promise in one command ---
+    # A sync value returns immediately; a promise is awaited; errors, rejections,
+    # and a never-settling promise all come back as structured diagnostics without
+    # wedging the session. Deterministic async via setTimeout — no network.
+    eq "await sync value"            "$("$HIBROW" eval "$P" --await '1+2' 2>&1)" "3"
+    contains "await resolves object" "$("$HIBROW" eval "$P" --await 'new Promise(function(r){setTimeout(function(){r({ok:true});},150);})' 2>&1 | tr -d '\n ')" '"ok":true'
+    eq "await async IIFE"            "$("$HIBROW" eval "$P" --await '(async()=>{await new Promise(function(r){setTimeout(r,50);});return 6*7;})()' 2>&1)" "42"
+    contains "await rejection message" "$("$HIBROW" eval "$P" --await 'Promise.reject(new Error("awaitfail777"))' 2>&1)" "awaitfail777"
+    contains "await keeps non-error reject" "$("$HIBROW" eval "$P" --await 'Promise.reject("plainreject888")' 2>&1)" "plainreject888"
+    "$HIBROW" eval "$P" --await 'Promise.reject(new Error("x"))' >/dev/null 2>&1; eq "await error exits nonzero" "$?" "1"
+    contains "await reports timeout"  "$("$HIBROW" eval "$P" --await --timeout 1 'new Promise(function(){})' 2>&1)" '"type":"timeout"'
+    eq "await session survives timeout" "$("$HIBROW" eval "$P" --await '555' 2>&1)" "555"
+    eq "await in frame"              "$("$HIBROW" eval "$P" --frame 0 --await 'Promise.resolve(document.querySelector("#a").innerText)' 2>&1)" '"CHILD-A"'
+
     # --- click (in a frame) + wait ---
     "$HIBROW" click "$P" '#gbtn' --frame 0/0 >/dev/null 2>&1
     eq "click in frame"            "$("$HIBROW" eval "$P" --frame 0/0 "document.getElementById('gstate').textContent" 2>&1)" '"CLICKED"'

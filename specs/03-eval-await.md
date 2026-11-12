@@ -1,5 +1,12 @@
 # `hibrow eval --await` — settle a promise in one command
 
+**Status:** Implemented. `--await` + `--timeout <secs>` ship on `eval` for Chrome
+and Firefox, inline / `-f` / `-f-` / tab / `--frame`, with the four error
+categories below; the feature e2e suite asserts the behavior on both engines. The
+gateway-side read-deadline backstop (see "Timeout") was left out of v1 — the
+page-side race and CDP/Marionette context-destroyed errors cover the realistic
+cases — and can be added if a pathological hang is ever observed.
+
 ## Context
 
 `eval` is synchronous: it returns the completion value of the expression and does
